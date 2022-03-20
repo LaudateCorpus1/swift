@@ -658,12 +658,11 @@ public:
 
   /// Retrieve the declaration of DistributedActorSystem.make().
   ///
-  /// \param actorOrSystem distributed actor or actor system to get the
-  /// remoteCall function for. Since the method we're looking for is an ad-hoc
-  /// requirement, a specific type MUST be passed here as it is not possible
-  /// to obtain the decl from just the `DistributedActorSystem` protocol type.
+  /// \param thunk the function from which we'll be invoking things on the obtained
+  /// actor system; This way we'll always get the right type, taking care of any
+  /// where clauses etc.
   FuncDecl *getMakeInvocationEncoderOnDistributedActorSystem(
-      NominalTypeDecl *actorOrSystem) const;
+      AbstractFunctionDecl *thunk) const;
 
   // Retrieve the declaration of
   // DistributedInvocationEncoder.recordGenericSubstitution(_:).
@@ -1298,8 +1297,17 @@ public:
   CanGenericSignature getSingleGenericParameterSignature() const;
 
   /// Retrieve a generic signature with a single type parameter conforming
-  /// to the given protocol or composition type, like <T: type>.
-  CanGenericSignature getOpenedArchetypeSignature(Type type);
+  /// to the given protocol or composition type, like <T: P>.
+  ///
+  /// The opened archetype may have a different set of conformances from the
+  /// corresponding existential. The opened archetype conformances are dictated
+  /// by the ABI for generic arguments, while the existential value conformances
+  /// are dictated by their layout (see \c Type::getExistentialLayout()). In
+  /// particular, the opened archetype signature does not have requirements for
+  /// conformances inherited from superclass constraints while existential
+  /// values do.
+  CanGenericSignature getOpenedArchetypeSignature(Type type,
+                                                  GenericSignature parentSig);
 
   GenericSignature getOverrideGenericSignature(const ValueDecl *base,
                                                const ValueDecl *derived);

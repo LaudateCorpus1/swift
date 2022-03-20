@@ -424,8 +424,8 @@ swift::FragileFunctionKindRequest::evaluate(Evaluator &evaluator,
                 /*allowUsableFromInline=*/true};
       }
 
-      // If a property or subscript is @inlinable or @_alwaysEmitIntoClient,
-      // the accessors are @inlinable or @_alwaysEmitIntoClient also.
+      // Property and subscript accessors inherit @_alwaysEmitIntoClient,
+      // @_backDeploy, and @inlinable from their storage declarations.
       if (auto accessor = dyn_cast<AccessorDecl>(AFD)) {
         auto *storage = accessor->getStorage();
         if (storage->getAttrs().getAttribute<InlinableAttr>()) {
@@ -434,6 +434,10 @@ swift::FragileFunctionKindRequest::evaluate(Evaluator &evaluator,
         }
         if (storage->getAttrs().hasAttribute<AlwaysEmitIntoClientAttr>()) {
           return {FragileFunctionKind::AlwaysEmitIntoClient,
+                  /*allowUsableFromInline=*/true};
+        }
+        if (storage->getAttrs().hasAttribute<BackDeployAttr>()) {
+          return {FragileFunctionKind::BackDeploy,
                   /*allowUsableFromInline=*/true};
         }
       }
@@ -1235,12 +1239,10 @@ bool DeclContext::isAsyncContext() const {
     return false;
   case DeclContextKind::FileUnit:
     if (const SourceFile *sf = dyn_cast<SourceFile>(this))
-      return getASTContext().LangOpts.EnableExperimentalAsyncTopLevel &&
-             sf->isAsyncTopLevelSourceFile();
+      return sf->isAsyncTopLevelSourceFile();
     return false;
   case DeclContextKind::TopLevelCodeDecl:
-    return getASTContext().LangOpts.EnableExperimentalAsyncTopLevel &&
-           getParent()->isAsyncContext();
+    return getParent()->isAsyncContext();
   case DeclContextKind::AbstractClosureExpr:
     return cast<AbstractClosureExpr>(this)->isBodyAsync();
   case DeclContextKind::AbstractFunctionDecl: {

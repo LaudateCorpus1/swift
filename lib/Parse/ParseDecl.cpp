@@ -21,6 +21,7 @@
 #include "swift/Parse/SyntaxParsingContext.h"
 #include "swift/Syntax/SyntaxKind.h"
 #include "swift/Subsystems.h"
+#include "swift/Strings.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/Attr.h"
 #include "swift/AST/GenericParamList.h"
@@ -573,7 +574,8 @@ ParserResult<AvailableAttr> Parser::parseExtendedAvailabilitySpecList(
                 Deprecated.Version, Deprecated.Range,
                 Obsoleted.Version, Obsoleted.Range,
                 PlatformAgnostic,
-                /*Implicit=*/false);
+                /*Implicit=*/false,
+                AttrName == SPI_AVAILABLE_ATTRNAME);
   return makeParserResult(Attr);
 
 }
@@ -858,7 +860,8 @@ bool Parser::parseAvailability(
           /*DeprecatedRange=*/SourceRange(),
           /*Obsoleted=*/llvm::VersionTuple(),
           /*ObsoletedRange=*/SourceRange(), PlatformAgnostic,
-          /*Implicit=*/false));
+          /*Implicit=*/false,
+          AttrName == SPI_AVAILABLE_ATTRNAME));
     }
 
     return true;
@@ -1740,9 +1743,35 @@ void Parser::parseAllAvailabilityMacroArguments() {
 
 ParserStatus Parser::parsePlatformVersionInList(StringRef AttrName,
     llvm::SmallVector<PlatformAndVersion, 4> &PlatformAndVersions) {
-  // FIXME(backDeploy): Parse availability macros (e.g. SwiftStdlib: 5.1)
   SyntaxParsingContext argumentContext(SyntaxContext,
       SyntaxKind::AvailabilityVersionRestriction);
+
+  // Check for availability macros first.
+  if (peekAvailabilityMacroName()) {
+    SmallVector<AvailabilitySpec *, 4> Specs;
+    ParserStatus MacroStatus = parseAvailabilityMacro(Specs);
+    if (MacroStatus.isError())
+      return MacroStatus;
+
+    for (auto *Spec : Specs) {
+      auto *PlatformVersionSpec =
+          dyn_cast<PlatformVersionConstraintAvailabilitySpec>(Spec);
+      // Since peekAvailabilityMacroName() only matches defined availability
+      // macros, we don't expect to get any other kind of spec here.
+      assert(PlatformVersionSpec && "Unexpected AvailabilitySpec kind");
+
+      auto Platform = PlatformVersionSpec->getPlatform();
+      auto Version = PlatformVersionSpec->getVersion();
+      if (Version.getSubminor().hasValue() || Version.getBuild().hasValue()) {
+        diagnose(PlatformVersionSpec->getVersionSrcRange().Start,
+                 diag::attr_availability_platform_version_major_minor_only,
+                 AttrName);
+      }
+      PlatformAndVersions.emplace_back(Platform, Version);
+    }
+
+    return makeParserSuccess();
+  }
 
   // Expect a possible platform name (e.g. 'macOS' or '*').
   if (!Tok.isAny(tok::identifier, tok::oper_binary_spaced)) {
@@ -1751,23 +1780,22 @@ ParserStatus Parser::parsePlatformVersionInList(StringRef AttrName,
   }
 
   // Parse the platform name.
-  auto MaybePlatform = platformFromString(Tok.getText());
+  StringRef platformText = Tok.getText();
+  auto MaybePlatform = platformFromString(platformText);
   SourceLoc PlatformLoc = Tok.getLoc();
+  consumeToken();
+
   if (!MaybePlatform.hasValue()) {
     diagnose(PlatformLoc, diag::attr_availability_unknown_platform,
-             Tok.getText(), AttrName);
-    return makeParserError();
-  }
-  consumeToken();
-  PlatformKind Platform = *MaybePlatform;
-
-  // Wildcards ('*') aren't supported in this kind of list. If this list
-  // entry is just a wildcard, skip it. Wildcards with a version are
-  // diagnosed below.
-  if (Platform == PlatformKind::none && Tok.isAny(tok::comma, tok::r_paren)) {
+             platformText, AttrName);
+  } else if (*MaybePlatform == PlatformKind::none) {
+    // Wildcards ('*') aren't supported in this kind of list.
     diagnose(PlatformLoc, diag::attr_availability_wildcard_ignored,
              AttrName);
-    return makeParserSuccess();
+
+    // If this list entry is just a wildcard, skip it.
+    if (Tok.isAny(tok::comma, tok::r_paren))
+      return makeParserSuccess();
   }
 
   // Parse version number.
@@ -1786,13 +1814,13 @@ ParserStatus Parser::parsePlatformVersionInList(StringRef AttrName,
              AttrName);
   }
 
-  // Wildcards ('*') aren't supported in this kind of list.
-  if (Platform == PlatformKind::none) {
-    diagnose(PlatformLoc, diag::attr_availability_wildcard_ignored,
-             AttrName);
-  } else {
-    PlatformAndVersions.emplace_back(Platform, VerTuple);
+  if (MaybePlatform.hasValue()) {
+    auto Platform = *MaybePlatform;
+    if (Platform != PlatformKind::none) {
+      PlatformAndVersions.emplace_back(Platform, VerTuple);
+    }
   }
+
   return makeParserSuccess();
 }
 
@@ -1956,14 +1984,6 @@ bool Parser::parseNewDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc,
           DeclAttribute::isDeclModifier(DK));
     }
 
-    DiscardAttribute = true;
-  }
-
-  // If this attribute is only permitted when distributed is enabled, reject it.
-  if (DeclAttribute::isDistributedOnly(DK) &&
-      !shouldParseExperimentalDistributed()) {
-    diagnose(Loc, diag::attr_requires_distributed, AttrName,
-             DeclAttribute::isDeclModifier(DK));
     DiscardAttribute = true;
   }
 
@@ -2445,91 +2465,11 @@ bool Parser::parseNewDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc,
       }
       // Parse 'OSX 13.13'.
       case NextSegmentKind::PlatformVersion: {
-        SyntaxParsingContext argumentContext(SyntaxContext,
-                                             SyntaxKind::AvailabilityVersionRestriction);
-        if ((Tok.is(tok::identifier) || Tok.is(tok::oper_binary_spaced)) &&
-            (peekToken().isAny(tok::integer_literal, tok::floating_literal) ||
-             peekAvailabilityMacroName())) {
-
-          PlatformKind Platform;
-
-          if (peekAvailabilityMacroName()) {
-            // Handle availability macros first.
-            //
-            // The logic to search for macros and platform name could
-            // likely be handled by parseAvailabilitySpecList
-            // if we don't rely on parseList here.
-            SmallVector<AvailabilitySpec *, 4> Specs;
-            ParserStatus MacroStatus = parseAvailabilityMacro(Specs);
-            if (MacroStatus.isError())
-              return MacroStatus;
-
-            for (auto *Spec : Specs) {
-              if (auto *PlatformVersionSpec =
-                   dyn_cast<PlatformVersionConstraintAvailabilitySpec>(Spec)) {
-                auto Platform = PlatformVersionSpec->getPlatform();
-                auto Version = PlatformVersionSpec->getVersion();
-                if (Version.getSubminor().hasValue() ||
-                    Version.getBuild().hasValue()) {
-                  diagnose(Tok.getLoc(), diag::originally_defined_in_major_minor_only);
-                }
-                PlatformAndVersions.emplace_back(Platform, Version);
-
-              } else if (auto *PlatformAgnostic =
-                  dyn_cast<PlatformAgnosticVersionConstraintAvailabilitySpec>(Spec)) {
-                diagnose(PlatformAgnostic->getPlatformAgnosticNameLoc(),
-                         PlatformAgnostic->isLanguageVersionSpecific() ?
-                           diag::originally_defined_in_swift_version :
-                           diag::originally_defined_in_package_description);
-
-              } else if (auto *OtherPlatform =
-                         dyn_cast<OtherPlatformAvailabilitySpec>(Spec)) {
-                diagnose(OtherPlatform->getStarLoc(),
-                         diag::originally_defined_in_missing_platform_name);
-
-              } else {
-                llvm_unreachable("Unexpected AvailabilitySpec kind.");
-              }
-            }
-
-            return makeParserSuccess();
-          }
-
-          // Parse platform name.
-          auto Plat = platformFromString(Tok.getText());
-          if (!Plat.hasValue()) {
-            diagnose(Tok.getLoc(),
-                     diag::originally_defined_in_unrecognized_platform);
-            SuppressLaterDiags = true;
-            return makeParserError();
-          } else {
-            consumeToken();
-            Platform = *Plat;
-          }
-          // Parse version number
-          llvm::VersionTuple VerTuple;
-          SourceRange VersionRange;
-          if (parseVersionTuple(VerTuple, VersionRange,
-              Diagnostic(diag::attr_availability_expected_version, AttrName))) {
-            SuppressLaterDiags = true;
-            return makeParserError();
-          } else {
-            if (VerTuple.getSubminor().hasValue() ||
-                VerTuple.getBuild().hasValue()) {
-              diagnose(Tok.getLoc(), diag::originally_defined_in_major_minor_only);
-            }
-            // * as platform name isn't supported.
-            if (Platform == PlatformKind::none) {
-              diagnose(AtLoc, diag::originally_defined_in_missing_platform_name);
-            } else {
-              PlatformAndVersions.emplace_back(Platform, VerTuple);
-            }
-            return makeParserSuccess();
-          }
-        }
-        diagnose(AtLoc, diag::originally_defined_in_need_platform_version);
-        SuppressLaterDiags = true;
-        return makeParserError();
+        ParserStatus ListItemStatus =
+            parsePlatformVersionInList(AttrName, PlatformAndVersions);
+        if (ListItemStatus.isErrorOrHasCompletion())
+          SuppressLaterDiags = true;
+        return ListItemStatus;
       }
       }
       llvm_unreachable("invalid next segment kind");
@@ -2541,7 +2481,7 @@ bool Parser::parseNewDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc,
       return false;
     }
     if (PlatformAndVersions.empty()) {
-      diagnose(AtLoc, diag::originally_defined_in_need_platform_version);
+      diagnose(AtLoc, diag::attr_availability_need_platform_version, AttrName);
       return false;
     }
 
@@ -2862,8 +2802,12 @@ bool Parser::parseNewDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc,
     break;
   }
   case DAK_TypeSequence: {
-    auto range = SourceRange(Loc, Tok.getRange().getStart());
-    Attributes.add(TypeSequenceAttr::create(Context, AtLoc, range));
+    if (Context.LangOpts.EnableExperimentalVariadicGenerics) {
+      auto range = SourceRange(Loc, Tok.getRange().getStart());
+      Attributes.add(TypeSequenceAttr::create(Context, AtLoc, range));
+    } else {
+      DiscardAttribute = true;
+    }
     break;
   }
 
@@ -7963,6 +7907,116 @@ ParserResult<ClassDecl> Parser::parseDeclClass(ParseDeclOptions Flags,
   return DCC.fixupParserResult(Status, CD);
 }
 
+ParserStatus Parser::parsePrimaryAssociatedTypes(
+    SmallVectorImpl<AssociatedTypeDecl *> &AssocTypes) {
+  SyntaxParsingContext GPSContext(SyntaxContext,
+                                  SyntaxKind::PrimaryAssociatedTypeClause);
+
+  SourceLoc LAngleLoc = consumeStartingLess();
+
+  auto Result = parsePrimaryAssociatedTypeList(AssocTypes);
+
+  // Parse the closing '>'.
+  SourceLoc RAngleLoc;
+  if (startsWithGreater(Tok)) {
+    RAngleLoc = consumeStartingGreater();
+  } else {
+    diagnose(Tok, diag::expected_rangle_primary_associated_type_list);
+    diagnose(LAngleLoc, diag::opening_angle);
+
+    // Skip until we hit the '>'.
+    RAngleLoc = skipUntilGreaterInTypeList();
+  }
+
+  return Result;
+}
+
+ParserStatus Parser::parsePrimaryAssociatedTypeList(
+    SmallVectorImpl<AssociatedTypeDecl *> &AssocTypes) {
+  ParserStatus Result;
+  SyntaxParsingContext PATContext(SyntaxContext,
+                                  SyntaxKind::PrimaryAssociatedTypeList);
+
+  bool HasNextParam = false;
+  do {
+    SyntaxParsingContext ATContext(SyntaxContext,
+                                   SyntaxKind::PrimaryAssociatedType);
+
+    // Note that we're parsing a declaration.
+    StructureMarkerRAII ParsingDecl(*this, Tok.getLoc(),
+                                    StructureMarkerKind::Declaration);
+
+    // Parse attributes.
+    DeclAttributes Attrs;
+    if (Tok.hasComment())
+      Attrs.add(new (Context) RawDocCommentAttr(Tok.getCommentRange()));
+    parseDeclAttributeList(Attrs);
+
+    // Parse the name of the parameter.
+    Identifier Name;
+    SourceLoc NameLoc;
+    if (parseIdentifier(Name, NameLoc, /*diagnoseDollarPrefix=*/true,
+                        diag::expected_primary_associated_type_name)) {
+      Result.setIsParseError();
+      break;
+    }
+
+    // Parse the ':' followed by a type.
+    SmallVector<InheritedEntry, 1> Inherited;
+    if (Tok.is(tok::colon)) {
+      (void)consumeToken();
+      ParserResult<TypeRepr> Ty;
+
+      if (Tok.isAny(tok::identifier, tok::code_complete, tok::kw_protocol,
+                    tok::kw_Any)) {
+        Ty = parseType();
+      } else if (Tok.is(tok::kw_class)) {
+        diagnose(Tok, diag::unexpected_class_constraint);
+        diagnose(Tok, diag::suggest_anyobject)
+        .fixItReplace(Tok.getLoc(), "AnyObject");
+        consumeToken();
+        Result.setIsParseError();
+      } else {
+        diagnose(Tok, diag::expected_generics_type_restriction, Name);
+        Result.setIsParseError();
+      }
+
+      if (Ty.hasCodeCompletion())
+        return makeParserCodeCompletionStatus();
+
+      if (Ty.isNonNull())
+        Inherited.push_back({Ty.get()});
+    }
+
+    ParserResult<TypeRepr> UnderlyingTy;
+    if (Tok.is(tok::equal)) {
+      SyntaxParsingContext InitContext(SyntaxContext,
+                                       SyntaxKind::TypeInitializerClause);
+      consumeToken(tok::equal);
+      UnderlyingTy = parseType(diag::expected_type_in_associatedtype);
+      Result |= UnderlyingTy;
+      if (UnderlyingTy.isNull())
+        return Result;
+    }
+
+    auto *AssocType = new (Context)
+        AssociatedTypeDecl(CurDeclContext, NameLoc, Name, NameLoc,
+                           UnderlyingTy.getPtrOrNull(),
+                           /*trailingWhere=*/nullptr);
+    AssocType->getAttrs() = Attrs;
+    if (!Inherited.empty())
+      AssocType->setInherited(Context.AllocateCopy(Inherited));
+    AssocType->setPrimary();
+
+    AssocTypes.push_back(AssocType);
+
+    // Parse the comma, if the list continues.
+    HasNextParam = consumeIf(tok::comma);
+  } while (HasNextParam);
+
+  return Result;
+}
+
 /// Parse a 'protocol' declaration, doing no token skipping on error.
 ///
 /// \verbatim
@@ -7970,7 +8024,17 @@ ParserResult<ClassDecl> Parser::parseDeclClass(ParseDeclOptions Flags,
 ///      protocol-head '{' protocol-member* '}'
 ///
 ///   protocol-head:
-///     'protocol' attribute-list identifier inheritance? 
+///     attribute-list 'protocol' identifier primary-associated-type-list?
+///     inheritance? 
+///
+///   primary-associated-type-list:
+///     '<' primary-associated-type+ '>'
+///
+///   primary-associated-type:
+///     identifier inheritance? default-associated-type
+///
+///   default-associated-type:
+///     '=' type
 ///
 ///   protocol-member:
 ///      decl-func
@@ -7991,12 +8055,20 @@ parseDeclProtocol(ParseDeclOptions Flags, DeclAttributes &Attributes) {
   if (Status.isErrorOrHasCompletion())
     return Status;
 
-  // Protocols don't support generic parameters, but people often want them and
-  // we want to have good error recovery if they try them out.  Parse them and
-  // produce a specific diagnostic if present.
-  if (startsWithLess(Tok)) {
-    diagnose(Tok, diag::generic_arguments_protocol);
-    maybeParseGenericParams();
+  SmallVector<AssociatedTypeDecl *, 2> PrimaryAssociatedTypes;
+
+  if (Context.LangOpts.EnableParameterizedProtocolTypes) {
+    if (startsWithLess(Tok)) {
+      Status |= parsePrimaryAssociatedTypes(PrimaryAssociatedTypes);
+    }
+  } else {
+    // Protocols don't support generic parameters, but people often want them and
+    // we want to have good error recovery if they try them out.  Parse them and
+    // produce a specific diagnostic if present.
+    if (startsWithLess(Tok)) {
+      diagnose(Tok, diag::generic_arguments_protocol);
+      maybeParseGenericParams();
+    }
   }
 
   DebuggerContextChange DCC (*this);
@@ -8034,6 +8106,12 @@ parseDeclProtocol(ParseDeclOptions Flags, DeclAttributes &Attributes) {
     CodeCompletion->setParsedDecl(Proto);
 
   ContextChange CC(*this, Proto);
+
+  // Re-parent the primary associated type declarations into the protocol.
+  for (auto *AssocType : PrimaryAssociatedTypes) {
+    AssocType->setDeclContext(Proto);
+    Proto->addMember(AssocType);
+  }
 
   // Parse the body.
   {

@@ -892,6 +892,7 @@ private:
                     bool openBracket = true, bool closeBracket = true);
   void printGenericDeclGenericParams(GenericContext *decl);
   void printDeclGenericRequirements(GenericContext *decl);
+  void printPrimaryAssociatedTypes(ProtocolDecl *decl);
   void printBodyIfNecessary(const AbstractFunctionDecl *decl);
 
   void printEnumElement(EnumElementDecl *elt);
@@ -1380,7 +1381,8 @@ struct RequirementPrintLocation {
 /// function does: asking "where should this requirement be printed?" and then
 /// callers check if the location is the ATD.
 static RequirementPrintLocation
-bestRequirementPrintLocation(ProtocolDecl *proto, const Requirement &req) {
+bestRequirementPrintLocation(ProtocolDecl *proto, const Requirement &req,
+                             PrintOptions opts, bool inheritanceClause) {
   auto protoSelf = proto->getProtocolSelfType();
   // Returns the most relevant decl within proto connected to outerType (or null
   // if one doesn't exist), and whether the type is an "direct use",
@@ -1397,6 +1399,7 @@ bestRequirementPrintLocation(ProtocolDecl *proto, const Requirement &req) {
         return true;
       } else if (auto DMT = t->getAs<DependentMemberType>()) {
         auto assocType = DMT->getAssocType();
+
         if (assocType && assocType->getProtocol() == proto) {
           relevantDecl = assocType;
           foundType = t;
@@ -1411,6 +1414,17 @@ bestRequirementPrintLocation(ProtocolDecl *proto, const Requirement &req) {
     // If we didn't find anything, relevantDecl and foundType will be null, as
     // desired.
     auto directUse = foundType && outerType->isEqual(foundType);
+
+    // Prefer to attach requirements to associated type declarations,
+    // unless the associated type is a primary associated type and
+    // we're printing primary associated types using the new syntax.
+    if (!directUse &&
+        relevantDecl &&
+        opts.PrintPrimaryAssociatedTypes &&
+        isa<AssociatedTypeDecl>(relevantDecl) &&
+        cast<AssociatedTypeDecl>(relevantDecl)->isPrimary())
+      relevantDecl = proto;
+
     return std::make_pair(relevantDecl, directUse);
   };
 
@@ -1481,7 +1495,8 @@ void PrintAST::printInheritedFromRequirementSignature(ProtocolDecl *proto,
           return false;
         }
 
-        auto location = bestRequirementPrintLocation(proto, req);
+        auto location = bestRequirementPrintLocation(proto, req, Options,
+                                                     /*inheritanceClause=*/true);
         return location.AttachedTo == attachingTo && !location.InWhereClause;
       });
 }
@@ -1496,7 +1511,8 @@ void PrintAST::printWhereClauseFromRequirementSignature(ProtocolDecl *proto,
                             proto->getRequirementSignature().getRequirements()),
       flags,
       [&](const Requirement &req) {
-        auto location = bestRequirementPrintLocation(proto, req);
+        auto location = bestRequirementPrintLocation(proto, req, Options,
+                                                     /*inheritanceClause=*/false);
         return location.AttachedTo == attachingTo && location.InWhereClause;
       });
 }
@@ -2969,6 +2985,35 @@ static void suppressingFeatureUnsafeInheritExecutor(PrintOptions &options,
   options.ExcludeAttrList.resize(originalExcludeAttrCount);
 }
 
+static bool usesFeaturePrimaryAssociatedTypes(Decl *decl) {
+  if (auto *protoDecl = dyn_cast<ProtocolDecl>(decl)) {
+    if (protoDecl->getPrimaryAssociatedTypes().size() > 0)
+      return true;
+  }
+
+  return false;
+}
+
+static void suppressingFeaturePrimaryAssociatedTypes(PrintOptions &options,
+                                         llvm::function_ref<void()> action) {
+  bool originalPrintPrimaryAssociatedTypes = options.PrintPrimaryAssociatedTypes;
+  options.PrintPrimaryAssociatedTypes = false;
+  action();
+  options.PrintPrimaryAssociatedTypes = originalPrintPrimaryAssociatedTypes;
+}
+
+static bool usesFeatureUnavailableFromAsync(Decl *decl) {
+  return decl->getAttrs().hasAttribute<UnavailableFromAsyncAttr>();
+}
+
+static void
+suppressingFeatureUnavailableFromAsync(PrintOptions &options,
+                                       llvm::function_ref<void()> action) {
+  unsigned originalExcludeAttrCount = options.ExcludeAttrList.size();
+  options.ExcludeAttrList.push_back(DAK_UnavailableFromAsync);
+  action();
+  options.ExcludeAttrList.resize(originalExcludeAttrCount);
+}
 
 /// Suppress the printing of a particular feature.
 static void suppressingFeature(PrintOptions &options, Feature feature,
@@ -3485,6 +3530,38 @@ void PrintAST::visitClassDecl(ClassDecl *decl) {
   }
 }
 
+void PrintAST::printPrimaryAssociatedTypes(ProtocolDecl *decl) {
+  auto primaryAssocTypes = decl->getPrimaryAssociatedTypes();
+  if (primaryAssocTypes.empty())
+    return;
+
+  Printer.printStructurePre(PrintStructureKind::DeclGenericParameterClause);
+
+  Printer << "<";
+  llvm::interleave(
+      primaryAssocTypes,
+      [&](AssociatedTypeDecl *assocType) {
+        Printer.callPrintStructurePre(PrintStructureKind::GenericParameter,
+                                      assocType);
+        Printer.printName(assocType->getName(),
+                          PrintNameContext::GenericParameter);
+
+        printInheritedFromRequirementSignature(decl, assocType);
+
+        if (assocType->hasDefaultDefinitionType()) {
+          Printer << " = ";
+          assocType->getDefaultDefinitionType().print(Printer, Options);
+        }
+
+        Printer.printStructurePost(PrintStructureKind::GenericParameter,
+                                   assocType);
+      },
+      [&] { Printer << ", "; });
+  Printer << ">";
+
+  Printer.printStructurePost(PrintStructureKind::DeclGenericParameterClause);
+}
+
 void PrintAST::visitProtocolDecl(ProtocolDecl *decl) {
   printDocumentationComment(decl);
   printAttributes(decl);
@@ -3501,6 +3578,10 @@ void PrintAST::visitProtocolDecl(ProtocolDecl *decl) {
       [&]{
         Printer.printName(decl->getName());
       });
+
+    if (Options.PrintPrimaryAssociatedTypes) {
+      printPrimaryAssociatedTypes(decl);
+    }
 
     printInheritedFromRequirementSignature(decl, decl);
 
@@ -4836,20 +4917,22 @@ void PrintAST::visitRepeatWhileStmt(RepeatWhileStmt *stmt) {
   visit(stmt->getCond());
 }
 
-void PrintAST::printStmtCondition(StmtCondition stmt) {
-  for (auto elt : stmt) {
-    if (auto pattern = elt.getPatternOrNull()) {
-      printPattern(pattern);
-      auto initializer = elt.getInitializer();
-      if (initializer) {
-        Printer << " = ";
-        visit(initializer);
-      }
-    }
-    else if (auto boolean = elt.getBooleanOrNull()) {
-      visit(boolean);
-    }
-  }
+void PrintAST::printStmtCondition(StmtCondition condition) {
+  interleave(
+      condition,
+      [&](StmtConditionElement &elt) {
+        if (auto pattern = elt.getPatternOrNull()) {
+          printPattern(pattern);
+          auto initializer = elt.getInitializer();
+          if (initializer) {
+            Printer << " = ";
+            visit(initializer);
+          }
+        } else if (auto boolean = elt.getBooleanOrNull()) {
+          visit(boolean);
+        }
+      },
+      [&] { Printer << ", "; });
 }
 
 void PrintAST::visitDoStmt(DoStmt *stmt) {
@@ -4997,6 +5080,14 @@ bool Decl::shouldPrintInContext(const PrintOptions &PO) const {
     return PO.PrintIfConfig;
   }
 
+  if (auto *ATD = dyn_cast<AssociatedTypeDecl>(this)) {
+    // If PO.PrintPrimaryAssociatedTypes is on, primary associated
+    // types are printed as part of the protocol declaration itself,
+    // so skip them here.
+    if (ATD->isPrimary() && PO.PrintPrimaryAssociatedTypes)
+      return false;
+  }
+
   // Print everything else.
   return true;
 }
@@ -5082,6 +5173,9 @@ class TypePrinter : public TypeVisitor<TypePrinter> {
     } else if (auto existential = dyn_cast<ExistentialType>(T.getPointer())) {
       if (!Options.PrintExplicitAny)
         return isSimpleUnderPrintOptions(existential->getConstraintType());
+    } else if (auto existential = dyn_cast<ExistentialMetatypeType>(T.getPointer())) {
+      if (!Options.PrintExplicitAny)
+        return isSimpleUnderPrintOptions(existential->getInstanceType());
     }
     return T->hasSimpleTypeRepr();
   }
@@ -5502,10 +5596,32 @@ public:
       }
     }
 
-    if (T->is<ExistentialMetatypeType>() && Options.PrintExplicitAny)
-      Printer << "any ";
+    Type instanceType = T->getInstanceType();
+    if (Options.PrintExplicitAny) {
+      if (T->is<ExistentialMetatypeType>()) {
+        Printer << "any ";
 
-    printWithParensIfNotSimple(T->getInstanceType());
+        // FIXME: We need to replace nested existential metatypes so that
+        // we don't print duplicate 'any'. This will be unnecessary once
+        // ExistentialMetatypeType is split into ExistentialType(MetatypeType).
+        instanceType = Type(instanceType).transform([](Type type) -> Type {
+          if (auto existential = type->getAs<ExistentialMetatypeType>())
+            return MetatypeType::get(existential->getInstanceType());
+
+          return type;
+        });
+      } else if (instanceType->isAny() || instanceType->isAnyObject()) {
+        // FIXME: 'any' is needed to distinguish between '(any Any).Type'
+        // and 'any Any.Type'. However, this combined with the above hack
+        // to replace nested existential metatypes with metatypes causes
+        // a bug in printing nested existential metatypes for Any and AnyObject,
+        // e.g. 'any (any Any).Type.Type'. This will be fixed by using
+        // ExistentialType for Any and AnyObject.
+        instanceType = ExistentialType::get(instanceType, /*forceExistential=*/true);
+      }
+    }
+
+    printWithParensIfNotSimple(instanceType);
 
     // We spell normal metatypes of existential types as .Protocol.
     if (isa<MetatypeType>(T) &&
@@ -6080,8 +6196,14 @@ public:
   }
 
   void visitVariadicSequenceType(VariadicSequenceType *T) {
-    visit(T->getBaseType());
-    Printer << "...";
+    if (Options.PrintForSIL) {
+      Printer << "[";
+      visit(T->getBaseType());
+      Printer << "]";
+    } else {
+      visit(T->getBaseType());
+      Printer << "...";
+    }
   }
 
   void visitProtocolType(ProtocolType *T) {
@@ -6205,7 +6327,11 @@ public:
       if (printNamedOpaque())
         return;
 
-      visit(T->getExistentialType());
+      auto constraint = T->getExistentialType();
+      if (auto existential = constraint->getAs<ExistentialType>())
+        constraint = existential->getConstraintType();
+
+      visit(constraint);
       return;
     }
     case PrintOptions::OpaqueReturnTypePrintingMode::StableReference: {

@@ -145,9 +145,16 @@ namespace {
 ///
 class TaskFutureWaitAsyncContext : public AsyncContext {
 public:
+  // The ABI reserves three words of storage for these contexts, which
+  // we currently use as follows.  These fields are not accessed by
+  // generated code; they're purely internal to the runtime, and only
+  // when the calling task actually suspends.
+  //
+  // (If you think three words is an odd choice, one of them used to be
+  // the context flags.)
   SwiftError *errorResult;
-
   OpaqueValue *successResultPointer;
+  void *_reserved;
 
   void fillWithSuccess(AsyncTask::FutureFragment *future) {
     fillWithSuccess(future->getStoragePtr(), future->getResultType(),
@@ -280,12 +287,22 @@ class alignas(2 * sizeof(void*)) ActiveTaskStatus {
     /// actor. This bit is cleared when a starts running on a thread, suspends
     /// or is completed.
     IsEnqueued = 0x1000,
+
+#ifndef NDEBUG
+    /// Task has been completed.  This is purely used to enable an assertion
+    /// that the task is completed when we destroy it.
+    IsComplete = 0x2000,
+#endif
   };
 
+  // Note: this structure is mirrored by ActiveTaskStatusWithEscalation and
+  // ActiveTaskStatusWithoutEscalation in
+  // include/swift/Reflection/RuntimeInternals.h. Any changes to the layout here
+  // must also be made there.
 #if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION && SWIFT_POINTER_IS_4_BYTES
   uint32_t Flags;
   dispatch_lock_t ExecutionLock;
-  uint32_t Unused;
+  LLVM_ATTRIBUTE_UNUSED uint32_t Unused = {};
 #elif SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION && SWIFT_POINTER_IS_8_BYTES
   uint32_t Flags;
   dispatch_lock_t ExecutionLock;
@@ -293,7 +310,7 @@ class alignas(2 * sizeof(void*)) ActiveTaskStatus {
   uint32_t Flags;
 #else /* !SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION && SWIFT_POINTER_IS_8_BYTES */
   uint32_t Flags;
-  uint32_t Unused;
+  LLVM_ATTRIBUTE_UNUSED uint32_t Unused = {};
 #endif
   TaskStatusRecord *Record;
 
@@ -393,6 +410,20 @@ public:
 #endif
   }
 
+#ifndef NDEBUG
+  bool isComplete() const {
+    return Flags & IsComplete;
+  }
+
+  ActiveTaskStatus withComplete() const {
+#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
+    return ActiveTaskStatus(Record, Flags | IsComplete, ExecutionLock);
+#else
+    return ActiveTaskStatus(Record, Flags | IsComplete);
+#endif
+  }
+#endif
+
   /// Is there a lock on the linked list of status records?
   bool isStatusRecordLocked() const { return Flags & IsStatusRecordLocked; }
   ActiveTaskStatus withLockingRecord(TaskStatusRecord *lockRecord) const {
@@ -480,7 +511,9 @@ public:
   }
 
   void traceStatusChanged(AsyncTask *task) {
-    concurrency::trace::task_status_changed(task, Flags);
+    concurrency::trace::task_status_changed(
+        task, static_cast<uint8_t>(getStoredPriority()), isCancelled(),
+        isStoredPriorityEscalated(), isRunning(), isEnqueued());
   }
 };
 
@@ -564,6 +597,9 @@ struct AsyncTask::PrivateStorage {
       auto newStatus = oldStatus.withRunning(false);
       newStatus = newStatus.withoutStoredPriorityEscalation();
       newStatus = newStatus.withoutEnqueued();
+#ifndef NDEBUG
+      newStatus = newStatus.withComplete();
+#endif
 
       // This can fail since the task can still get concurrently cancelled or
       // escalated.
@@ -650,6 +686,7 @@ retry:;
   while (true) {
     // We can get here from being suspended or being enqueued
     assert(!oldStatus.isRunning());
+    assert(!oldStatus.isComplete());
 
 #if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
     // Task's priority is greater than the thread's - do a self escalation
@@ -740,7 +777,10 @@ inline void AsyncTask::flagAsAndEnqueueOnExecutor(ExecutorRef newExecutor) {
 
   // Set up task for enqueue to next location by setting the Job priority field
   Flags.setPriority(newStatus.getStoredPriority());
-  concurrency::trace::task_flags_changed(this, Flags.getOpaqueValue());
+  concurrency::trace::task_flags_changed(
+      this, static_cast<uint8_t>(Flags.getPriority()), Flags.task_isChildTask(),
+      Flags.task_isFuture(), Flags.task_isGroupChildTask(),
+      Flags.task_isAsyncLetTask());
 
   swift_task_enqueue(this, newExecutor);
 }

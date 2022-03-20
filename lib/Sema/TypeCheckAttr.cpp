@@ -66,6 +66,45 @@ public:
                                         std::forward<ArgTypes>(Args)...);
   }
 
+  /// Emits a diagnostic with a fixit to remove the attribute if the attribute
+  /// is applied to a non-public declaration. Returns true if a diagnostic was
+  /// emitted.
+  bool diagnoseAndRemoveAttrIfDeclIsNonPublic(DeclAttribute *attr,
+                                              bool isError) {
+    if (auto *VD = dyn_cast<ValueDecl>(D)) {
+      auto access =
+          VD->getFormalAccessScope(/*useDC=*/nullptr,
+                                   /*treatUsableFromInlineAsPublic=*/true);
+      if (!access.isPublic()) {
+        diagnoseAndRemoveAttr(
+            attr,
+            isError ? diag::attr_not_on_decl_with_invalid_access_level
+                    : diag::attr_has_no_effect_on_decl_with_access_level,
+            attr, access.accessLevelForDiagnostics());
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// Emits a diagnostic if there is no availability specified for the given
+  /// platform, as required by the given attribute. Returns true if a diagnostic
+  /// was emitted.
+  bool diagnoseMissingAvailability(DeclAttribute *attr, PlatformKind platform) {
+    auto IntroVer = D->getIntroducedOSVersion(platform);
+    if (IntroVer.hasValue())
+      return false;
+
+    if (auto *VD = dyn_cast<ValueDecl>(D)) {
+      diagnose(attr->AtLoc, diag::attr_requires_decl_availability_for_platform,
+               attr, VD->getName(), prettyPlatformString(platform));
+    } else {
+      diagnose(attr->AtLoc, diag::attr_requires_availability_for_platform, attr,
+               prettyPlatformString(platform));
+    }
+    return true;
+  }
+
   template <typename... ArgTypes>
   InFlightDiagnostic diagnose(ArgTypes &&... Args) const {
     return Ctx.Diags.diagnose(std::forward<ArgTypes>(Args)...);
@@ -256,7 +295,7 @@ public:
 
   void visitImplementationOnlyAttr(ImplementationOnlyAttr *attr);
   void visitNonEphemeralAttr(NonEphemeralAttr *attr);
-  void checkOriginalDefinedInAttrs(Decl *D, ArrayRef<OriginallyDefinedInAttr*> Attrs);
+  void checkOriginalDefinedInAttrs(ArrayRef<OriginallyDefinedInAttr *> Attrs);
 
   void visitDifferentiableAttr(DifferentiableAttr *attr);
   void visitDerivativeAttr(DerivativeAttr *attr);
@@ -277,9 +316,9 @@ public:
 
   void visitUnsafeInheritExecutorAttr(UnsafeInheritExecutorAttr *attr);
 
-  void visitPrimaryAssociatedTypeAttr(PrimaryAssociatedTypeAttr *attr);
+  void checkBackDeployAttrs(ArrayRef<BackDeployAttr *> Attrs);
 
-  void checkBackDeployAttrs(Decl *D, ArrayRef<BackDeployAttr *> Attrs);
+  void visitKnownToBeLocalAttr(KnownToBeLocalAttr *attr);
 };
 
 } // end anonymous namespace
@@ -901,7 +940,7 @@ void AttributeChecker::visitAccessControlAttr(AccessControlAttr *attr) {
   if (attr->getAccess() == AccessLevel::Open) {
     auto classDecl = dyn_cast<ClassDecl>(D);
     if (!(classDecl && !classDecl->isActor()) &&
-        !D->isPotentiallyOverridable() &&
+        !D->isSyntacticallyOverridable() &&
         !attr->isInvalid()) {
       diagnose(attr->getLocation(), diag::access_control_open_bad_decl)
         .fixItReplace(attr->getRange(), "public");
@@ -1268,8 +1307,9 @@ void TypeChecker::checkDeclAttributes(Decl *D) {
     TypeChecker::applyAccessNote(VD);
 
   AttributeChecker Checker(D);
-  // We need to check all OriginallyDefinedInAttr relative to each other, so
-  // collect them and check in batch later.
+  // We need to check all OriginallyDefinedInAttr and BackDeployAttr relative
+  // to each other, so collect them and check in batch later.
+  llvm::SmallVector<BackDeployAttr *, 4> backDeployAttrs;
   llvm::SmallVector<OriginallyDefinedInAttr*, 4> ODIAttrs;
   for (auto attr : D->getAttrs()) {
     if (!attr->isValid()) continue;
@@ -1279,6 +1319,8 @@ void TypeChecker::checkDeclAttributes(Decl *D) {
     if (attr->canAppearOnDecl(D)) {
       if (auto *ODI = dyn_cast<OriginallyDefinedInAttr>(attr)) {
         ODIAttrs.push_back(ODI);
+      } else if (auto *BD = dyn_cast<BackDeployAttr>(attr)) {
+        backDeployAttrs.push_back(BD);
       } else {
         // Otherwise, check it.
         Checker.visit(attr);
@@ -1319,7 +1361,8 @@ void TypeChecker::checkDeclAttributes(Decl *D) {
     else
       Checker.diagnoseAndRemoveAttr(attr, diag::invalid_decl_attribute, attr);
   }
-  Checker.checkOriginalDefinedInAttrs(D, ODIAttrs);
+  Checker.checkBackDeployAttrs(backDeployAttrs);
+  Checker.checkOriginalDefinedInAttrs(ODIAttrs);
 }
 
 /// Returns true if the given method is an valid implementation of a
@@ -1569,6 +1612,13 @@ static Decl *getEnclosingDeclForDecl(Decl *D) {
 void AttributeChecker::visitAvailableAttr(AvailableAttr *attr) {
   if (Ctx.LangOpts.DisableAvailabilityChecking)
     return;
+
+  while (attr->IsSPI) {
+    if (attr->hasPlatform() && attr->Introduced.hasValue())
+      break;
+    diagnoseAndRemoveAttr(attr, diag::spi_available_malformed);
+    break;
+  }
 
   if (auto *PD = dyn_cast<ProtocolDecl>(D->getDeclContext())) {
     if (auto *VD = dyn_cast<ValueDecl>(D)) {
@@ -2018,65 +2068,23 @@ synthesizeMainBody(AbstractFunctionDecl *fn, void *arg) {
 static FuncDecl *resolveMainFunctionDecl(DeclContext *declContext,
                                          ResolvedMemberResult &resolution,
                                          ASTContext &ctx) {
-  // The normal resolution mechanism won't choose the asynchronous main function
-  // unless no other options are available because extensions and generic types
-  // (structs/classes) are not considered asynchronous contexts.
-  // We want them to be promoted to a viable entrypoint if the deployment target
-  // is high enough.
-  SmallVector<FuncDecl *, 4> viableCandidates;
+  // Choose the best overload if it's a main function
+  if (resolution.hasBestOverload()) {
+    ValueDecl *best = resolution.getBestOverload();
+    if (FuncDecl *func = dyn_cast<FuncDecl>(best)) {
+      if (func->isMainTypeMainMethod()) {
+        return func;
+      }
+    }
+  }
+  // Look for the most highly-ranked main-function candidate
   for (ValueDecl *candidate : resolution.getMemberDecls(Viable)) {
-    if (FuncDecl *function = dyn_cast<FuncDecl>(candidate)) {
-      if (function->isMainTypeMainMethod())
-        viableCandidates.push_back(function);
+    if (FuncDecl *func = dyn_cast<FuncDecl>(candidate)) {
+      if (func->isMainTypeMainMethod())
+        return func;
     }
   }
-  if (viableCandidates.empty()) {
-    return nullptr;
-  }
-
-  AvailabilityContext contextAvailability =
-      AvailabilityContext::forDeploymentTarget(ctx);
-  const bool hasAsyncSupport = contextAvailability.isContainedIn(
-      ctx.getBackDeployedConcurrencyAvailability());
-
-  FuncDecl *best = nullptr;
-  for (FuncDecl *candidate : viableCandidates) {
-    // The candidate will work if it's synchronous, or if we support concurrency
-    // and it is async, or if we are in YOLO mode
-    const bool candidateWorks = !candidate->hasAsync() ||
-                                (hasAsyncSupport && candidate->hasAsync()) ||
-                                ctx.LangOpts.DisableAvailabilityChecking;
-
-    // Skip it if it won't work
-    if (!candidateWorks)
-      continue;
-
-    // If we don't have a best, the candidate is the best so far
-    if (!best) {
-      best = candidate;
-      continue;
-    }
-
-    // If the candidate is better and it's synchronous, just swap it right in.
-    // If the candidate is better and it's async, make sure we support async
-    // before selecting it.
-    //
-    // If it's unordered (equally bestest), use the async version if we support
-    // it or use the sync version if we don't.
-    const Comparison rank =
-        TypeChecker::compareDeclarations(declContext, candidate, best);
-    const bool isBetter = rank == Comparison::Better;
-    const bool isUnordered = rank == Comparison::Unordered;
-    const bool swapForAsync =
-        hasAsyncSupport && candidate->hasAsync() && !best->hasAsync();
-    const bool swapForSync =
-        !hasAsyncSupport && !candidate->hasAsync() && best->hasAsync();
-    const bool selectCandidate =
-        isBetter || (isUnordered && (swapForAsync || swapForSync));
-    if (selectCandidate)
-      best = candidate;
-  }
-  return best;
+  return nullptr;
 }
 
 FuncDecl *
@@ -3267,15 +3275,30 @@ void AttributeChecker::visitPropertyWrapperAttr(PropertyWrapperAttr *attr) {
 
 void AttributeChecker::visitResultBuilderAttr(ResultBuilderAttr *attr) {
   auto *nominal = dyn_cast<NominalTypeDecl>(D);
+  auto &ctx = D->getASTContext();
   SmallVector<ValueDecl *, 4> potentialMatches;
   bool supportsBuildBlock = TypeChecker::typeSupportsBuilderOp(
-      nominal->getDeclaredType(), nominal, D->getASTContext().Id_buildBlock,
+      nominal->getDeclaredType(), nominal, ctx.Id_buildBlock,
       /*argLabels=*/{}, &potentialMatches);
+  bool isBuildPartialBlockFeatureEnabled =
+      ctx.LangOpts.EnableExperimentalPairwiseBuildBlock;
+  bool supportsBuildPartialBlock = isBuildPartialBlockFeatureEnabled &&
+      TypeChecker::typeSupportsBuilderOp(
+          nominal->getDeclaredType(), nominal,
+          ctx.Id_buildPartialBlock,
+          /*argLabels=*/{ctx.Id_first}, &potentialMatches) &&
+      TypeChecker::typeSupportsBuilderOp(
+          nominal->getDeclaredType(), nominal,
+          ctx.Id_buildPartialBlock,
+          /*argLabels=*/{ctx.Id_accumulated, ctx.Id_next}, &potentialMatches);
 
-  if (!supportsBuildBlock) {
+  if (!supportsBuildBlock && !supportsBuildPartialBlock) {
     {
       auto diag = diagnose(
-          nominal->getLoc(), diag::result_builder_static_buildblock);
+          nominal->getLoc(),
+          isBuildPartialBlockFeatureEnabled
+              ? diag::result_builder_static_buildblock_or_buildpartialblock
+              : diag::result_builder_static_buildblock);
 
       // If there were no close matches, propose adding a stub.
       SourceLoc buildInsertionLoc;
@@ -3409,8 +3432,8 @@ void AttributeChecker::visitNonEphemeralAttr(NonEphemeralAttr *attr) {
   attr->setInvalid();
 }
 
-void AttributeChecker::checkOriginalDefinedInAttrs(Decl *D,
-    ArrayRef<OriginallyDefinedInAttr*> Attrs) {
+void AttributeChecker::checkOriginalDefinedInAttrs(
+    ArrayRef<OriginallyDefinedInAttr *> Attrs) {
   if (Attrs.empty())
     return;
   auto &Ctx = D->getASTContext();
@@ -3421,20 +3444,9 @@ void AttributeChecker::checkOriginalDefinedInAttrs(Decl *D,
   for (auto *Attr: Attrs) {
     static StringRef AttrName = "_originallyDefinedIn";
 
-    if (auto *VD = dyn_cast<ValueDecl>(D)) {
-      // This attribute does not make sense on private declarations since
-      // clients can't use them.
-      auto access =
-        VD->getFormalAccessScope(/*useDC=*/nullptr,
-                                 /*treatUsableFromInlineAsPublic=*/true);
-      if (!access.isPublic()) {
-        diagnoseAndRemoveAttr(Attr,
-                              diag::originally_defined_in_on_non_public,
-                              AttrName, VD->getFormalAccess());
-        continue;
-      }
-    }
-    
+    if (diagnoseAndRemoveAttrIfDeclIsNonPublic(Attr, /*isError=*/false))
+      continue;
+
     if (!Attr->isActivePlatform(Ctx))
       continue;
     auto AtLoc = Attr->AtLoc;
@@ -3443,7 +3455,7 @@ void AttributeChecker::checkOriginalDefinedInAttrs(Decl *D,
       // We've seen the platform before, emit error to the previous one which
       // comes later in the source order.
       diagnose(seenPlatforms[Platform],
-               diag::originally_defined_in_dupe_platform,
+               diag::attr_contains_multiple_versions_for_platform, Attr,
                platformString(Platform));
       return;
     }
@@ -3451,12 +3463,11 @@ void AttributeChecker::checkOriginalDefinedInAttrs(Decl *D,
       diagnose(AtLoc, diag::originally_definedin_topleve_decl, AttrName);
       return;
     }
-    auto IntroVer = D->getIntroducedOSVersion(Platform);
-    if (!IntroVer.hasValue()) {
-      diagnose(AtLoc, diag::originally_definedin_need_available,
-               AttrName);
+
+    if (diagnoseMissingAvailability(Attr, Platform))
       return;
-    }
+
+    auto IntroVer = D->getIntroducedOSVersion(Platform);
     if (IntroVer.getValue() > Attr->MovedVersion) {
       diagnose(AtLoc,
                diag::originally_definedin_must_not_before_available_version,
@@ -3466,9 +3477,103 @@ void AttributeChecker::checkOriginalDefinedInAttrs(Decl *D,
   }
 }
 
-void AttributeChecker::checkBackDeployAttrs(Decl *D,
-    ArrayRef<BackDeployAttr *> Attrs) {
-  // FIXME(backDeploy): Diagnose incompatible uses of `@_backDeploy
+void AttributeChecker::checkBackDeployAttrs(ArrayRef<BackDeployAttr *> Attrs) {
+  if (Attrs.empty())
+    return;
+
+  // Diagnose conflicting attributes. @_alwaysEmitIntoClient, @inlinable, and
+  // @_transparent all conflict with back deployment because they each cause the
+  // body of a function to be copied into the client under certain conditions
+  // and would defeat the goal of back deployment, which is to always use the
+  // ABI version of the declaration when it is available.
+  if (auto *AEICA = D->getAttrs().getAttribute<AlwaysEmitIntoClientAttr>()) {
+    diagnoseAndRemoveAttr(AEICA, diag::attr_incompatible_with_back_deploy,
+                          AEICA, D->getDescriptiveKind());
+  }
+
+  if (auto *IA = D->getAttrs().getAttribute<InlinableAttr>()) {
+    diagnoseAndRemoveAttr(IA, diag::attr_incompatible_with_back_deploy, IA,
+                          D->getDescriptiveKind());
+  }
+
+  if (auto *TA = D->getAttrs().getAttribute<TransparentAttr>()) {
+    diagnoseAndRemoveAttr(TA, diag::attr_incompatible_with_back_deploy, TA,
+                          D->getDescriptiveKind());
+  }
+
+  // @objc conflicts with back deployment since it implies dynamic dispatch.
+  if (auto *OA = D->getAttrs().getAttribute<ObjCAttr>()) {
+    diagnose(OA->getLocation(), diag::attr_incompatible_with_back_deploy, OA,
+             D->getDescriptiveKind());
+  }
+
+  // Only functions, methods, computed properties, and subscripts are
+  // back-deployable, so D should be ValueDecl.
+  auto *VD = cast<ValueDecl>(D);
+  std::map<PlatformKind, SourceLoc> seenPlatforms;
+
+  for (auto *Attr : Attrs) {
+    // Back deployment only makes sense for public declarations.
+    if (diagnoseAndRemoveAttrIfDeclIsNonPublic(Attr, /*isError=*/true))
+      continue;
+
+    // Back deployment isn't compatible with dynamic dispatch.
+    if (VD->isSyntacticallyOverridable()) {
+      diagnose(Attr->getLocation(), diag::attr_incompatible_with_non_final,
+               Attr, D->getDescriptiveKind());
+      continue;
+    }
+
+    if (auto *VarD = dyn_cast<VarDecl>(D)) {
+      // There must be a function body to back deploy so for vars we require
+      // that they be computed in order to allow back deployment.
+      if (VarD->hasStorageOrWrapsStorage()) {
+        diagnoseAndRemoveAttr(Attr, diag::attr_not_on_stored_properties, Attr);
+        continue;
+      }
+    }
+
+    // FIXME(backDeploy): support coroutines rdar://90111169
+    auto diagnoseCoroutineIfNecessary = [&](AccessorDecl *AD) {
+      if (AD->isCoroutine())
+        diagnose(Attr->getLocation(), diag::back_deploy_not_on_coroutine,
+                 Attr, AD->getDescriptiveKind());
+    };
+    if (auto *ASD = dyn_cast<AbstractStorageDecl>(D)) {
+      ASD->visitEmittedAccessors([&](AccessorDecl *AD) {
+        diagnoseCoroutineIfNecessary(AD);
+      });
+    }
+    if (auto *AD = dyn_cast<AccessorDecl>(D)) {
+      diagnoseCoroutineIfNecessary(AD);
+    }
+
+    auto AtLoc = Attr->AtLoc;
+    auto Platform = Attr->Platform;
+
+    if (!seenPlatforms.insert({Platform, AtLoc}).second) {
+      // We've seen the platform before, emit error to the previous one which
+      // comes later in the source order.
+      diagnose(seenPlatforms[Platform],
+               diag::attr_contains_multiple_versions_for_platform, Attr,
+               platformString(Platform));
+      continue;
+    }
+
+    // Require explicit availability for back deployed decls.
+    if (diagnoseMissingAvailability(Attr, Platform))
+      continue;
+
+    // Verify that the decl is available before the back deployment boundary.
+    // If it's not, the attribute doesn't make sense since the back deployment
+    // fallback could never be executed at runtime.
+    auto IntroVer = D->getIntroducedOSVersion(Platform);
+    if (Attr->Version <= IntroVer.getValue()) {
+      diagnose(AtLoc, diag::attr_has_no_effect_decl_not_available_before, Attr,
+               VD->getName(), prettyPlatformString(Platform), Attr->Version);
+      continue;
+    }
+  }
 }
 
 Type TypeChecker::checkReferenceOwnershipAttr(VarDecl *var, Type type,
@@ -5592,24 +5697,23 @@ void AttributeChecker::visitDistributedActorAttr(DistributedActorAttr *attr) {
     }
 
     // distributed func must be declared inside an distributed actor
-    if (dc->getSelfClassDecl() &&
-        !dc->getSelfClassDecl()->isDistributedActor()) {
-      diagnoseAndRemoveAttr(
-          attr, diag::distributed_actor_func_not_in_distributed_actor);
-      return;
-    } else if (auto protoDecl = dc->getSelfProtocolDecl()){
-      if (!protoDecl->inheritsFromDistributedActor()) {
-        auto diag = diagnoseAndRemoveAttr(
-            attr, diag::distributed_actor_func_not_in_distributed_actor);
-        diagnoseDistributedFunctionInNonDistributedActorProtocol(
-            protoDecl, diag);
-        return;
+    auto selfTy = dc->getSelfTypeInContext();
+    if (!selfTy->isDistributedActor()) {
+      auto diagnostic = diagnoseAndRemoveAttr(
+        attr, diag::distributed_actor_func_not_in_distributed_actor);
+
+      if (auto *protoDecl = dc->getSelfProtocolDecl()) {
+        diagnoseDistributedFunctionInNonDistributedActorProtocol(protoDecl,
+                                                                 diagnostic);
       }
-    } else if (dc->getSelfStructDecl() || dc->getSelfEnumDecl()) {
-      diagnoseAndRemoveAttr(
-          attr, diag::distributed_actor_func_not_in_distributed_actor);
       return;
     }
+  }
+}
+
+void AttributeChecker::visitKnownToBeLocalAttr(KnownToBeLocalAttr *attr) {
+  if (!D->isImplicit()) {
+    diagnoseAndRemoveAttr(attr, diag::distributed_local_cannot_be_used);
   }
 }
 
@@ -5824,10 +5928,6 @@ void AttributeChecker::visitUnsafeInheritExecutorAttr(
   if (!fn->isAsyncContext()) {
     diagnose(attr->getLocation(), diag::inherits_executor_without_async);
   }
-}
-
-void AttributeChecker::visitPrimaryAssociatedTypeAttr(
-    PrimaryAssociatedTypeAttr *attr) {
 }
 
 namespace {

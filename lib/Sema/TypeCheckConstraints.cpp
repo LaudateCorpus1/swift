@@ -130,6 +130,10 @@ bool TypeVariableType::Implementation::isTypeSequence() const {
       && locator->getGenericParameter()->isTypeSequence();
 }
 
+bool TypeVariableType::Implementation::isCodeCompletionToken() const {
+  return locator && locator->directlyAt<CodeCompletionExpr>();
+}
+
 void *operator new(size_t bytes, ConstraintSystem& cs,
                    size_t alignment) {
   return cs.getAllocator().Allocate(bytes, alignment);
@@ -337,25 +341,23 @@ Type TypeChecker::typeCheckExpression(Expr *&expr, DeclContext *dc,
 }
 
 Optional<SolutionApplicationTarget>
-TypeChecker::typeCheckExpression(
-    SolutionApplicationTarget &target,
-    TypeCheckExprOptions options) {
-  Expr *expr = target.getAsExpr();
+TypeChecker::typeCheckExpression(SolutionApplicationTarget &target,
+                                 TypeCheckExprOptions options) {
   DeclContext *dc = target.getDeclContext();
   auto &Context = dc->getASTContext();
-  FrontendStatsTracer StatsTracer(Context.Stats,
-                                  "typecheck-expr", expr);
-  PrettyStackTraceExpr stackTrace(Context, "type-checking", expr);
+  FrontendStatsTracer StatsTracer(Context.Stats, "typecheck-expr",
+                                  target.getAsExpr());
+  PrettyStackTraceExpr stackTrace(Context, "type-checking", target.getAsExpr());
 
   // First, pre-check the expression, validating any types that occur in the
   // expression and folding sequence expressions.
-  if (ConstraintSystem::preCheckExpression(
-        expr, dc, /*replaceInvalidRefsWithErrors=*/true,
-        options.contains(TypeCheckExprFlags::LeaveClosureBodyUnchecked))) {
-    target.setExpr(expr);
+  if (ConstraintSystem::preCheckTarget(
+          target, /*replaceInvalidRefsWithErrors=*/true,
+          options.contains(TypeCheckExprFlags::LeaveClosureBodyUnchecked))) {
     return None;
   }
-  target.setExpr(expr);
+
+  auto *expr = target.getAsExpr();
 
   // Check whether given expression has a code completion token which requires
   // special handling.
@@ -810,25 +812,6 @@ bool TypeChecker::typeCheckForEachBinding(DeclContext *dc, ForEachStmt *stmt) {
   if (!sequenceProto)
     return failed();
 
-  // Precheck the sequence.
-  Expr *sequence = stmt->getSequence();
-  if (ConstraintSystem::preCheckExpression(
-          sequence, dc, /*replaceInvalidRefsWithErrors=*/true,
-          /*leaveClosureBodiesUnchecked=*/false))
-    return failed();
-  stmt->setSequence(sequence);
-
-  // Precheck the filtering condition.
-  if (Expr *whereExpr = stmt->getWhere()) {
-    if (ConstraintSystem::preCheckExpression(
-            whereExpr, dc,
-            /*replaceInvalidRefsWithErrors=*/true,
-            /*leaveClosureBodiesUnchecked=*/false))
-      return failed();
-
-    stmt->setWhere(whereExpr);
-  }
-
   auto target = SolutionApplicationTarget::forForEachStmt(
       stmt, sequenceProto, dc, /*bindPatternVarsOneWay=*/false);
   if (!typeCheckExpression(target))
@@ -870,14 +853,48 @@ bool TypeChecker::typeCheckExprPattern(ExprPattern *EP, DeclContext *DC,
                                   "typecheck-expr-pattern", EP);
   PrettyStackTracePattern stackTrace(Context, "type-checking", EP);
 
+  auto tildeEqualsApplication =
+      synthesizeTildeEqualsOperatorApplication(EP, DC, rhsType);
+
+  if (!tildeEqualsApplication)
+    return true;
+
+  VarDecl *matchVar;
+  Expr *matchCall;
+
+  std::tie(matchVar, matchCall) = *tildeEqualsApplication;
+
+  // Result of `~=` should always be a boolean.
+  auto contextualTy = Context.getBoolDecl()->getDeclaredInterfaceType();
+  auto target = SolutionApplicationTarget::forExprPattern(matchCall, DC, EP,
+                                                          contextualTy);
+
+  // Check the expression as a condition.
+  auto result = typeCheckExpression(target);
+  if (!result)
+    return true;
+
+  // Save the synthesized $match variable in the pattern.
+  EP->setMatchVar(matchVar);
+  // Save the type-checked expression in the pattern.
+  EP->setMatchExpr(result->getAsExpr());
+  // Set the type on the pattern.
+  EP->setType(rhsType);
+  return false;
+}
+
+Optional<std::pair<VarDecl *, BinaryExpr *>>
+TypeChecker::synthesizeTildeEqualsOperatorApplication(ExprPattern *EP,
+                                                      DeclContext *DC,
+                                                      Type enumType) {
+  auto &Context = DC->getASTContext();
   // Create a 'let' binding to stand in for the RHS value.
   auto *matchVar =
       new (Context) VarDecl(/*IsStatic*/ false, VarDecl::Introducer::Let,
                             EP->getLoc(), Context.Id_PatternMatchVar, DC);
-  matchVar->setInterfaceType(rhsType->mapTypeOutOfContext());
+  matchVar->setInterfaceType(enumType->mapTypeOutOfContext());
 
   matchVar->setImplicit();
-  EP->setMatchVar(matchVar);
 
   // Find '~=' operators for the match.
   auto matchLookup =
@@ -887,19 +904,19 @@ bool TypeChecker::typeCheckExprPattern(ExprPattern *EP, DeclContext *DC,
   auto &diags = DC->getASTContext().Diags;
   if (!matchLookup) {
     diags.diagnose(EP->getLoc(), diag::no_match_operator);
-    return true;
+    return None;
   }
-  
+
   SmallVector<ValueDecl*, 4> choices;
   for (auto &result : matchLookup) {
     choices.push_back(result.getValueDecl());
   }
-  
+
   if (choices.empty()) {
     diags.diagnose(EP->getLoc(), diag::no_match_operator);
-    return true;
+    return None;
   }
-  
+
   // Build the 'expr ~= var' expression.
   // FIXME: Compound name locations.
   auto *matchOp =
@@ -911,15 +928,10 @@ bool TypeChecker::typeCheckExprPattern(ExprPattern *EP, DeclContext *DC,
   auto *matchVarRef = new (Context) DeclRefExpr(matchVar,
                                                 DeclNameLoc(EP->getEndLoc()),
                                                 /*Implicit=*/true);
-  Expr *matchCall = BinaryExpr::create(Context, EP->getSubExpr(), matchOp,
+  auto *matchCall = BinaryExpr::create(Context, EP->getSubExpr(), matchOp,
                                        matchVarRef, /*implicit*/ true);
-  // Check the expression as a condition.
-  bool hadError = typeCheckCondition(matchCall, DC);
-  // Save the type-checked expression in the pattern.
-  EP->setMatchExpr(matchCall);
-  // Set the type on the pattern.
-  EP->setType(rhsType);
-  return hadError;
+
+  return std::make_pair(matchVar, matchCall);
 }
 
 static Type replaceArchetypesWithTypeVariables(ConstraintSystem &cs,
@@ -1442,26 +1454,29 @@ void ConstraintSystem::print(raw_ostream &out) const {
           out << choice.getBaseType()->getString(PO) << ".";
         out << choice.getDecl()->getBaseName() << ": "
             << resolved.boundType->getString(PO) << " == "
-            << resolved.openedType->getString(PO) << "\n";
+            << resolved.openedType->getString(PO);
         break;
 
       case OverloadChoiceKind::KeyPathApplication:
         out << "key path application root "
-            << choice.getBaseType()->getString(PO) << "\n";
+            << choice.getBaseType()->getString(PO);
         break;
 
       case OverloadChoiceKind::DynamicMemberLookup:
       case OverloadChoiceKind::KeyPathDynamicMemberLookup:
-        out << "dynamic member lookup:"
-            << choice.getBaseType()->getString(PO) << "  name="
-            << choice.getName() << "\n";
+        out << "dynamic member lookup: "
+            << choice.getBaseType()->getString(PO) << " name="
+            << choice.getName();
         break;
 
       case OverloadChoiceKind::TupleIndex:
         out << "tuple " << choice.getBaseType()->getString(PO) << " index "
-            << choice.getTupleIndex() << "\n";
+            << choice.getTupleIndex();
         break;
       }
+      out << " for ";
+      elt.first->dump(&getASTContext().SourceMgr, out);
+      out << "\n";
     }
     out << "\n";
   }

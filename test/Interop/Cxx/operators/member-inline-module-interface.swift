@@ -7,6 +7,10 @@
 // CHECK:   mutating func callAsFunction(_ x: Int32, _ y: Int32) -> Int32
 // CHECK: }
 
+// CHECK: struct LoadableBoolWrapper {
+// CHECK:   static func ! (lhs: inout LoadableBoolWrapper) -> LoadableBoolWrapper
+// CHECK: }
+
 // CHECK: struct AddressOnlyIntWrapper {
 // CHECK:   mutating func callAsFunction() -> Int32
 // CHECK:   mutating func callAsFunction(_ x: Int32) -> Int32
@@ -165,4 +169,21 @@
 // CHECK:   subscript(x: Int32) -> UnsafePointer<Int32>! { mutating get }
 // CHECK:   @available(*, unavailable, message: "use subscript")
 // CHECK:   mutating func __operatorSubscriptConst(_ x: Int32) -> UnsafePointer<Int32>!
+// CHECK: }
+
+// CHECK: struct DerivedFromAddressOnlyIntWrapper {
+// CHECK:   mutating func callAsFunction() -> Int32
+// CHECK:   mutating func callAsFunction(_ x: Int32) -> Int32
+// CHECK:   mutating func callAsFunction(_ x: Int32, _ y: Int32) -> Int32
+// CHECK: }
+
+// CHECK: struct DerivedFromReadWriteIntArray {
+// CHECK:   subscript(x: Int32) -> Int32
+// CHECK:   func __operatorSubscriptConst(_ x: Int32) -> UnsafePointer<Int32>
+// CHECK:   mutating func __operatorSubscript(_ x: Int32) -> UnsafeMutablePointer<Int32>
+// CHECK: }
+
+// CHECK: struct DerivedFromNonTrivialArrayByVal {
+// CHECK:   subscript(x: Int32) -> NonTrivial { get }
+// CHECK:   mutating func __operatorSubscriptConst(_ x: Int32) -> NonTrivial
 // CHECK: }

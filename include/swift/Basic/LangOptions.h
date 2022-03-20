@@ -88,7 +88,10 @@ namespace swift {
     Enabled = 1,
 
     /// Use both and assert if the results do not match.
-    Verify = 2
+    Verify = 2,
+
+    /// Use both, print a message only but do not assert on mismatch.
+    Check = 3,
   };
 
   /// A collection of options that affect the language dialect and
@@ -130,6 +133,13 @@ namespace swift {
 
     /// The SDK canonical name, if known.
     std::string SDKName;
+
+    /// The lowest target OS version that code in this module may be inlined
+    /// into. In resilient modules, this should match the minimum
+    /// deployment target of the *first* resilient version of the module, since
+    /// clients may need to interoperate with versions as far back as that
+    /// deployment target.
+    llvm::VersionTuple MinimumInliningTargetVersion;
 
     /// The alternate name to use for the entry point instead of main.
     std::string entryPointFunctionName = "main";
@@ -334,13 +344,16 @@ namespace swift {
     bool EnableInferPublicSendable = false;
 
     /// Enable experimental 'distributed' actors and functions.
-    bool EnableExperimentalDistributed = false;
+    bool EnableExperimentalDistributed = true;
 
     /// Enable experimental 'move only' features.
     bool EnableExperimentalMoveOnly = false;
 
     /// Enable experimental pairwise `buildBlock` for result builders.
     bool EnableExperimentalPairwiseBuildBlock = false;
+
+    /// Enable variadic generics.
+    bool EnableExperimentalVariadicGenerics = false;
 
     /// Disable the implicit import of the _Concurrency module.
     bool DisableImplicitConcurrencyModuleImport =
@@ -396,9 +409,6 @@ namespace swift {
     /// Diagnose switches over non-frozen enums that do not have catch-all
     /// cases.
     bool EnableNonFrozenEnumExhaustivityDiagnostics = false;
-
-    /// Enable making top-level code support concurrency
-    bool EnableExperimentalAsyncTopLevel = false;
 
     /// Regex for the passes that should report passed and missed optimizations.
     ///
@@ -518,17 +528,31 @@ namespace swift {
     /// Enable the new experimental protocol requirement signature minimization
     /// algorithm.
     RequirementMachineMode RequirementMachineProtocolSignatures =
-        RequirementMachineMode::Disabled;
+        RequirementMachineMode::Verify;
 
     /// Enable the new experimental generic signature minimization algorithm
     /// for abstract generic signatures.
     RequirementMachineMode RequirementMachineAbstractSignatures =
-        RequirementMachineMode::Disabled;
+        RequirementMachineMode::Verify;
 
     /// Enable the new experimental generic signature minimization algorithm
     /// for user-written generic signatures.
     RequirementMachineMode RequirementMachineInferredSignatures =
-        RequirementMachineMode::Disabled;
+        RequirementMachineMode::Verify;
+
+    /// Disable preprocessing pass to eliminate conformance requirements
+    /// on generic parameters which are made concrete. Usually you want this
+    /// enabled. It can be disabled for debugging and testing.
+    bool EnableRequirementMachineConcreteContraction = true;
+
+    /// Enable the stronger minimization algorithm. This is just for debugging;
+    /// if you have a testcase which requires this, please submit a bug report.
+    bool EnableRequirementMachineLoopNormalization = false;
+
+    /// Enable experimental, more correct support for opaque result types as
+    /// concrete types. This will sometimes fail to produce a convergent
+    /// rewrite system.
+    bool EnableRequirementMachineOpaqueArchetypes = false;
 
     /// Enables dumping type witness systems from associated type inference.
     bool DumpTypeWitnessSystems = false;
@@ -716,7 +740,7 @@ namespace swift {
 
     /// Enable experimental support for type inference through multi-statement
     /// closures.
-    bool EnableMultiStatementClosureInference = false;
+    bool EnableMultiStatementClosureInference = true;
 
     /// Enable experimental support for generic parameter inference in
     /// parameter positions from associated default expressions.

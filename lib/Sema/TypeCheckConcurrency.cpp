@@ -344,12 +344,14 @@ GlobalActorAttributeRequest::evaluate(
     if (auto var = dyn_cast<VarDecl>(storage)) {
 
       // ... but not if it's an async-context top-level global
-      if (var->isTopLevelGlobal() && var->getDeclContext()->isAsyncContext()) {
+      if (var->isTopLevelGlobal() &&
+          (var->getDeclContext()->isAsyncContext() ||
+           var->getASTContext().LangOpts.WarnConcurrency)) {
         var->diagnose(diag::global_actor_top_level_var)
             .highlight(globalActorAttr->getRangeWithAt());
         return None;
       }
-      
+
       // ... and not if it's local property
       if (var->getDeclContext()->isLocalContext()) {
         var->diagnose(diag::global_actor_on_local_variable, var->getName())
@@ -1394,57 +1396,6 @@ namespace {
       return getDeclContext()->getParentModule();
     }
 
-    /// In Swift 6, global-actor isolation is not carried-over to the
-    /// initializing expressions of non-static instance properties.
-    /// The actual change happens in \c getActorIsolationOfContext ,
-    /// but this function exists to warn users of Swift 5 about this
-    /// isolation change, so that they can prepare ahead-of-time.
-    void warnAboutGlobalActorIsoChangeInSwift6(const ActorIsolation &reqIso,
-                                               const Expr *user) {
-      if (ctx.isSwiftVersionAtLeast(6))
-        return;
-
-      // Check our context stack for a PatternBindingInitializer environment.
-      DeclContext const* withinDC = nullptr;
-      for (auto dc = contextStack.rbegin(); dc != contextStack.rend(); dc++) {
-        if (isa<PatternBindingInitializer>(*dc)) {
-          withinDC = *dc;
-          break;
-        }
-      }
-
-      // Not within a relevant decl context.
-      if (!withinDC)
-        return;
-
-      // Check if this PatternBindingInitializer's isolation would change
-      // in Swift 6+
-      if (auto *var = withinDC->getNonLocalVarDecl()) {
-        if (var->isInstanceMember() &&
-            !var->getAttrs().hasAttribute<LazyAttr>()) {
-          // At this point, we know the isolation will change in Swift 6.
-          // So, let's check if that change will cause an error.
-
-          auto dcIso = getActorIsolationOfContext(
-                         const_cast<DeclContext*>(withinDC));
-
-          // If the isolation granted in Swift 5 is for a global actor, and
-          // the expression requires that global actor's isolation, then it will
-          // become an error in Swift 6.
-          if (dcIso.isGlobalActor() && dcIso == reqIso) {
-            ctx.Diags.diagnose(user->getLoc(),
-                               diag::global_actor_from_initializing_expr,
-                               reqIso.getGlobalActor(),
-                               var->getDescriptiveKind(), var->getName())
-            .highlight(user->getSourceRange())
-            // make it a warning and attach the "this will become an error..."
-            // to the message. The error in Swift 6 will not be this diagnostic.
-            .warnUntilSwiftVersion(6);
-          }
-        }
-      }
-    }
-
     /// Determine whether code in the given use context might execute
     /// concurrently with code in the definition context.
     bool mayExecuteConcurrentlyWith(
@@ -1568,15 +1519,24 @@ namespace {
     /// and we reach up to mark the CallExpr.
     void markNearestCallAsImplicitly(
         Optional<ImplicitActorHopTarget> setAsync,
-        bool setThrows = false, bool setDistributedThunk = false) {
+        bool setThrows = false,
+        bool setDistributedThunk = false) {
       assert(applyStack.size() > 0 && "not contained within an Apply?");
 
       const auto End = applyStack.rend();
       for (auto I = applyStack.rbegin(); I != End; ++I)
         if (auto call = dyn_cast<CallExpr>(*I)) {
-          if (setAsync) call->setImplicitlyAsync(*setAsync);
-          if (setThrows) call->setImplicitlyThrows(true);
-          if (setDistributedThunk) call->setShouldApplyDistributedThunk(true);
+          if (setAsync) {
+            call->setImplicitlyAsync(*setAsync);
+          }
+          if (setThrows) {
+            call->setImplicitlyThrows(true);
+          }else {
+            call->setImplicitlyThrows(false);
+          }
+          if (setDistributedThunk) {
+            call->setShouldApplyDistributedThunk(true);
+          }
           return;
         }
       llvm_unreachable("expected a CallExpr in applyStack!");
@@ -1903,6 +1863,39 @@ namespace {
       return nullptr;
     }
 
+    VarDecl *findReferencedBaseSelf(Expr *expr) {
+      if (auto selfVar = getReferencedParamOrCapture(expr))
+        if (selfVar->isSelfParameter() || selfVar->isSelfParamCapture())
+          return selfVar;
+
+      // Look through identity expressions and implicit conversions.
+      Expr *prior;
+      do {
+        prior = expr;
+
+        expr = expr->getSemanticsProvidingExpr();
+
+        if (auto conversion = dyn_cast<ImplicitConversionExpr>(expr))
+          expr = conversion->getSubExpr();
+      } while (prior != expr);
+
+      if (auto call = dyn_cast<DotSyntaxCallExpr>(expr)) {
+        for (auto arg : *call->getArgs()) {
+          if (auto declRef = dyn_cast<DeclRefExpr>(arg.getExpr())) {
+            if (auto var = dyn_cast<VarDecl>(declRef->getDecl())) {
+              if (var->isSelfParameter()) {
+                return var;
+              }
+            }
+          }
+        }
+      }
+
+
+      // Not a self reference.
+      return nullptr;
+    }
+
     static FuncDecl *findAnnotatableFunction(DeclContext *dc) {
       auto fn = dyn_cast<FuncDecl>(dc);
       if (!fn) return nullptr;
@@ -2117,7 +2110,8 @@ namespace {
       case ActorIsolation::GlobalActorUnsafe:
         return ActorIsolation::forGlobalActor(
             dc->mapTypeIntoContext(isolation.getGlobalActor()),
-            isolation == ActorIsolation::GlobalActorUnsafe);
+            isolation == ActorIsolation::GlobalActorUnsafe)
+              .withPreconcurrency(isolation.preconcurrency());
       }
     }
 
@@ -2148,6 +2142,14 @@ namespace {
         return None;
       }
 
+      if (auto baseSelf = findReferencedBaseSelf(context)) {
+        if (baseSelf->getAttrs().hasAttribute<KnownToBeLocalAttr>()) {
+        return std::make_pair(
+            /*setThrows=*/false,
+            /*isDistributedThunk=*/false);
+        }
+      }
+
       // Check that we have a distributed function.
       auto func = dyn_cast<AbstractFunctionDecl>(decl);
       if (!func || !func->isDistributed()) {
@@ -2159,7 +2161,9 @@ namespace {
         return None;
       }
 
-      return std::make_pair(!func->hasThrows(), true);
+      return std::make_pair(
+          /*setThrows=*/!func->hasThrows(),
+          /*isDistributedThunk=*/true);
     }
 
     /// Attempts to identify and mark a valid cross-actor use of a synchronous
@@ -2286,12 +2290,8 @@ namespace {
       // we are within that global actor already.
       Optional<ActorIsolation> unsatisfiedIsolation;
       if (Type globalActor = fnType->getGlobalActor()) {
-        if (getContextIsolation().isGlobalActor() &&
-            getContextIsolation().getGlobalActor()->isEqual(globalActor)) {
-          warnAboutGlobalActorIsoChangeInSwift6(
-              ActorIsolation::forGlobalActor(globalActor, false),
-              apply);
-        } else {
+        if (!(getContextIsolation().isGlobalActor() &&
+            getContextIsolation().getGlobalActor()->isEqual(globalActor))) {
           unsatisfiedIsolation = ActorIsolation::forGlobalActor(
               globalActor, /*unsafe=*/false);
         }
@@ -2341,14 +2341,16 @@ namespace {
               apply->getLoc(), diag::actor_isolated_call_decl,
               *unsatisfiedIsolation,
               calleeDecl->getDescriptiveKind(), calleeDecl->getName(),
-              getContextIsolation());
+              getContextIsolation())
+            .warnUntilSwiftVersionIf(getContextIsolation().preconcurrency(), 6);
           calleeDecl->diagnose(
               diag::actor_isolated_sync_func, calleeDecl->getDescriptiveKind(),
               calleeDecl->getName());
         } else {
           ctx.Diags.diagnose(
               apply->getLoc(), diag::actor_isolated_call, *unsatisfiedIsolation,
-              getContextIsolation());
+              getContextIsolation())
+            .warnUntilSwiftVersionIf(getContextIsolation().preconcurrency(), 6);
         }
 
         if (unsatisfiedIsolation->isGlobalActor()) {
@@ -2426,8 +2428,6 @@ namespace {
       auto contextIsolation = getInnermostIsolatedContext(declContext);
       if (contextIsolation.isGlobalActor() &&
           contextIsolation.getGlobalActor()->isEqual(globalActor)) {
-
-        warnAboutGlobalActorIsoChangeInSwift6(contextIsolation, context);
         return false;
       }
 
@@ -2686,6 +2686,52 @@ namespace {
           });
     }
 
+    static bool isStoredProperty(ValueDecl const *member) {
+      if (auto *var = dyn_cast<VarDecl>(member))
+        if (var->hasStorage() && var->isInstanceMember())
+          return true;
+      return false;
+    }
+
+    /// an ad-hoc check specific to member isolation checking.
+    static bool memberAccessWasAllowedInSwift5(DeclContext const *refCxt,
+                                               ValueDecl const *member,
+                                               SourceLoc memberLoc) {
+      // no need for this in Swift 6+
+      if (refCxt->getASTContext().isSwiftVersionAtLeast(6))
+        return false;
+
+      // In Swift 5, we were allowing all members to be referenced from a
+      // deinit, nested within a wide variety of contexts.
+      if (auto oldFn = isActorInitOrDeInitContext(refCxt)) {
+        if (isa<DestructorDecl>(oldFn) && member->isInstanceMember()) {
+          auto &diags = refCxt->getASTContext().Diags;
+
+          // if the context in which we consider the access matches between
+          // old and new, and its a stored property, then skip the warning
+          // because it will still be allowed in Swift 6.
+          if (!(refCxt == oldFn && isStoredProperty(member))) {
+            unsigned cxtKind = 0; // deinit
+
+            // try to get a better name for this context.
+            if (isa<AutoClosureExpr>(refCxt)) {
+              cxtKind = 1;
+            } else if (isa<AbstractClosureExpr>(refCxt)) {
+              cxtKind = 2;
+            }
+
+            diags.diagnose(memberLoc, diag::actor_isolated_from_decl,
+                           member->getDescriptiveKind(),
+                           member->getName(),
+                           cxtKind).warnUntilSwiftVersion(6);
+          }
+          return true;
+        }
+      }
+
+      return false;
+    }
+
     /// To support flow-isolation, some member accesses in inits / deinits
     /// must be permitted, despite the isolation of 'self' not being
     /// correct in Sema.
@@ -2697,7 +2743,7 @@ namespace {
     ///
     /// \returns true iff the member access is permitted in Sema because it will
     /// be verified later by flow-isolation.
-    bool checkedByFlowIsolation(DeclContext const *refCxt,
+    static bool checkedByFlowIsolation(DeclContext const *refCxt,
                                 ReferencedActor &baseActor,
                                 ValueDecl const *member,
                                 SourceLoc memberLoc) {
@@ -2716,7 +2762,7 @@ namespace {
       while (true) {
         fnDecl = dyn_cast_or_null<AbstractFunctionDecl>(refCxt->getAsDecl());
         if (!fnDecl)
-          return false;
+          break;
 
         // go up one level if this context is a defer.
         if (auto *d = dyn_cast<FuncDecl>(fnDecl)) {
@@ -2728,25 +2774,15 @@ namespace {
         break;
       }
 
+      if (memberAccessWasAllowedInSwift5(refCxt, member, memberLoc))
+        return true; // then permit it now.
+
       if (!usesFlowSensitiveIsolation(fnDecl))
         return false;
 
       // Stored properties are definitely OK.
-      if (auto *var = dyn_cast<VarDecl>(member))
-        if (var->hasStorage() && var->isInstanceMember())
+      if (isStoredProperty(member))
           return true;
-
-      // In Swift 5, we were allowing all members to be referenced from a
-      // deinit, but that will not be valid in Swift 6+, so warn about it.
-      if (!refCxt->getASTContext().isSwiftVersionAtLeast(6)) {
-        if (isa<DestructorDecl>(fnDecl) && member->isInstanceMember()) {
-          auto &diags = refCxt->getASTContext().Diags;
-          diags.diagnose(memberLoc, diag::actor_isolated_from_deinit,
-                         member->getDescriptiveKind(),
-                         member->getName()).warnUntilSwiftVersion(6);
-          return true;
-        }
-      }
 
       return false;
     }
@@ -2824,7 +2860,8 @@ namespace {
         bool performDistributedChecks =
             isolation.getActorType()->isDistributedActor() &&
             !isolatedActor.isPotentiallyIsolated &&
-            !isa<ConstructorDecl>(member);
+            !isa<ConstructorDecl>(member) &&
+            !member->getAttrs().hasAttribute<KnownToBeLocalAttr>();
         if (performDistributedChecks) {
           if (auto access = checkDistributedAccess(memberLoc, member, context)){
             // This is a distributed access, so mark it as throwing or
@@ -2961,58 +2998,76 @@ namespace {
     /// isolation checked.
     ClosureActorIsolation determineClosureIsolation(
         AbstractClosureExpr *closure) {
-      // If the closure specifies a global actor, use it.
+      bool preconcurrency = false;
+
       if (auto explicitClosure = dyn_cast<ClosureExpr>(closure)) {
+        preconcurrency = explicitClosure->isIsolatedByPreconcurrency();
+
+        // If the closure specifies a global actor, use it.
         if (Type globalActorType = resolveGlobalActorType(explicitClosure))
-          return ClosureActorIsolation::forGlobalActor(globalActorType);
+          return ClosureActorIsolation::forGlobalActor(globalActorType,
+                                                       preconcurrency);
       }
 
       // If a closure has an isolated parameter, it is isolated to that
       // parameter.
       for (auto param : *closure->getParameters()) {
         if (param->isIsolated())
-          return ClosureActorIsolation::forActorInstance(param);
+          return ClosureActorIsolation::forActorInstance(param, preconcurrency);
       }
 
       // Sendable closures are actor-independent unless the closure has
       // specifically opted into inheriting actor isolation.
       if (isSendableClosure(closure, /*forActorIsolation=*/true))
-        return ClosureActorIsolation::forIndependent();
+        return ClosureActorIsolation::forIndependent(preconcurrency);
 
       // A non-Sendable closure gets its isolation from its context.
       auto parentIsolation = getActorIsolationOfContext(closure->getParent());
+      preconcurrency |= parentIsolation.preconcurrency();
 
       // We must have parent isolation determined to get here.
       switch (parentIsolation) {
       case ActorIsolation::Independent:
       case ActorIsolation::Unspecified:
-        return ClosureActorIsolation::forIndependent();
+        return ClosureActorIsolation::forIndependent(preconcurrency);
 
       case ActorIsolation::GlobalActor:
       case ActorIsolation::GlobalActorUnsafe: {
         Type globalActorType = closure->mapTypeIntoContext(
             parentIsolation.getGlobalActor()->mapTypeOutOfContext());
-        return ClosureActorIsolation::forGlobalActor(globalActorType);
+        return ClosureActorIsolation::forGlobalActor(globalActorType,
+                                                     preconcurrency);
       }
 
       case ActorIsolation::ActorInstance: {
         if (auto param = closure->getCaptureInfo().getIsolatedParamCapture())
-          return ClosureActorIsolation::forActorInstance(param);
+          return ClosureActorIsolation::forActorInstance(param, preconcurrency);
 
-        return ClosureActorIsolation::forIndependent();
+        return ClosureActorIsolation::forIndependent(preconcurrency);
       }
     }
     }
 
-    /// Determine whether the given reference is to a method on
-    /// a remote distributed actor in the given context.
-    bool isDistributedThunk(ConcreteDeclRef ref, Expr *context,
-                            bool isInAsyncLetInitializer);
   };
 }
 
 bool ActorIsolationChecker::mayExecuteConcurrentlyWith(
     const DeclContext *useContext, const DeclContext *defContext) {
+  // Fast path for when the use and definition contexts are the same.
+  if (useContext == defContext)
+    return false;
+
+  // If both contexts are isolated to the same actor, then they will not
+  // execute concurrently.
+  auto useIsolation = getActorIsolationOfContext(
+      const_cast<DeclContext *>(useContext));
+  if (useIsolation.isActorIsolated()) {
+    auto defIsolation = getActorIsolationOfContext(
+        const_cast<DeclContext *>(defContext));
+    if (useIsolation == defIsolation)
+      return false;
+  }
+
   // Walk the context chain from the use to the definition.
   while (useContext != defContext) {
     // If we find a concurrent closure... it can be run concurrently.
@@ -3058,7 +3113,7 @@ void swift::checkFunctionActorIsolation(AbstractFunctionDecl *decl) {
     if (auto superInit = ctor->getSuperInitCall())
       superInit->walk(checker);
   }
-  if (auto attr = decl->getAttrs().getAttribute<DistributedActorAttr>()) {
+  if (decl->getAttrs().hasAttribute<DistributedActorAttr>()) {
     if (auto func = dyn_cast<FuncDecl>(decl)) {
       checkDistributedFunction(func, /*diagnose=*/true);
     }
@@ -3547,6 +3602,36 @@ static bool checkClassGlobalActorIsolation(
   return true;
 }
 
+/// Generally speaking, the isolation of the decl that overrides
+/// must match the overridden decl. But there are a number of exceptions,
+/// e.g., the decl that overrides can be nonisolated.
+/// \param newIso the isolation of the overriding declaration.
+static bool validOverrideIsolation(ActorIsolation newIso,
+                                   ValueDecl *overriddenDecl,
+                                   ActorIsolation overriddenIso) {
+  // If the isolation matches, we're done.
+  if (newIso == overriddenIso)
+    return true;
+
+  // If the overriding declaration is non-isolated, it's okay.
+  if (newIso.isIndependent() || newIso.isUnspecified())
+    return true;
+
+  // If both are actor-instance isolated, we're done. This wasn't caught by
+  // the equality case above because the nominal type describing the actor
+  // will differ when we're overriding.
+  if (newIso.getKind() == overriddenIso.getKind() &&
+      newIso.getKind() == ActorIsolation::ActorInstance)
+    return true;
+
+  // If the overridden declaration is from Objective-C with no actor annotation,
+  // allow it.
+  if (overriddenDecl->hasClangNode() && !overriddenIso)
+    return true;
+
+  return false;
+}
+
 ActorIsolation ActorIsolationRequest::evaluate(
     Evaluator &evaluator, ValueDecl *value) const {
   // If this declaration has actor-isolated "self", it's isolated to that
@@ -3604,9 +3689,36 @@ ActorIsolation ActorIsolationRequest::evaluate(
         if (!ctor->hasAsync())
           defaultIsolation = ActorIsolation::forIndependent();
 
+  // Look for and remember the overridden declaration's isolation.
+  Optional<ActorIsolation> overriddenIso;
+  ValueDecl *overriddenValue = nullptr;
+  if ( (overriddenValue = value->getOverriddenDecl()) ) {
+    auto iso = getActorIsolation(overriddenValue);
+    SubstitutionMap subs;
+
+    if (Type selfType = value->getDeclContext()->getSelfInterfaceType()) {
+      subs = selfType->getMemberSubstitutionMap(
+          value->getModuleContext(), overriddenValue);
+    }
+    iso = iso.subst(subs);
+
+    // use the overridden decl's iso as the default isolation for this decl.
+    defaultIsolation = iso;
+    overriddenIso = iso;
+  }
+
   // Function used when returning an inferred isolation.
   auto inferredIsolation = [&](
       ActorIsolation inferred, bool onlyGlobal = false) {
+    // check if the inferred isolation is valid in the context of
+    // its overridden isolation.
+    if (overriddenValue) {
+      // if the inferred isolation is not valid, then carry-over the overridden
+      // declaration's isolation as this decl's inferred isolation.
+      if (!validOverrideIsolation(inferred, overriddenValue, *overriddenIso))
+        inferred = *overriddenIso;
+    }
+
     // Add an implicit attribute to capture the actor isolation that was
     // inferred, so that (e.g.) it will be printed and serialized.
     ASTContext &ctx = value->getASTContext();
@@ -3615,12 +3727,14 @@ ActorIsolation ActorIsolationRequest::evaluate(
       // Stored properties cannot be non-isolated, so don't infer it.
       if (auto var = dyn_cast<VarDecl>(value)) {
         if (!var->isStatic() && var->hasStorage())
-          return ActorIsolation::forUnspecified();
+          return ActorIsolation::forUnspecified()
+                    .withPreconcurrency(inferred.preconcurrency());
       }
 
 
       if (onlyGlobal)
-        return ActorIsolation::forUnspecified();
+        return ActorIsolation::forUnspecified()
+                  .withPreconcurrency(inferred.preconcurrency());
 
       value->getAttrs().add(new (ctx) NonisolatedAttr(/*IsImplicit=*/true));
       break;
@@ -3635,7 +3749,8 @@ ActorIsolation ActorIsolationRequest::evaluate(
               if (auto *nominal = varDC->getSelfNominalTypeDecl())
                 if (isa<StructDecl>(nominal) &&
                     !isWrappedValueOfPropWrapper(var))
-                  return ActorIsolation::forUnspecified();
+                  return ActorIsolation::forUnspecified()
+                              .withPreconcurrency(inferred.preconcurrency());
 
       auto typeExpr = TypeExpr::createImplicit(inferred.getGlobalActor(), ctx);
       auto attr = CustomAttr::create(
@@ -3649,7 +3764,8 @@ ActorIsolation ActorIsolationRequest::evaluate(
     case ActorIsolation::ActorInstance:
     case ActorIsolation::Unspecified:
       if (onlyGlobal)
-        return ActorIsolation::forUnspecified();
+        return ActorIsolation::forUnspecified()
+                    .withPreconcurrency(inferred.preconcurrency());
 
       // Nothing to do.
       break;
@@ -3689,20 +3805,6 @@ ActorIsolation ActorIsolationRequest::evaluate(
     }
   }
 
-  // If the declaration overrides another declaration, it must have the same
-  // actor isolation.
-  if (auto overriddenValue = value->getOverriddenDecl()) {
-    auto isolation = getActorIsolation(overriddenValue);
-    SubstitutionMap subs;
-
-    if (Type selfType = value->getDeclContext()->getSelfInterfaceType()) {
-      subs = selfType->getMemberSubstitutionMap(
-          value->getModuleContext(), overriddenValue);
-    }
-
-    return inferredIsolation(isolation.subst(subs));
-  }
-
   // If this is an accessor, use the actor isolation of its storage
   // declaration.
   if (auto accessor = dyn_cast<AccessorDecl>(value)) {
@@ -3710,7 +3812,9 @@ ActorIsolation ActorIsolationRequest::evaluate(
   }
 
   if (auto var = dyn_cast<VarDecl>(value)) {
-    if (var->isTopLevelGlobal() && var->getDeclContext()->isAsyncContext()) {
+    if (var->isTopLevelGlobal() &&
+        (var->getASTContext().LangOpts.WarnConcurrency ||
+         var->getDeclContext()->isAsyncContext())) {
       if (Type mainActor = var->getASTContext().getMainActorType())
         return inferredIsolation(
             ActorIsolation::forGlobalActor(mainActor,
@@ -3897,30 +4001,7 @@ void swift::checkOverrideActorIsolation(ValueDecl *value) {
     overriddenIsolation = overriddenIsolation.subst(subs);
   }
 
-  // If the isolation matches, we're done.
-  if (isolation == overriddenIsolation)
-    return;
-  
-  // FIXME: do we need this?
-  if (overriddenIsolation == ActorIsolation::Unspecified &&
-      isolation == ActorIsolation::Independent) {
-    return;
-  }
-
-  // If the overriding declaration is non-isolated, it's okay.
-  if (isolation.isIndependent() || isolation.isUnspecified())
-    return;
-
-  // If both are actor-instance isolated, we're done. This wasn't caught by
-  // the equality case above because the nominal type describing the actor
-  // will differ when we're overriding.
-  if (isolation.getKind() == overriddenIsolation.getKind() &&
-      isolation.getKind() == ActorIsolation::ActorInstance)
-    return;
-
-  // If the overridden declaration is from Objective-C with no actor annotation,
-  // allow it.
-  if (overridden->hasClangNode() && !overriddenIsolation)
+  if (validOverrideIsolation(isolation, overridden, overriddenIsolation))
     return;
 
   // Isolation mismatch. Diagnose it.
@@ -4294,6 +4375,7 @@ ProtocolConformance *GetImplicitSendableRequest::evaluate(
                                           NoVersion, SourceRange(),
                                           NoVersion, SourceRange(),
                                           PlatformAgnosticAvailabilityKind::Unavailable,
+                                          false,
                                           false);
 
       // Conformance availability is currently tied to the declaring extension.

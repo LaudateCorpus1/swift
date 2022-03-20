@@ -178,3 +178,97 @@ func test_workaround_for_optional_void_result() {
     let _ = $0
   }
 }
+
+enum WrapperEnum<Wrapped> where Wrapped: RawRepresentable {
+case known(Wrapped)
+
+  static func ~= (lhs: Wrapped, rhs: WrapperEnum<Wrapped>) -> Bool where Wrapped: Equatable {
+    switch rhs {
+    case .known(let wrapped):
+      return wrapped == lhs
+    }
+  }
+}
+
+func test_custom_tilde_equals_operator_matching() {
+  enum TildeTest : String {
+  case test = "test"
+  case otherTest = ""
+  }
+
+  func test(_: (WrapperEnum<TildeTest>) -> Void) {}
+
+  test { v in
+    print(v)
+
+    switch v {
+    case .test: break // Ok although `.test` comes from `TildeTest` instead of `WrapperEnum`
+    case .otherTest: break // Ok although `.otherTest` comes from `TildeTest` instead of `WrapperEnum`
+    case .known(_): break // Ok - `.known` comes from `WrapperEnum`
+    }
+  }
+}
+
+// Local functions can capture variables before they are declared.
+func test_local_function_capturing_vars() {
+  struct A {
+    var cond: Bool
+  }
+
+  func test<T>(fn: () -> T) -> T {
+    fn()
+  }
+
+  func outer(a: A) {
+    test {
+      func local() {
+        if !message.isEmpty { // Ok
+          print(message)
+        }
+
+        message = "World" // Ok
+      }
+
+      var message = a.cond ? "hello" : ""
+    }
+  }
+}
+
+func test_taps_type_checked_with_correct_decl_context() {
+  struct Path {
+    func contains<T>(_: T) -> Bool where T: StringProtocol { return false }
+  }
+
+  let paths: [Path] = []
+  let strs: [String] = []
+
+  _ = paths.filter { path in
+    for str in strs where path.contains("\(str).hello") {
+      return true
+    }
+    return false
+  }
+}
+
+// rdar://90347159 - in pattern matching context `case` should be preferred over static declarations
+func test_pattern_matches_only_cases() {
+  enum ParsingError : Error {
+    case ok(Int)
+    case failed([Error], Int)
+
+    static var ok: Int { 42 }
+    static func failed(_: [Error], at: Any) -> Self { fatalError() }
+  }
+
+  let _: (ParsingError) -> Void = {
+    switch $0 {
+    case let ParsingError.failed(errors, _): print(errors) // Ok
+    default: break
+    }
+
+    switch $0 {
+    case let ParsingError.ok(result): print(result) // Ok
+    default: break
+    }
+  }
+}

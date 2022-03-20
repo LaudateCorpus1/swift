@@ -560,6 +560,8 @@ public:
   /// Keep track of subscript declarations based on getter/setter
   /// pairs.
   llvm::DenseMap<std::pair<FuncDecl *, FuncDecl *>, SubscriptDecl *> Subscripts;
+  llvm::DenseMap<llvm::StringRef, std::pair<FuncDecl *, FuncDecl *>>
+      GetterSetterMap;
 
   /// Keep track of getter/setter pairs for functions imported from C++
   /// subscript operators based on the type in which they are declared and
@@ -572,7 +574,16 @@ public:
 
   /// Keep track of cxx function names, params etc in order to
   /// allow for de-duping functions that differ strictly on "constness".
-  llvm::DenseMap<llvm::StringRef, std::pair<llvm::DenseSet<clang::FunctionDecl *>, llvm::DenseSet<clang::FunctionDecl *>>> cxxMethods;
+  llvm::DenseMap<llvm::StringRef,
+                 std::pair<
+                     llvm::DenseSet<clang::FunctionDecl *>,
+                     llvm::DenseSet<clang::FunctionDecl *>>>
+      cxxMethods;
+
+  // Cache for already-specialized function templates and any thunks they may
+  // have.
+  llvm::DenseMap<clang::FunctionDecl *, ValueDecl *>
+      specializedFunctionTemplates;
 
   /// Keeps track of the Clang functions that have been turned into
   /// properties.
@@ -947,8 +958,9 @@ public:
 
   /// If we already imported a given decl, return the corresponding Swift decl.
   /// Otherwise, return nullptr.
-  Decl *importDeclCached(const clang::NamedDecl *ClangDecl, Version version,
-                         bool UseCanonicalDecl = true);
+  Optional<Decl *> importDeclCached(const clang::NamedDecl *ClangDecl,
+                                    Version version,
+                                    bool UseCanonicalDecl = true);
 
   Decl *importDeclImpl(const clang::NamedDecl *ClangDecl, Version version,
                        bool &TypedefIsSuperfluous, bool &HadForwardDeclaration);

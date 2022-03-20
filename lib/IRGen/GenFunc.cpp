@@ -2366,8 +2366,7 @@ IRGenFunction::createAsyncDispatchFn(const FunctionPointer &fnPtr,
   auto *dispatchFnTy =
       llvm::FunctionType::get(IGM.VoidTy, argTys, false /*vaargs*/);
   llvm::SmallString<40> name;
-  llvm::raw_svector_ostream(name)
-      << "__swift_suspend_dispatch_" << argTypes.size();
+  llvm::raw_svector_ostream(name) << CurFn->getName() << ".0";
   llvm::Function *dispatch =
       llvm::Function::Create(dispatchFnTy, llvm::Function::InternalLinkage,
                              llvm::StringRef(name), &IGM.Module);
@@ -2376,7 +2375,7 @@ IRGenFunction::createAsyncDispatchFn(const FunctionPointer &fnPtr,
   IRGenFunction dispatchIGF(IGM, dispatch);
   // Don't emit debug info if we are generating a function for the prologue.
   if (IGM.DebugInfo && Builder.getCurrentDebugLocation())
-    IGM.DebugInfo->emitArtificialFunction(dispatchIGF, dispatch);
+    IGM.DebugInfo->emitOutlinedFunction(dispatchIGF, dispatch, CurFn->getName());
   auto &Builder = dispatchIGF.Builder;
   auto it = dispatchIGF.CurFn->arg_begin(), end = dispatchIGF.CurFn->arg_end();
   llvm::Value *fnPtrArg = &*(it++);

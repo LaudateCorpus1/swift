@@ -2,14 +2,14 @@
 // REQUIRES: concurrency
 // REQUIRES: distributed
 
-import _Distributed
+import Distributed
 
 distributed actor DA {
   typealias ActorSystem = FakeActorSystem
 }
 
 extension DA {
-  // CHECK-LABEL: sil hidden [thunk] [distributed] [ossa] @$s17distributed_thunk2DAC1fyyFTE : $@convention(method) @async (@guaranteed DA) -> @error Error
+  // CHECK-LABEL: sil hidden [thunk] [distributed] [ossa] @$s17distributed_thunk2DAC1fyyYaKFTE : $@convention(method) @async (@guaranteed DA) -> @error Error
   // CHECK: function_ref @swift_distributed_actor_is_remote
 
   // Call the actor function
@@ -106,7 +106,7 @@ public struct FakeInvocationEncoder: DistributedTargetInvocationEncoder {
   public typealias SerializationRequirement = Codable
 
   public mutating func recordGenericSubstitution<T>(_ type: T.Type) throws {}
-  public mutating func recordArgument<Argument: SerializationRequirement>(_ argument: Argument) throws {}
+  public mutating func recordArgument<Value: SerializationRequirement>(_ argument: RemoteCallArgument<Value>) throws {}
   public mutating func recordReturnType<R: SerializationRequirement>(_ type: R.Type) throws {}
   public mutating func recordErrorType<E: Error>(_ type: E.Type) throws {}
   public mutating func doneRecording() throws {}

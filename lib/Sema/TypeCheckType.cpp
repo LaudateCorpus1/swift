@@ -433,7 +433,8 @@ Type TypeResolution::resolveTypeInContext(TypeDecl *typeDecl,
       if (typeDecl->getDeclContext()->getSelfProtocolDecl()) {
         if (isa<AssociatedTypeDecl>(typeDecl) ||
             (isa<TypeAliasDecl>(typeDecl) &&
-             !cast<TypeAliasDecl>(typeDecl)->isGeneric())) {
+             !cast<TypeAliasDecl>(typeDecl)->isGeneric() &&
+             !isSpecialized)) {
           if (getStage() == TypeResolutionStage::Structural) {
             return DependentMemberType::get(selfType, typeDecl->getName());
           } else if (auto assocType = dyn_cast<AssociatedTypeDecl>(typeDecl)) {
@@ -2619,9 +2620,11 @@ TypeResolver::resolveAttributedType(TypeAttributes &attrs, TypeRepr *repr,
         getDeclContext()->getSelfProtocolDecl()) {
       diagnoseInvalid(repr, attrs.getLoc(TAK_unchecked),
                       diag::unchecked_not_inheritance_clause);
+      ty = ErrorType::get(getASTContext());
     } else if (!ty->isConstraintType()) {
       diagnoseInvalid(repr, attrs.getLoc(TAK_unchecked),
                       diag::unchecked_not_existential, ty);
+      ty = ErrorType::get(getASTContext());
     }
 
     // Nothing to record in the type. Just clear the attribute.
@@ -2753,7 +2756,11 @@ TypeResolver::resolveAttributedType(TypeAttributes &attrs, TypeRepr *repr,
       diagnoseInvalid(repr, attrs.getLoc(TAK_opened), diag::opened_non_protocol,
                       ty);
     } else {
-      ty = OpenedArchetypeType::get(ty->getCanonicalType(), attrs.OpenedID);
+      ty = GenericEnvironment::mapTypeIntoContext(
+                 resolution.getGenericSignature().getGenericEnvironment(), ty);
+      ty = OpenedArchetypeType::get(ty->getCanonicalType(),
+                                    resolution.getGenericSignature(),
+                                    attrs.OpenedID);
     }
     attrs.clearAttribute(TAK_opened);
   }
@@ -3766,7 +3773,8 @@ NeverNullType TypeResolver::resolveTupleType(TupleTypeRepr *repr,
 
   bool complained = false;
   if (repr->hasEllipsis()) {
-    if (repr->getNumElements() == 1 && !repr->hasElementNames()) {
+    if (getASTContext().LangOpts.EnableExperimentalVariadicGenerics &&
+        repr->getNumElements() == 1 && !repr->hasElementNames()) {
       // This is probably a pack expansion. Try to resolve the pattern type.
       auto patternTy = resolveType(repr->getElementType(0), elementOptions);
       if (patternTy->hasError())
@@ -4111,12 +4119,17 @@ class ExistentialTypeVisitor
   ASTContext &Ctx;
   bool checkStatements;
   bool hitTopStmt;
+
+  unsigned exprCount = 0;
+  llvm::SmallVector<TypeRepr *, 4> reprStack;
     
 public:
   ExistentialTypeVisitor(ASTContext &ctx, bool checkStatements)
     : Ctx(ctx), checkStatements(checkStatements), hitTopStmt(false) { }
 
   bool walkToTypeReprPre(TypeRepr *T) override {
+    reprStack.push_back(T);
+
     if (T->isInvalid())
       return false;
     if (auto compound = dyn_cast<CompoundIdentTypeRepr>(T)) {
@@ -4137,6 +4150,11 @@ public:
     return true;
   }
 
+  bool walkToTypeReprPost(TypeRepr *T) override {
+    reprStack.pop_back();
+    return true;
+  }
+
   std::pair<bool, Stmt*> walkToStmtPre(Stmt *S) override {
     if (checkStatements && !hitTopStmt) {
       hitTopStmt = true;
@@ -4150,13 +4168,86 @@ public:
     return !checkStatements;
   }
 
+  std::pair<bool, Expr *> walkToExprPre(Expr *E) override {
+    ++exprCount;
+    return {true, E};
+  }
+
+  Expr * walkToExprPost(Expr *E) override {
+    --exprCount;
+    return E;
+  }
+
   void visitTypeRepr(TypeRepr *T) {
     // Do nothing for all TypeReprs except the ones listed below.
+  }
+
+  bool existentialNeedsParens(TypeRepr *parent) {
+    switch (parent->getKind()) {
+    case TypeReprKind::Optional:
+    case TypeReprKind::Protocol:
+      return true;
+    case TypeReprKind::Metatype:
+    case TypeReprKind::Attributed:
+    case TypeReprKind::Error:
+    case TypeReprKind::Function:
+    case TypeReprKind::InOut:
+    case TypeReprKind::Composition:
+    case TypeReprKind::OpaqueReturn:
+    case TypeReprKind::NamedOpaqueReturn:
+    case TypeReprKind::Existential:
+    case TypeReprKind::SimpleIdent:
+    case TypeReprKind::GenericIdent:
+    case TypeReprKind::CompoundIdent:
+    case TypeReprKind::Dictionary:
+    case TypeReprKind::ImplicitlyUnwrappedOptional:
+    case TypeReprKind::Tuple:
+    case TypeReprKind::Fixed:
+    case TypeReprKind::Array:
+    case TypeReprKind::SILBox:
+    case TypeReprKind::Shared:
+    case TypeReprKind::Owned:
+    case TypeReprKind::Isolated:
+    case TypeReprKind::Placeholder:
+    case TypeReprKind::CompileTimeConst:
+      return false;
+    }
   }
 
   void visitIdentTypeRepr(IdentTypeRepr *T) {
     if (T->isInvalid())
       return;
+
+    // Compute the type repr to attach 'any' to.
+    TypeRepr *replaceRepr = T;
+    // Insert parens in expression context for '(any P).self'
+    bool needsParens = (exprCount != 0);
+    if (reprStack.size() > 1) {
+      auto parentIt = reprStack.end() - 2;
+      needsParens = existentialNeedsParens(*parentIt);
+
+      // Expand to include parenthesis before checking if the parent needs
+      // to be replaced.
+      while (parentIt != reprStack.begin() &&
+             (*parentIt)->getWithoutParens() != *parentIt)
+        parentIt -= 1;
+
+      // For existential metatypes, 'any' is applied to the metatype.
+      if ((*parentIt)->getKind() == TypeReprKind::Metatype) {
+        replaceRepr = *parentIt;
+        if (parentIt != reprStack.begin())
+          needsParens = existentialNeedsParens(*(parentIt - 1));
+      }
+    }
+
+    std::string fix;
+    llvm::raw_string_ostream OS(fix);
+    if (needsParens)
+      OS << "(";
+    ExistentialTypeRepr existential(SourceLoc(), replaceRepr);
+    existential.print(OS);
+    if (needsParens)
+      OS << ")";
 
     auto comp = T->getComponentRange().back();
     if (auto *proto = dyn_cast_or_null<ProtocolDecl>(comp->getBoundDecl())) {
@@ -4164,8 +4255,10 @@ public:
         Ctx.Diags.diagnose(comp->getNameLoc(),
                            diag::existential_requires_any,
                            proto->getDeclaredInterfaceType(),
+                           proto->getExistentialType(),
                            /*isAlias=*/false)
-            .limitBehavior(DiagnosticBehavior::Warning);
+            .limitBehavior(DiagnosticBehavior::Warning)
+            .fixItReplace(replaceRepr->getSourceRange(), fix);
       }
     } else if (auto *alias = dyn_cast_or_null<TypeAliasDecl>(comp->getBoundDecl())) {
       auto type = Type(alias->getDeclaredInterfaceType()->getDesugaredType());
@@ -4182,8 +4275,10 @@ public:
           Ctx.Diags.diagnose(comp->getNameLoc(),
                              diag::existential_requires_any,
                              alias->getDeclaredInterfaceType(),
+                             ExistentialType::get(alias->getDeclaredInterfaceType()),
                              /*isAlias=*/true)
-              .limitBehavior(DiagnosticBehavior::Warning);
+              .limitBehavior(DiagnosticBehavior::Warning)
+              .fixItReplace(replaceRepr->getSourceRange(), fix);
         }
       }
     }

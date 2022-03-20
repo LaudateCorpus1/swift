@@ -568,10 +568,7 @@ bool MissingConformanceFailure::diagnoseTypeCannotConform(
     constraintType = existential->getConstraintType();
 
   emitDiagnostic(diag::type_cannot_conform,
-                 nonConformingType->isExistentialType(), 
-                 nonConformingType, 
-                 constraintType->isEqual(protocolType),
-                 protocolType);
+                 nonConformingType, protocolType);
 
   bool emittedSpecializedNote = false;
   if (auto protoType = protocolType->getAs<ProtocolType>()) {
@@ -710,6 +707,7 @@ Optional<Diag<Type, Type>> GenericArgumentsMismatchFailure::getDiagnosticFor(
   case CTP_YieldByReference:
   case CTP_CalleeResult:
   case CTP_EnumCaseRawValue:
+  case CTP_ExprPattern:
     break;
   }
   return None;
@@ -2353,7 +2351,9 @@ bool ContextualFailure::diagnoseAsError() {
     if (isExpr<OptionalTryExpr>(anchor) ||
         isExpr<OptionalEvaluationExpr>(anchor)) {
       auto objectType = fromType->getOptionalObjectType();
-      if (objectType->isEqual(toType)) {
+      // Cannot assume that `fromType` is always optional here since
+      // it could assume a type from context.
+      if (objectType && objectType->isEqual(toType)) {
         MissingOptionalUnwrapFailure failure(getSolution(), getType(anchor),
                                              toType,
                                              getConstraintLocator(anchor));
@@ -2368,9 +2368,7 @@ bool ContextualFailure::diagnoseAsError() {
         if (auto existential = constraintType->getAs<ExistentialType>())
           constraintType = existential->getConstraintType();
 
-        emitDiagnostic(diag::type_cannot_conform,
-                       /*isExistentialType=*/true, fromType, 
-                       constraintType->isEqual(toType), toType);
+        emitDiagnostic(diag::type_cannot_conform, fromType, toType);
         emitDiagnostic(diag::only_concrete_types_conform_to_protocols);
         return true;
       }
@@ -2538,6 +2536,7 @@ getContextualNilDiagnostic(ContextualTypePurpose CTP) {
   case CTP_YieldByReference:
   case CTP_WrappedProperty:
   case CTP_ComposedPropertyWrapper:
+  case CTP_ExprPattern:
     return None;
 
   case CTP_EnumCaseRawValue:
@@ -3121,7 +3120,7 @@ bool ContextualFailure::tryProtocolConformanceFixIt(
   // Emit a diagnostic to inform the user that they need to conform to the
   // missing protocols.
   auto conformanceDiag =
-      emitDiagnostic(diag::assign_protocol_conformance_fix_it, unwrappedToType,
+      emitDiagnostic(diag::assign_protocol_conformance_fix_it, constraint,
                      nominal->getDescriptiveKind(), fromType);
   if (nominal->getInherited().size() > 0) {
     auto lastInherited = nominal->getInherited().back().getLoc();
@@ -3149,8 +3148,9 @@ bool ContextualFailure::tryProtocolConformanceFixIt(
           ProtocolConformanceState::Incomplete, /*isUnchecked=*/false);
       ConformanceChecker checker(getASTContext(), &conformance,
                                  missingWitnesses);
-      checker.resolveValueWitnesses();
+      // Type witnesses must be resolved first.
       checker.resolveTypeWitnesses();
+      checker.resolveValueWitnesses();
     }
 
     for (auto decl : missingWitnesses) {
@@ -3228,7 +3228,7 @@ bool ContextualFailure::isIntegerToStringIndexConversion() const {
 Optional<Diag<Type, Type>>
 ContextualFailure::getDiagnosticFor(ContextualTypePurpose context,
                                     Type contextualType) {
-  auto forProtocol = contextualType->isExistentialType();
+  auto forProtocol = contextualType->isConstraintType();
   switch (context) {
   case CTP_Initialization: {
     if (contextualType->isAnyObject())
@@ -3301,6 +3301,7 @@ ContextualFailure::getDiagnosticFor(ContextualTypePurpose context,
   case CTP_CannotFail:
   case CTP_YieldByReference:
   case CTP_CalleeResult:
+  case CTP_ExprPattern:
     break;
   }
   return None;
@@ -3810,7 +3811,10 @@ bool MissingMemberFailure::diagnoseForDynamicCallable() const {
 }
 
 bool MissingMemberFailure::diagnoseInLiteralCollectionContext() const {
-  auto *expr = castToExpr(getAnchor());
+  auto *expr = getAsExpr(getAnchor());
+  if (!expr)
+    return false;
+
   auto *parentExpr = findParentExpr(expr);
   auto &solution = getSolution();
 
@@ -5919,8 +5923,11 @@ void MissingGenericArgumentsFailure::emitGenericSignatureNote(
     return (type == params.end()) ? Type() : type->second;
   };
 
+  auto baseType = anchor.dyn_cast<TypeRepr *>();
+  if (!baseType)
+    return;
+
   SmallString<64> paramsAsString;
-  auto baseType = anchor.get<TypeRepr *>();
   if (TypeChecker::getDefaultGenericArgumentsString(paramsAsString, GTD,
                                                     getPreferredType)) {
     auto diagnostic = emitDiagnosticAt(

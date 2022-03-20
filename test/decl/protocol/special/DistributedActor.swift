@@ -1,8 +1,8 @@
-// RUN: %target-typecheck-verify-swift -enable-experimental-distributed -disable-availability-checking -verify-ignore-unknown
+// RUN: %target-typecheck-verify-swift -disable-availability-checking -verify-ignore-unknown
 // REQUIRES: concurrency
 // REQUIRES: distributed
 
-import _Distributed
+import Distributed
 
 /// Use the existential wrapper as the default actor system.
 typealias DefaultDistributedActorSystem = FakeActorSystem
@@ -20,11 +20,11 @@ distributed actor D2 {
 }
 
 distributed actor D3 {
-  // expected-error@-1{{protocol 'DistributedActor' is broken; cannot derive conformance for type 'D3'}}
-  // expected-error@-2{{protocol 'DistributedActor' is broken; cannot derive conformance for type 'D3'}} // FIXME(distributed): duplicate errors
-  // expected-error@-3{{type 'D3' does not conform to protocol 'Identifiable'}}
-  // expected-error@-4{{type 'D3' does not conform to protocol 'DistributedActor'}}
-  // expected-error@-5{{type 'D3' does not conform to protocol 'DistributedActor'}}
+  // expected-error@-1{{type 'D3' does not conform to protocol 'Identifiable'}}
+  // expected-error@-2{{type 'D3' does not conform to protocol 'DistributedActor'}}
+  // Codable synthesis also will fail since the ID mismatch:
+  // expected-error@-4{{type 'D3' does not conform to protocol 'Decodable'}}
+  // expected-error@-5{{type 'D3' does not conform to protocol 'Encodable'}}
 
   var id: Int { 0 }
   // expected-error@-1{{property 'id' cannot be defined explicitly, as it conflicts with distributed actor synthesized stored property}}
@@ -36,11 +36,12 @@ struct OtherActorIdentity: Sendable, Hashable, Codable {}
 
 distributed actor D4 {
   // expected-error@-1{{actor 'D4' has no initializers}}
-  // expected-error@-2{{type 'D4' does not conform to protocol 'DistributedActor'}} // FIXME(distributed): duplicated errors
-  // expected-error@-3{{type 'D4' does not conform to protocol 'DistributedActor'}}
-  // expected-error@-4{{protocol 'DistributedActor' is broken; cannot derive conformance for type 'D4'}} // FIXME(distributed): duplicated errors
-  // expected-error@-5{{protocol 'DistributedActor' is broken; cannot derive conformance for type 'D4'}}
-  // expected-error@-6{{type 'D4' does not conform to protocol 'Identifiable'}}
+  // expected-error@-2{{type 'D4' does not conform to protocol 'DistributedActor'}}
+  // expected-error@-3{{type 'D4' does not conform to protocol 'Identifiable'}}
+  // Codable synthesis also will fail since the ID errors:
+  // expected-error@-5{{type 'D4' does not conform to protocol 'Decodable'}}
+  // expected-error@-6{{type 'D4' does not conform to protocol 'Encodable'}}
+
   let actorSystem: String
   // expected-error@-1{{invalid redeclaration of synthesized property 'actorSystem'}}
   // expected-error@-2{{property 'actorSystem' cannot be defined explicitly, as it conflicts with distributed actor synthesized stored property}}
@@ -160,7 +161,7 @@ struct FakeInvocationEncoder: DistributedTargetInvocationEncoder {
   typealias SerializationRequirement = Codable
 
   mutating func recordGenericSubstitution<T>(_ type: T.Type) throws {}
-  mutating func recordArgument<Argument: SerializationRequirement>(_ argument: Argument) throws {}
+  mutating func recordArgument<Value: SerializationRequirement>(_ argument: RemoteCallArgument<Value>) throws {}
   mutating func recordReturnType<R: SerializationRequirement>(_ type: R.Type) throws {}
   mutating func recordErrorType<E: Error>(_ type: E.Type) throws {}
   mutating func doneRecording() throws {}

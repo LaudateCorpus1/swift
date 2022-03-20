@@ -2025,7 +2025,9 @@ void IRGenModule::emitVTableStubs() {
       alias->setVisibility(llvm::GlobalValue::HiddenVisibility);
     else
       ApplyIRLinkage(IRGen.Opts.InternalizeSymbols
-                        ? IRLinkage::Internal
+                        ? IRLinkage{llvm::GlobalValue::ExternalLinkage,
+                                    llvm::GlobalValue::HiddenVisibility,
+                                    llvm::GlobalValue::DefaultStorageClass}
                         : IRLinkage::ExternalExport).to(alias);
   }
 }
@@ -2104,7 +2106,6 @@ getIRLinkage(const UniversalLinkageInfo &info, SILLinkage linkage,
                         : RESULT(External, Hidden, Default);
 
   case SILLinkage::Shared:
-  case SILLinkage::SharedExternal:
     return isDefinition ? RESULT(LinkOnceODR, Hidden, Default)
                         : RESULT(External, Hidden, Default);
 
@@ -4171,7 +4172,10 @@ void IRGenModule::emitAccessibleFunctions() {
 
     GenericSignature signature;
     if (auto *env = func->getGenericEnvironment()) {
-      signature = env->getGenericSignature();
+      // Drop all of the marker protocols because they are effect-less
+      // at runtime.
+      signature = env->getGenericSignature().withoutMarkerProtocols();
+
       genericEnvironment =
           getAddrOfGenericEnvironment(signature.getCanonicalSignature());
     }

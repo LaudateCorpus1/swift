@@ -226,6 +226,10 @@ public:
 
   void setIdealExpectedType(Type Ty) { expectedTypeContext.setIdealType(Ty); }
 
+  const ExpectedTypeContext *getExpectedTypeContext() const {
+    return &expectedTypeContext;
+  }
+
   CodeCompletionContext::TypeContextKind typeContextKind() const {
     if (expectedTypeContext.empty() &&
         !expectedTypeContext.getPreferNonVoid()) {
@@ -537,7 +541,6 @@ public:
 
   static bool canUseAttributeOnDecl(DeclAttrKind DAK, bool IsInSil,
                                     bool IsConcurrencyEnabled,
-                                    bool IsDistributedEnabled,
                                     Optional<DeclKind> DK);
 
   void getAttributeDeclCompletions(bool IsInSil, Optional<DeclKind> DK);

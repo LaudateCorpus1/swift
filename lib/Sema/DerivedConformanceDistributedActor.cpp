@@ -112,11 +112,9 @@ static ValueDecl *deriveDistributedActor_id(DerivedConformance &derived) {
   VarDecl *propDecl;
   PatternBindingDecl *pbDecl;
   std::tie(propDecl, pbDecl) = derived.declareDerivedProperty(
-      C.Id_id,
-      propertyType, propertyType,
+      DerivedConformance::SynthesizedIntroducer::Let, C.Id_id, propertyType,
+      propertyType,
       /*isStatic=*/false, /*isFinal=*/true);
-
-  propDecl->setIntroducer(VarDecl::Introducer::Let);
 
   // mark as nonisolated, allowing access to it from everywhere
   propDecl->getAttrs().add(
@@ -128,24 +126,24 @@ static ValueDecl *deriveDistributedActor_id(DerivedConformance &derived) {
 
 static ValueDecl *deriveDistributedActor_actorSystem(
     DerivedConformance &derived) {
-  assert(derived.Nominal->isDistributedActor());
   auto &C = derived.Context;
+
+  auto classDecl = dyn_cast<ClassDecl>(derived.Nominal);
+  assert(classDecl && derived.Nominal->isDistributedActor());
 
   // ```
   // nonisolated
   // let actorSystem: ActorSystem
   // ```
   // (no need for @actorIndependent because it is an immutable let)
-  auto propertyType = getDistributedActorSystemType(derived.Nominal);
+  auto propertyType = getDistributedActorSystemType(classDecl);
 
   VarDecl *propDecl;
   PatternBindingDecl *pbDecl;
   std::tie(propDecl, pbDecl) = derived.declareDerivedProperty(
-      C.Id_actorSystem,
+      DerivedConformance::SynthesizedIntroducer::Let, C.Id_actorSystem,
       propertyType, propertyType,
       /*isStatic=*/false, /*isFinal=*/true);
-
-  propDecl->setIntroducer(VarDecl::Introducer::Let);
 
   // mark as nonisolated, allowing access to it from everywhere
   propDecl->getAttrs().add(

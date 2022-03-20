@@ -297,6 +297,50 @@ struct ConformanceCollectionResult {
   std::vector<std::string> Errors;
 };
 
+struct AssociatedType {
+  std::string TypeAliasName;
+  std::string SubstitutedTypeMangledName;
+  std::string SubstitutedTypeFullyQualifiedName;
+  std::string SubstitutedTypeDiagnosticPrintName;
+};
+
+/// Info about all of a given type's associated types, as read out from an Image
+struct AssociatedTypeInfo {
+  std::string MangledTypeName;
+  std::string FullyQualifiedName;
+  std::string ProtocolFullyQualifiedName;
+  std::vector<AssociatedType> AssociatedTypes;
+};
+
+struct AssociatedTypeCollectionResult {
+  std::vector<AssociatedTypeInfo> AssociatedTypeInfos;
+  std::vector<std::string> Errors;
+};
+
+struct PropertyTypeInfo {
+  std::string Label;
+  std::string TypeMangledName;
+  std::string TypeFullyQualifiedName;
+  std::string TypeDiagnosticPrintName;
+};
+
+struct EnumCaseInfo {
+  std::string Label;
+};
+
+/// Info about all of a given type's fields, as read out from an Image
+struct FieldMetadata {
+  std::string MangledTypeName;
+  std::string FullyQualifiedName;
+  std::vector<PropertyTypeInfo> Properties;
+  std::vector<EnumCaseInfo> EnumCases;
+};
+
+struct FieldTypeCollectionResult {
+  std::vector<FieldMetadata> FieldInfos;
+  std::vector<std::string> Errors;
+};
+
 /// An implementation of MetadataReader's BuilderType concept for
 /// building TypeRefs, and parsing field metadata from any images
 /// it has been made aware of.
@@ -568,6 +612,15 @@ public:
 
     return ProtocolCompositionTypeRef::create(*this, protocolRefs, superclass,
                                               isClassBound);
+  }
+
+  const ParameterizedProtocolTypeRef *
+  createParameterizedProtocolType(const TypeRef *base,
+                                  llvm::ArrayRef<const TypeRef *> args) {
+    auto *baseProto = llvm::dyn_cast<ProtocolCompositionTypeRef>(base);
+    if (!baseProto)
+      return nullptr;
+    return ParameterizedProtocolTypeRef::create(*this, baseProto, args);
   }
 
   const ExistentialMetatypeTypeRef *createExistentialMetatypeType(
@@ -879,7 +932,9 @@ public:
 
   void dumpTypeRef(RemoteRef<char> MangledName, std::ostream &stream,
                    bool printTypeName = false);
+  FieldTypeCollectionResult collectFieldTypes(llvm::Optional<std::string> forMangledTypeName);
   void dumpFieldSection(std::ostream &stream);
+  AssociatedTypeCollectionResult collectAssociatedTypes(llvm::Optional<std::string> forMangledTypeName);
   void dumpAssociatedTypeSection(std::ostream &stream);
   void dumpBuiltinTypeSection(std::ostream &stream);
   void dumpCaptureSection(std::ostream &stream);
@@ -1304,8 +1359,7 @@ public:
         auto TypeName = nodeToString(demangleTypeRef(TypeRef));
         clearNodeFactory();
         if (OptionalMangledTypeName.hasValue()) {
-          typeNameToManglingMap[TypeName] =
-              "$s" + OptionalMangledTypeName.getValue();
+          typeNameToManglingMap[TypeName] = OptionalMangledTypeName.getValue();
         }
       }
     }

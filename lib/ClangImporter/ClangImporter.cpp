@@ -19,6 +19,7 @@
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/Builtins.h"
 #include "swift/AST/ClangModuleLoader.h"
+#include "swift/AST/ConcreteDeclRef.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsClangImporter.h"
 #include "swift/AST/DiagnosticsSema.h"
@@ -28,6 +29,7 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/NameLookupRequests.h"
+#include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/Types.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/Platform.h"
@@ -477,6 +479,11 @@ static bool clangSupportsPragmaAttributeWithSwiftAttr() {
   return swiftAttrParsedInfo.IsSupportedByPragmaAttribute;
 }
 
+static inline bool isPCHFilenameExtension(StringRef path) {
+  return llvm::sys::path::extension(path)
+    .endswith(file_types::getExtension(file_types::TY_PCH));
+}
+
 void
 importer::getNormalInvocationArguments(
     std::vector<std::string> &invocationArgStrs,
@@ -487,8 +494,7 @@ importer::getNormalInvocationArguments(
   ClangImporterOptions &importerOpts = ctx.ClangImporterOpts;
   auto languageVersion = ctx.LangOpts.EffectiveLanguageVersion;
 
-  if (llvm::sys::path::extension(importerOpts.BridgingHeader)
-          .endswith(file_types::getExtension(file_types::TY_PCH))) {
+  if (isPCHFilenameExtension(importerOpts.BridgingHeader)) {
     invocationArgStrs.insert(invocationArgStrs.end(), {
         "-include-pch", importerOpts.BridgingHeader
     });
@@ -922,8 +928,7 @@ bool ClangImporter::canReadPCH(StringRef PCHFilename) {
 Optional<std::string>
 ClangImporter::getPCHFilename(const ClangImporterOptions &ImporterOptions,
                               StringRef SwiftPCHHash, bool &isExplicit) {
-  if (llvm::sys::path::extension(ImporterOptions.BridgingHeader)
-        .endswith(file_types::getExtension(file_types::TY_PCH))) {
+  if (isPCHFilenameExtension(ImporterOptions.BridgingHeader)) {
     isExplicit = true;
     return ImporterOptions.BridgingHeader;
   }
@@ -1083,8 +1088,7 @@ ClangImporter::create(ASTContext &ctx,
 
 
 
-  if (llvm::sys::path::extension(importerOpts.BridgingHeader)
-        .endswith(file_types::getExtension(file_types::TY_PCH))) {
+  if (isPCHFilenameExtension(importerOpts.BridgingHeader)) {
     importer->Impl.setSinglePCHImport(importerOpts.BridgingHeader);
     importer->Impl.IsReadingBridgingPCH = true;
     if (tracker) {
@@ -1511,8 +1515,7 @@ bool ClangImporter::importBridgingHeader(StringRef header, ModuleDecl *adapter,
                                          SourceLoc diagLoc,
                                          bool trackParsedSymbols,
                                          bool implicitImport) {
-  if (llvm::sys::path::extension(header)
-        .endswith(file_types::getExtension(file_types::TY_PCH))) {
+  if (isPCHFilenameExtension(header)) {
     Impl.ImportedHeaderOwners.push_back(adapter);
     // We already imported this with -include-pch above, so we should have
     // collected a bunch of PCH-encoded module imports that we just need to
@@ -2257,8 +2260,9 @@ ClangImporter::Implementation::Implementation(
       IsReadingBridgingPCH(false),
       CurrentVersion(ImportNameVersion::fromOptions(ctx.LangOpts)),
       Walker(DiagnosticWalker(*this)),
+      BuffersForDiagnostics(ctx.SourceMgr),
       BridgingHeaderLookupTable(new SwiftLookupTable(nullptr)),
-      BuffersForDiagnostics(ctx.SourceMgr), platformAvailability(ctx.LangOpts),
+      platformAvailability(ctx.LangOpts),
       nameImporter(),
       DisableSourceImport(ctx.ClangImporterOpts.DisableSourceImport),
       DWARFImporter(dwarfImporterDelegate) {}
@@ -3628,7 +3632,8 @@ std::string ClangImporter::getClangModuleHash() const {
   return Impl.Invocation->getModuleHash(Impl.Instance->getDiagnostics());
 }
 
-Decl *ClangImporter::importDeclCached(const clang::NamedDecl *ClangDecl) {
+Optional<Decl *>
+ClangImporter::importDeclCached(const clang::NamedDecl *ClangDecl) {
   return Impl.importDeclCached(ClangDecl, Impl.CurrentVersion);
 }
 
@@ -4564,7 +4569,7 @@ synthesizeBaseClassFieldGetterBody(AbstractFunctionDecl *afd, void *context) {
   ASTContext &ctx = afd->getASTContext();
 
   AccessorDecl *getterDecl = cast<AccessorDecl>(afd);
-  VarDecl *baseClassVar = static_cast<VarDecl *>(context);
+  AbstractStorageDecl *baseClassVar = static_cast<AbstractStorageDecl *>(context);
   StructDecl *baseStruct =
       cast<StructDecl>(baseClassVar->getDeclContext()->getAsDecl());
   StructDecl *derivedStruct =
@@ -4585,16 +4590,29 @@ synthesizeBaseClassFieldGetterBody(AbstractFunctionDecl *afd, void *context) {
   casted->setType(baseStruct->getSelfInterfaceType());
   casted->setThrows(false);
 
-  // If the base class var has a clang decl, that means it's an access into a
-  // stored field. Otherwise, we're looking into another base class, so it's a
-  // another synthesized accessor.
-  AccessSemantics accessKind = baseClassVar->getClangDecl()
-                                   ? AccessSemantics::DirectToStorage
-                                   : AccessSemantics::DirectToImplementation;
-  auto baseMember =
-      new (ctx) MemberRefExpr(casted, SourceLoc(), baseClassVar, DeclNameLoc(),
-                              /*Implicit=*/true, accessKind);
-  baseMember->setType(baseClassVar->getType());
+  Expr *baseMember = nullptr;
+  if (auto subscript = dyn_cast<SubscriptDecl>(baseClassVar)) {
+    auto paramDecl = getterDecl->getParameters()->get(0);
+    auto paramRefExpr = new (ctx) DeclRefExpr(paramDecl,
+                                              DeclNameLoc(),
+                                              /*Implicit=*/ true);
+    paramRefExpr->setType(paramDecl->getType());
+
+    auto *argList = ArgumentList::forImplicitUnlabeled(ctx, {paramRefExpr});
+    baseMember = SubscriptExpr::create(ctx, casted, argList, subscript);
+    baseMember->setType(subscript->getElementInterfaceType());
+  } else {
+    // If the base class var has a clang decl, that means it's an access into a
+    // stored field. Otherwise, we're looking into another base class, so it's a
+    // another synthesized accessor.
+    AccessSemantics accessKind = baseClassVar->getClangDecl()
+                                     ? AccessSemantics::DirectToStorage
+                                     : AccessSemantics::DirectToImplementation;
+    baseMember =
+        new (ctx) MemberRefExpr(casted, SourceLoc(), baseClassVar, DeclNameLoc(),
+                                /*Implicit=*/true, accessKind);
+    baseMember->setType(cast<VarDecl>(baseClassVar)->getType());
+  }
 
   auto ret = new (ctx) ReturnStmt(SourceLoc(), baseMember);
   auto body = BraceStmt::create(ctx, SourceLoc(), {ret}, SourceLoc(),
@@ -4612,7 +4630,7 @@ synthesizeBaseClassFieldGetterBody(AbstractFunctionDecl *afd, void *context) {
 static std::pair<BraceStmt *, bool>
 synthesizeBaseClassFieldSetterBody(AbstractFunctionDecl *afd, void *context) {
   auto setterDecl = cast<AccessorDecl>(afd);
-  VarDecl *baseClassVar = static_cast<VarDecl *>(context);
+  AbstractStorageDecl *baseClassVar = static_cast<AbstractStorageDecl *>(context);
   ASTContext &ctx = setterDecl->getASTContext();
 
   StructDecl *baseStruct =
@@ -4623,16 +4641,30 @@ synthesizeBaseClassFieldSetterBody(AbstractFunctionDecl *afd, void *context) {
   auto *pointeePropertyRefExpr =
       getInOutSelfInteropStaticCast(setterDecl, baseStruct, derivedStruct);
 
-  // If the base class var has a clang decl, that means it's an access into a
-  // stored field. Otherwise, we're looking into another base class, so it's a
-  // another synthesized accessor.
-  AccessSemantics accessKind = baseClassVar->getClangDecl()
-                                   ? AccessSemantics::DirectToStorage
-                                   : AccessSemantics::DirectToImplementation;
-  auto storedRef =
-      new (ctx) MemberRefExpr(pointeePropertyRefExpr, SourceLoc(), baseClassVar,
-                              DeclNameLoc(), /*Implicit=*/true, accessKind);
-  storedRef->setType(LValueType::get(baseClassVar->getType()));
+  Expr *storedRef = nullptr;
+  if (auto subscript = dyn_cast<SubscriptDecl>(baseClassVar)) {
+    auto paramDecl = setterDecl->getParameters()->get(1);
+    auto paramRefExpr = new (ctx) DeclRefExpr(paramDecl,
+                                              DeclNameLoc(),
+                                              /*Implicit=*/ true);
+    paramRefExpr->setType(paramDecl->getType());
+
+    auto *argList = ArgumentList::forImplicitUnlabeled(ctx, {paramRefExpr});
+    storedRef = SubscriptExpr::create(ctx, pointeePropertyRefExpr, argList, subscript);
+    storedRef->setType(subscript->getElementInterfaceType());
+  } else {
+    // If the base class var has a clang decl, that means it's an access into a
+    // stored field. Otherwise, we're looking into another base class, so it's a
+    // another synthesized accessor.
+    AccessSemantics accessKind = baseClassVar->getClangDecl()
+                                     ? AccessSemantics::DirectToStorage
+                                     : AccessSemantics::DirectToImplementation;
+
+    storedRef =
+        new (ctx) MemberRefExpr(pointeePropertyRefExpr, SourceLoc(), baseClassVar,
+                                DeclNameLoc(), /*Implicit=*/true, accessKind);
+    storedRef->setType(LValueType::get(cast<VarDecl>(baseClassVar)->getType()));
+  }
 
   auto newValueParamRefExpr =
       new (ctx) DeclRefExpr(setterDecl->getParameters()->get(0), DeclNameLoc(),
@@ -4649,11 +4681,22 @@ synthesizeBaseClassFieldSetterBody(AbstractFunctionDecl *afd, void *context) {
   return {body, /*isTypeChecked=*/true};
 }
 
-static std::array<AccessorDecl *, 2>
-makeBaseClassFieldAccessors(DeclContext *declContext, VarDecl *computedVar,
-                            VarDecl *baseClassVar) {
+static SmallVector<AccessorDecl *, 2>
+makeBaseClassMemberAccessors(DeclContext *declContext,
+                             AbstractStorageDecl *computedVar,
+                             AbstractStorageDecl *baseClassVar) {
   auto &ctx = declContext->getASTContext();
   auto computedType = computedVar->getInterfaceType();
+
+  ParameterList *bodyParams = nullptr;
+  if (auto subscript = dyn_cast<SubscriptDecl>(baseClassVar)) {
+    computedType = computedType->getAs<FunctionType>()->getResult();
+
+    auto idxParam = subscript->getIndices()->get(0);
+    bodyParams = ParameterList::create(ctx, { idxParam });
+  } else {
+    bodyParams = ParameterList::createEmpty(ctx);
+  }
 
   auto getterDecl = AccessorDecl::create(
       ctx,
@@ -4664,18 +4707,31 @@ makeBaseClassFieldAccessors(DeclContext *declContext, VarDecl *computedVar,
       /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
       /*Throws=*/false,
       /*ThrowsLoc=*/SourceLoc(),
-      /*GenericParams=*/nullptr, ParameterList::createEmpty(ctx), computedType,
+      /*GenericParams=*/nullptr, bodyParams, computedType,
       declContext);
   getterDecl->setIsTransparent(true);
   getterDecl->setAccess(AccessLevel::Public);
   getterDecl->setBodySynthesizer(synthesizeBaseClassFieldGetterBody,
                                  baseClassVar);
 
+  if (baseClassVar->getWriteImpl() == WriteImplKind::Immutable)
+    return {getterDecl};
+
   auto newValueParam =
       new (ctx) ParamDecl(SourceLoc(), SourceLoc(), Identifier(), SourceLoc(),
                           ctx.getIdentifier("newValue"), declContext);
   newValueParam->setSpecifier(ParamSpecifier::Default);
   newValueParam->setInterfaceType(computedType);
+
+  ParameterList *setterBodyParams = nullptr;
+  if (auto subscript = dyn_cast<SubscriptDecl>(baseClassVar)) {
+    auto idxParam = subscript->getIndices()->get(0);
+    bodyParams = ParameterList::create(ctx, { idxParam });
+    setterBodyParams = ParameterList::create(ctx, { newValueParam, idxParam });
+  } else {
+    setterBodyParams = ParameterList::create(ctx, { newValueParam });
+  }
+
   auto setterDecl = AccessorDecl::create(
       ctx,
       /*FuncLoc=*/SourceLoc(),
@@ -4685,7 +4741,7 @@ makeBaseClassFieldAccessors(DeclContext *declContext, VarDecl *computedVar,
       /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
       /*Throws=*/false,
       /*ThrowsLoc=*/SourceLoc(),
-      /*GenericParams=*/nullptr, ParameterList::create(ctx, {newValueParam}),
+      /*GenericParams=*/nullptr, setterBodyParams,
       TupleType::getEmpty(ctx), declContext);
   setterDecl->setIsTransparent(true);
   setterDecl->setAccess(AccessLevel::Public);
@@ -4718,6 +4774,20 @@ ValueDecl *cloneBaseMemberDecl(ValueDecl *decl, DeclContext *newContext) {
     return out;
   }
 
+  if (auto subscript = dyn_cast<SubscriptDecl>(decl)) {
+    auto out = SubscriptDecl::create(
+        subscript->getASTContext(), subscript->getName(), subscript->getStaticLoc(),
+        subscript->getStaticSpelling(), subscript->getSubscriptLoc(),
+        subscript->getIndices(), subscript->getNameLoc(), subscript->getElementInterfaceType(),
+        newContext, subscript->getGenericParams());
+    out->copyFormalAccessFrom(subscript);
+    out->setAccessors(SourceLoc(),
+                      makeBaseClassMemberAccessors(newContext, out, subscript),
+                      SourceLoc());
+    out->setImplInfo(subscript->getImplInfo());
+    return out;
+  }
+
   if (auto var = dyn_cast<VarDecl>(decl)) {
     auto rawMemory = allocateMemoryForDecl<VarDecl>(var->getASTContext(),
                                                     sizeof(VarDecl), false);
@@ -4729,9 +4799,11 @@ ValueDecl *cloneBaseMemberDecl(ValueDecl *decl, DeclContext *newContext) {
     out->setIsDynamic(var->isDynamic());
     out->copyFormalAccessFrom(var);
     out->setAccessors(SourceLoc(),
-                      makeBaseClassFieldAccessors(newContext, out, var),
+                      makeBaseClassMemberAccessors(newContext, out, var),
                       SourceLoc());
-    out->setImplInfo(StorageImplInfo::getComputed(StorageIsMutable));
+    auto isMutable = var->getWriteImpl() == WriteImplKind::Immutable
+                         ? StorageIsNotMutable : StorageIsMutable;
+    out->setImplInfo(StorageImplInfo::getComputed(isMutable));
     out->setIsSetterMutating(true);
     return out;
   }
@@ -5144,6 +5216,417 @@ ClangImporter::instantiateCXXClassTemplate(
 
   return dyn_cast_or_null<StructDecl>(
       Impl.importDecl(ctsd, Impl.CurrentVersion));
+}
+
+// On Windows and 32-bit platforms we need to force "Int" to actually be
+// re-imported as "Int." This is needed because otherwise, we cannot round-trip
+// "Int" and "UInt". For example, on Windows, "Int" will be imported into C++ as
+// "long long" and then back into Swift as "Int64" not "Int."
+static ValueDecl *rewriteIntegerTypes(SubstitutionMap subst, ValueDecl *oldDecl,
+                                      AbstractFunctionDecl *newDecl) {
+  auto originalFnSubst = cast<AbstractFunctionDecl>(oldDecl)
+                             ->getInterfaceType()
+                             ->getAs<GenericFunctionType>()
+                             ->substGenericArgs(subst);
+  // The constructor type is a function type as follows:
+  //   (CType.Type) -> (Generic) -> CType
+  // And a method's function type is as follows:
+  //   (inout CType) -> (Generic) -> Void
+  // In either case, we only want the result of that function type because that
+  // is the function type with the generic params that need to be substituted:
+  //   (Generic) -> CType
+  if (isa<ConstructorDecl>(oldDecl) || oldDecl->isInstanceMember() ||
+      oldDecl->isStatic())
+    originalFnSubst = cast<FunctionType>(originalFnSubst->getResult().getPointer());
+
+  SmallVector<ParamDecl *, 4> fixedParameters;
+  unsigned parameterIndex = 0;
+  for (auto *newFnParam : *newDecl->getParameters()) {
+    // If the user substituted this param with an (U)Int, use (U)Int.
+    auto substParamType =
+        originalFnSubst->getParams()[parameterIndex].getParameterType();
+    if (substParamType->isEqual(newDecl->getASTContext().getIntType()) ||
+        substParamType->isEqual(newDecl->getASTContext().getUIntType())) {
+      auto intParam =
+          ParamDecl::cloneWithoutType(newDecl->getASTContext(), newFnParam);
+      intParam->setInterfaceType(substParamType);
+      fixedParameters.push_back(intParam);
+    } else {
+      fixedParameters.push_back(newFnParam);
+    }
+    parameterIndex++;
+  }
+
+  auto fixedParams =
+      ParameterList::create(newDecl->getASTContext(), fixedParameters);
+  newDecl->setParameters(fixedParams);
+
+  // Now fix the result type:
+  if (originalFnSubst->getResult()->isEqual(
+          newDecl->getASTContext().getIntType()) ||
+      originalFnSubst->getResult()->isEqual(
+          newDecl->getASTContext().getUIntType())) {
+    // Constructors don't have a result.
+    if (auto func = dyn_cast<FuncDecl>(newDecl)) {
+      // We have to rebuild the whole function.
+      auto newFnDecl = FuncDecl::createImported(
+          func->getASTContext(), func->getNameLoc(),
+          func->getName(), func->getNameLoc(),
+          func->hasAsync(), func->hasThrows(),
+          fixedParams, originalFnSubst->getResult(),
+          /*genericParams=*/nullptr, func->getDeclContext(), newDecl->getClangDecl());
+      if (func->isStatic()) newFnDecl->setStatic();
+      if (func->isImportAsStaticMember()) newFnDecl->setImportAsStaticMember();
+      if (func->getImportAsMemberStatus().isInstance()) {
+        newFnDecl->setSelfAccessKind(func->getSelfAccessKind());
+        newFnDecl->setSelfIndex(func->getSelfIndex());
+      }
+
+      return newFnDecl;
+    }
+  }
+
+  return newDecl;
+}
+
+static Expr *createSelfExpr(FuncDecl *fnDecl) {
+  ASTContext &ctx = fnDecl->getASTContext();
+
+  auto selfDecl = fnDecl->getImplicitSelfDecl();
+  auto selfRefExpr = new (ctx) DeclRefExpr(selfDecl, DeclNameLoc(),
+                                           /*implicit*/ true);
+
+  if (!fnDecl->isMutating()) {
+    selfRefExpr->setType(selfDecl->getInterfaceType());
+    return selfRefExpr;
+  }
+  selfRefExpr->setType(LValueType::get(selfDecl->getInterfaceType()));
+
+  auto inoutSelfExpr = new (ctx) InOutExpr(
+      SourceLoc(), selfRefExpr,
+      fnDecl->mapTypeIntoContext(selfDecl->getValueInterfaceType()),
+      /*isImplicit*/ true);
+  inoutSelfExpr->setType(InOutType::get(selfDecl->getInterfaceType()));
+  return inoutSelfExpr;
+}
+
+// Synthesize a thunk body for the function created in
+// "addThunkForDependentTypes". This will just cast all params and forward them
+// along to the specialized function. It will also cast the result before
+// returning it.
+static std::pair<BraceStmt *, bool>
+synthesizeDependentTypeThunkParamForwarding(AbstractFunctionDecl *afd, void *context) {
+  ASTContext &ctx = afd->getASTContext();
+
+  auto thunkDecl = cast<FuncDecl>(afd);
+  auto specializedFuncDecl = static_cast<FuncDecl *>(context);
+
+  SmallVector<Argument, 8> forwardingParams;
+  unsigned paramIndex = 0;
+  for (auto param : *thunkDecl->getParameters()) {
+    if (isa<MetatypeType>(param->getType().getPointer())) {
+      paramIndex++;
+      continue;
+    }
+
+    Expr *paramRefExpr = new (ctx) DeclRefExpr(param, DeclNameLoc(),
+                                               /*Implicit=*/true);
+    paramRefExpr->setType(param->getType());
+
+    if (param->isInOut()) {
+      paramRefExpr->setType(LValueType::get(param->getType()));
+
+      paramRefExpr = new (ctx) InOutExpr(
+          SourceLoc(), paramRefExpr, param->getType(), /*isImplicit*/ true);
+      paramRefExpr->setType(InOutType::get(param->getType()));
+    }
+
+    auto specParamTy = specializedFuncDecl->getParameters()->get(paramIndex)->getType();
+
+    Expr *argExpr = nullptr;
+    if (specParamTy->isEqual(param->getType())) {
+      argExpr = paramRefExpr;
+    } else {
+      argExpr = ForcedCheckedCastExpr::createImplicit(ctx, paramRefExpr,
+                                                      specParamTy);
+    }
+
+    forwardingParams.push_back(Argument(SourceLoc(), Identifier(), argExpr));
+    paramIndex++;
+  }
+
+  Expr *specializedFuncDeclRef = new (ctx) DeclRefExpr(ConcreteDeclRef(specializedFuncDecl),
+                                                       DeclNameLoc(), true);
+  specializedFuncDeclRef->setType(specializedFuncDecl->getInterfaceType());
+
+  if (specializedFuncDecl->isInstanceMember()) {
+    auto selfExpr = createSelfExpr(thunkDecl);
+    auto *memberCall = DotSyntaxCallExpr::create(ctx, specializedFuncDeclRef, SourceLoc(), selfExpr);
+    memberCall->setThrows(false);
+    auto resultType = specializedFuncDecl->getInterfaceType()->getAs<FunctionType>()->getResult();
+    specializedFuncDeclRef = memberCall;
+    specializedFuncDeclRef->setType(resultType);
+  } else if (specializedFuncDecl->isStatic()) {
+    auto resultType = specializedFuncDecl->getInterfaceType()->getAs<FunctionType>()->getResult();
+    auto selfType = cast<NominalTypeDecl>(thunkDecl->getDeclContext()->getAsDecl())->getDeclaredInterfaceType();
+    auto selfTypeExpr = TypeExpr::createImplicit(selfType, ctx);
+    auto *memberCall = DotSyntaxCallExpr::create(ctx, specializedFuncDeclRef, SourceLoc(), selfTypeExpr);
+    memberCall->setThrows(false);
+    specializedFuncDeclRef = memberCall;
+    specializedFuncDeclRef->setType(resultType);
+  }
+
+  auto argList = ArgumentList::createImplicit(ctx, forwardingParams);
+  auto *specializedFuncCallExpr = CallExpr::createImplicit(ctx, specializedFuncDeclRef, argList);
+  specializedFuncCallExpr->setType(specializedFuncDecl->getResultInterfaceType());
+  specializedFuncCallExpr->setThrows(false);
+
+  Expr *resultExpr = nullptr;
+  if (specializedFuncCallExpr->getType()->isEqual(thunkDecl->getResultInterfaceType())) {
+    resultExpr = specializedFuncCallExpr;
+  } else {
+    resultExpr = ForcedCheckedCastExpr::createImplicit(
+        ctx, specializedFuncCallExpr, thunkDecl->getResultInterfaceType());
+  }
+
+  auto returnStmt = new (ctx)
+      ReturnStmt(SourceLoc(), resultExpr, /*implicit=*/true);
+  auto body = BraceStmt::create(ctx, SourceLoc(), {returnStmt}, SourceLoc(),
+                                /*implicit=*/true);
+  return {body, /*isTypeChecked=*/true};
+}
+
+// Create a thunk to map functions with dependent types to their specialized
+// version. For example, create a thunk with type (Any) -> Any to wrap a
+// specialized function template with type (Dependent<T>) -> Dependent<T>.
+static ValueDecl *addThunkForDependentTypes(FuncDecl *oldDecl,
+                                            FuncDecl *newDecl) {
+  bool updatedAnyParams = false;
+
+  SmallVector<ParamDecl *, 4> fixedParameters;
+  unsigned parameterIndex = 0;
+  for (auto *newFnParam : *newDecl->getParameters()) {
+    // If the un-specialized function had a parameter with type "Any" preserve
+    // that parameter. Otherwise, use the new function parameter.
+    auto oldParamType = oldDecl->getParameters()->get(parameterIndex)->getType();
+    if (oldParamType->isEqual(newDecl->getASTContext().TheAnyType)) {
+      updatedAnyParams = true;
+      auto newParam =
+          ParamDecl::cloneWithoutType(newDecl->getASTContext(), newFnParam);
+      newParam->setInterfaceType(oldParamType);
+      fixedParameters.push_back(newParam);
+    } else {
+      fixedParameters.push_back(newFnParam);
+    }
+    parameterIndex++;
+  }
+
+  // If we don't need this thunk, bail out.
+  if (!updatedAnyParams &&
+      !oldDecl->getResultInterfaceType()->isEqual(
+          oldDecl->getASTContext().TheAnyType))
+    return newDecl;
+
+  auto fixedParams =
+      ParameterList::create(newDecl->getASTContext(), fixedParameters);
+
+  Type fixedResultType;
+  if (oldDecl->getResultInterfaceType()->isEqual(
+          oldDecl->getASTContext().TheAnyType))
+    fixedResultType = oldDecl->getASTContext().TheAnyType;
+  else
+    fixedResultType = newDecl->getResultInterfaceType();
+
+  // We have to rebuild the whole function.
+  auto newFnDecl = FuncDecl::createImplicit(
+      newDecl->getASTContext(), newDecl->getStaticSpelling(),
+      newDecl->getName(), newDecl->getNameLoc(), newDecl->hasAsync(),
+      newDecl->hasThrows(), /*genericParams=*/nullptr, fixedParams,
+      fixedResultType, newDecl->getDeclContext());
+  newFnDecl->copyFormalAccessFrom(newDecl);
+  newFnDecl->setBodySynthesizer(synthesizeDependentTypeThunkParamForwarding, newDecl);
+  newFnDecl->setSelfAccessKind(newDecl->getSelfAccessKind());
+  if (newDecl->isStatic()) newFnDecl->setStatic();
+  newFnDecl->getAttrs().add(
+      new (newDecl->getASTContext()) TransparentAttr(/*IsImplicit=*/true));
+  return newFnDecl;
+}
+
+// Synthesizes the body of a thunk that takes extra metatype arguments and
+// skips over them to forward them along to the FuncDecl contained by context.
+// This is used when importing a C++ templated function where the template params
+// are not used in the function signature. We supply the type params as explicit
+// metatype arguments to aid in typechecking, but they shouldn't be forwarded to
+// the corresponding C++ function.
+static std::pair<BraceStmt *, bool>
+synthesizeForwardingThunkBody(AbstractFunctionDecl *afd, void *context) {
+  ASTContext &ctx = afd->getASTContext();
+
+  auto thunkDecl = cast<FuncDecl>(afd);
+  auto specializedFuncDecl = static_cast<FuncDecl *>(context);
+
+  SmallVector<Argument, 8> forwardingParams;
+  for (auto param : *thunkDecl->getParameters()) {
+    if (isa<MetatypeType>(param->getType().getPointer())) {
+      continue;
+    }
+    Expr *paramRefExpr = new (ctx) DeclRefExpr(param, DeclNameLoc(),
+                                               /*Implicit=*/true);
+    paramRefExpr->setType(param->getType());
+
+    if (param->isInOut()) {
+      paramRefExpr->setType(LValueType::get(param->getType()));
+
+      paramRefExpr = new (ctx) InOutExpr(
+          SourceLoc(), paramRefExpr, param->getType(), /*isImplicit*/ true);
+      paramRefExpr->setType(InOutType::get(param->getType()));
+    }
+
+    forwardingParams.push_back(Argument(SourceLoc(), Identifier(), paramRefExpr));
+  }
+
+  Expr *specializedFuncDeclRef = new (ctx) DeclRefExpr(ConcreteDeclRef(specializedFuncDecl),
+                                                       DeclNameLoc(), true);
+  specializedFuncDeclRef->setType(specializedFuncDecl->getInterfaceType());
+
+  if (specializedFuncDecl->isInstanceMember()) {
+    auto selfExpr = createSelfExpr(thunkDecl);
+    auto *memberCall = DotSyntaxCallExpr::create(ctx, specializedFuncDeclRef, SourceLoc(), selfExpr);
+    memberCall->setThrows(false);
+    auto resultType = specializedFuncDecl->getInterfaceType()->getAs<FunctionType>()->getResult();
+    specializedFuncDeclRef = memberCall;
+    specializedFuncDeclRef->setType(resultType);
+  } else if (specializedFuncDecl->isStatic()) {
+    auto resultType = specializedFuncDecl->getInterfaceType()->getAs<FunctionType>()->getResult();
+    auto selfType = cast<NominalTypeDecl>(thunkDecl->getDeclContext()->getAsDecl())->getDeclaredInterfaceType();
+    auto selfTypeExpr = TypeExpr::createImplicit(selfType, ctx);
+    auto *memberCall = DotSyntaxCallExpr::create(ctx, specializedFuncDeclRef, SourceLoc(), selfTypeExpr);
+    memberCall->setThrows(false);
+    specializedFuncDeclRef = memberCall;
+    specializedFuncDeclRef->setType(resultType);
+  }
+
+  auto argList = ArgumentList::createImplicit(ctx, forwardingParams);
+  auto *specializedFuncCallExpr = CallExpr::createImplicit(ctx, specializedFuncDeclRef, argList);
+  specializedFuncCallExpr->setType(thunkDecl->getResultInterfaceType());
+  specializedFuncCallExpr->setThrows(false);
+
+  auto returnStmt = new (ctx) ReturnStmt(SourceLoc(), specializedFuncCallExpr,
+                                         /*implicit=*/true);
+
+  auto body = BraceStmt::create(ctx, SourceLoc(), {returnStmt}, SourceLoc(),
+                                /*implicit=*/true);
+  return {body, /*isTypeChecked=*/true};
+}
+
+static ValueDecl *generateThunkForExtraMetatypes(SubstitutionMap subst,
+                                                 FuncDecl *oldDecl,
+                                                 FuncDecl *newDecl) {
+  // We added additional metatype parameters to aid template
+  // specialization, which are no longer now that we've specialized
+  // this function. Create a thunk that only forwards the original
+  // parameters along to the clang function.
+  SmallVector<ParamDecl *, 4> newParams;
+
+  for (auto param : *newDecl->getParameters()) {
+    auto *newParamDecl = ParamDecl::clone(newDecl->getASTContext(), param);
+    newParams.push_back(newParamDecl);
+  }
+
+  auto originalFnSubst = cast<AbstractFunctionDecl>(oldDecl)
+                             ->getInterfaceType()
+                             ->getAs<GenericFunctionType>()
+                             ->substGenericArgs(subst);
+  // The constructor type is a function type as follows:
+  //   (CType.Type) -> (Generic) -> CType
+  // And a method's function type is as follows:
+  //   (inout CType) -> (Generic) -> Void
+  // In either case, we only want the result of that function type because that
+  // is the function type with the generic params that need to be substituted:
+  //   (Generic) -> CType
+  if (isa<ConstructorDecl>(oldDecl) || oldDecl->isInstanceMember() ||
+      oldDecl->isStatic())
+    originalFnSubst = cast<FunctionType>(originalFnSubst->getResult().getPointer());
+
+  for (auto paramTy : originalFnSubst->getParams()) {
+    if (!paramTy.getPlainType()->is<MetatypeType>())
+      continue;
+
+    auto dc = newDecl->getDeclContext();
+    auto paramVarDecl =
+        new (newDecl->getASTContext()) ParamDecl(
+            SourceLoc(), SourceLoc(), Identifier(), SourceLoc(),
+            newDecl->getASTContext().getIdentifier("_"), dc);
+    paramVarDecl->setInterfaceType(paramTy.getPlainType());
+    paramVarDecl->setSpecifier(ParamSpecifier::Default);
+    newParams.push_back(paramVarDecl);
+  }
+
+  auto *newParamList =
+      ParameterList::create(newDecl->getASTContext(), SourceLoc(), newParams, SourceLoc());
+
+  auto thunk = FuncDecl::createImplicit(
+      newDecl->getASTContext(), newDecl->getStaticSpelling(), oldDecl->getName(),
+      newDecl->getNameLoc(), newDecl->hasAsync(), newDecl->hasThrows(),
+      /*genericParams=*/nullptr, newParamList,
+      newDecl->getResultInterfaceType(), newDecl->getDeclContext());
+  thunk->copyFormalAccessFrom(newDecl);
+  thunk->setBodySynthesizer(synthesizeForwardingThunkBody, newDecl);
+  thunk->setSelfAccessKind(newDecl->getSelfAccessKind());
+  if (newDecl->isStatic()) thunk->setStatic();
+  thunk->getAttrs().add(
+      new (newDecl->getASTContext()) TransparentAttr(/*IsImplicit=*/true));
+
+  return thunk;
+}
+
+ConcreteDeclRef
+ClangImporter::getCXXFunctionTemplateSpecialization(SubstitutionMap subst,
+                                                    ValueDecl *decl) {
+  PrettyStackTraceDeclAndSubst trace("specializing", subst, decl);
+
+  assert(isa<clang::FunctionTemplateDecl>(decl->getClangDecl()) &&
+         "This API should only be used with function templates.");
+
+  auto *newFn =
+      decl->getASTContext()
+          .getClangModuleLoader()
+          ->instantiateCXXFunctionTemplate(
+              decl->getASTContext(),
+              const_cast<clang::FunctionTemplateDecl *>(
+                  cast<clang::FunctionTemplateDecl>(decl->getClangDecl())),
+              subst);
+  // We failed to specialize this function template. The compiler is going to
+  // exit soon. Return something valid in the meantime.
+  if (!newFn)
+    return ConcreteDeclRef(decl);
+
+  if (Impl.specializedFunctionTemplates.count(newFn))
+    return ConcreteDeclRef(Impl.specializedFunctionTemplates[newFn]);
+
+  auto newDecl = cast_or_null<ValueDecl>(
+      decl->getASTContext().getClangModuleLoader()->importDeclDirectly(
+          newFn));
+
+  if (auto fn = dyn_cast<AbstractFunctionDecl>(newDecl)) {
+    if (!subst.empty()) {
+      newDecl = rewriteIntegerTypes(subst, decl, fn);
+    }
+  }
+
+  if (auto fn = dyn_cast<FuncDecl>(decl)) {
+    newDecl = addThunkForDependentTypes(fn, cast<FuncDecl>(newDecl));
+  }
+
+  if (auto fn = dyn_cast<FuncDecl>(decl)) {
+    if (newFn->getNumParams() != fn->getParameters()->size()) {
+      newDecl = generateThunkForExtraMetatypes(subst, fn,
+                                               cast<FuncDecl>(newDecl));
+    }
+  }
+
+  Impl.specializedFunctionTemplates[newFn] = newDecl;
+  return ConcreteDeclRef(newDecl);
 }
 
 bool ClangImporter::isCXXMethodMutating(const clang::CXXMethodDecl *method) {

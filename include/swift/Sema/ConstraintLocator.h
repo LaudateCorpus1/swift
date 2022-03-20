@@ -85,6 +85,9 @@ enum ContextualTypePurpose : uint8_t {
   CTP_ComposedPropertyWrapper, ///< Composed wrapper type expected to match
                                ///< former 'wrappedValue' type
 
+  CTP_ExprPattern,      ///< `~=` operator application associated with expression
+                        /// pattern.
+
   CTP_CannotFail,       ///< Conversion can never fail. abort() if it does.
 };
 
@@ -1052,6 +1055,19 @@ public:
 
   static bool classof(const LocatorPathElt *elt) {
     return elt->getKind() == PathElementKind::ClosureBodyElement;
+  }
+};
+
+class LocatorPathElt::PatternBindingElement final
+    : public StoredIntegerElement<1> {
+public:
+  PatternBindingElement(unsigned index)
+      : StoredIntegerElement(ConstraintLocator::PatternBindingElement, index) {}
+
+  unsigned getIndex() const { return getValue(); }
+
+  static bool classof(const LocatorPathElt *elt) {
+    return elt->getKind() == ConstraintLocator::PatternBindingElement;
   }
 };
 

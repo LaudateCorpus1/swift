@@ -142,7 +142,7 @@ ERROR(could_not_use_instance_member_on_type,none,
       "%select{| instance of nested}3 type %0",
       (Type, DeclNameRef, Type, bool))
 ERROR(could_not_use_member_on_existential,none,
-      "member %1 cannot be used on value of protocol type %0; consider using a"
+      "member %1 cannot be used on value of type %0; consider using a"
       " generic constraint instead",
       (Type, DeclNameRef))
 FIXIT(replace_with_type,"%0",(Type))
@@ -1542,6 +1542,9 @@ ERROR(optional_attribute_initializer,none,
 ERROR(unavailable_method_non_objc_protocol,none,
       "protocol members can only be marked unavailable in an @objc protocol",
       ())
+ERROR(spi_available_malformed,none,
+      "SPI available only supports introducing version on specific platform",
+      ())
 ERROR(missing_in_class_init_1,none,
       "stored property %0 requires an initial value%select{| or should be "
       "@NSManaged}1", (Identifier, bool))
@@ -1599,25 +1602,11 @@ WARNING(option_set_zero_constant,none,
 NOTE(option_set_empty_set_init,none,
      "use [] to silence this warning", ())
 
-// FIXME(backDeploy): Refactor to share with back deployment attr
-ERROR(originally_defined_in_dupe_platform,none,
-      "duplicate version number for platform %0", (StringRef))
-
 ERROR(originally_definedin_topleve_decl,none,
       "@%0 is only applicable to top-level decl", (StringRef))
 
-// FIXME(backDeploy): Refactor to share with back deployment attr
-ERROR(originally_definedin_need_available,none,
-      "need @available attribute for @%0", (StringRef))
-
 ERROR(originally_definedin_must_not_before_available_version,none,
       "symbols are moved to the current module before they were available in the OSs", (StringRef))
-
-// FIXME(backDeploy): Refactor to share with back deployment attr
-WARNING(originally_defined_in_on_non_public,
-       none, "@%0 does not have any effect on "
-       "%select{private|fileprivate|internal|%error|%error}1 declarations",
-       (StringRef, AccessLevel))
 
 // Alignment attribute
 ERROR(alignment_not_power_of_two,none,
@@ -1944,6 +1933,11 @@ ERROR(type_does_not_conform,none,
 WARNING(type_does_not_conform_swiftui_warning,none,
         "type %0 does not conform to protocol %1", (Type, Type))
 
+ERROR(non_final_class_cannot_conform_to_self_same_type,none,
+      "non-final class %0 cannot safely conform to protocol %1, "
+      "which requires that %2 %select{is exactly equal to|inherit from}3 %4",
+      (Type, Type, Type, unsigned, Type))
+
 ERROR(cannot_use_nil_with_this_type,none,
       "'nil' cannot be used in context expecting type %0", (Type))
 
@@ -1954,9 +1948,8 @@ ERROR(type_cannot_conform_to_nsobject,none,
 ERROR(use_of_equal_instead_of_equality,none,
       "use of '=' in a boolean context, did you mean '=='?", ())
 ERROR(type_cannot_conform, none,
-      "%select{type %1|protocol %1 as a type}0 cannot conform to "
-      "%select{%3|the protocol itself}2",
-      (bool, Type, bool, Type))
+      "type %0 cannot conform to %1",
+      (Type, Type))
 NOTE(only_concrete_types_conform_to_protocols,none,
      "only concrete types such as structs, enums and classes can conform to protocols",
      ())
@@ -2464,8 +2457,8 @@ ERROR(protocol_composition_one_class,none,
       "contains class %1", (Type, Type))
 
 ERROR(requires_conformance_nonprotocol,none,
-      "type %0 constrained to non-protocol, non-class type '%1'",
-      (Type, StringRef))
+      "type %0 constrained to non-protocol, non-class type %1",
+      (Type, Type))
 NOTE(requires_conformance_nonprotocol_fixit,none,
      "use '%0 == %1' to require '%0' to be '%1'",
      (StringRef, StringRef))
@@ -2786,9 +2779,9 @@ WARNING(anyobject_class_inheritance_deprecated,Deprecation,
 ERROR(multiple_inheritance,none,
   "multiple inheritance from classes %0 and %1", (Type, Type))
 ERROR(inheritance_from_non_protocol_or_class,none,
-  "inheritance from non-protocol, non-class type '%0'", (StringRef))
+  "inheritance from non-protocol, non-class type %0", (Type))
 ERROR(inheritance_from_non_protocol,none,
-  "inheritance from non-protocol type '%0'", (StringRef))
+  "inheritance from non-protocol type %0", (Type))
 ERROR(inheritance_from_anyobject,none,
   "only protocols can inherit from 'AnyObject'", ())
 ERROR(inheritance_from_parameterized_protocol,none,
@@ -3134,9 +3127,27 @@ ERROR(attr_not_on_variadic_parameters,none,
       "'%0' must not be used on variadic parameters", (StringRef))
 ERROR(attr_not_on_subscript_parameters,none,
       "'%0' must not be used on subscript parameters", (StringRef))
+ERROR(attr_not_on_stored_properties,none,
+      "'%0' must not be used on stored properties", (DeclAttribute))
+
+WARNING(attr_has_no_effect_on_decl_with_access_level,none,
+       "'%0' does not have any effect on "
+       "%select{private|fileprivate|internal|%error|%error}1 declarations",
+       (DeclAttribute, AccessLevel))
+ERROR(attr_not_on_decl_with_invalid_access_level,none,
+      "'%0' may not be used on "
+      "%select{private|fileprivate|internal|%error|%error}1 declarations",
+      (DeclAttribute, AccessLevel))
+
+ERROR(attr_has_no_effect_decl_not_available_before,none,
+      "'%0' has no effect because %1 is not available before %2 %3",
+      (DeclAttribute, DeclName, StringRef, llvm::VersionTuple))
 
 ERROR(attr_ambiguous_reference_to_decl,none,
       "ambiguous reference to %0 in '@%1' attribute", (DeclNameRef, StringRef))
+
+ERROR(attr_contains_multiple_versions_for_platform,none,
+      "'%0' contains multiple versions for %1", (DeclAttribute, StringRef))
 
 ERROR(override_final,none,
       "%0 overrides a 'final' %1", (DescriptiveDeclKind, DescriptiveDeclKind))
@@ -3151,6 +3162,10 @@ ERROR(member_cannot_be_final,none,
 ERROR(final_not_allowed_here,none,
       "'final' may only be applied to classes, properties, methods, and "
       "subscripts", ())
+
+ERROR(attr_incompatible_with_non_final,none,
+      "'%0' cannot be applied to a non-final %1",
+      (DeclAttribute, DescriptiveDeclKind))
 
 ERROR(final_not_on_accessors,none,
       "'final' cannot be applied to accessors, it must be put on the "
@@ -3576,7 +3591,7 @@ ERROR(construct_protocol_value,none,
       "value of type %0 is a protocol; it cannot be instantiated",
       (Type))
 ERROR(construct_protocol_by_name,none,
-      "protocol type %0 cannot be instantiated",
+      "type %0 cannot be instantiated",
       (Type))
 
 // Operators
@@ -4480,6 +4495,13 @@ ERROR(actor_inheritance,none,
 ERROR(actor_protocol_illegal_inheritance,none,
       "non-actor type %0 cannot conform to the 'Actor' protocol",
       (DeclName))
+ERROR(distributed_actor_conformance_missing_system_type,none,
+      "distributed actor %0 does not declare ActorSystem it can be used with.",
+      (DeclName))
+NOTE(note_distributed_actor_system_can_be_defined_using_defaultdistributedactorsystem,none,
+     "you can provide a module-wide default actor system by declaring:\n"
+     "typealias DefaultDistributedActorSystem = <#ConcreteActorSystem#>\n",
+     ())
 ERROR(distributed_actor_protocol_illegal_inheritance,none,
       "non-distributed actor type %0 cannot conform to the 'DistributedActor' protocol",
       (DeclName))
@@ -4495,9 +4517,10 @@ NOTE(note_distributed_actor_system_conformance_missing_adhoc_requirement,none,
 ERROR(override_implicit_unowned_executor,none,
       "cannot override an actor's 'unownedExecutor' property that wasn't "
       "explicitly defined", ())
-ERROR(actor_isolated_from_deinit,none,
-      "actor-isolated %0 %1 can not be referenced from a non-isolated deinit",
-      (DescriptiveDeclKind, DeclName))
+ERROR(actor_isolated_from_decl,none,
+      "actor-isolated %0 %1 can not be referenced from a non-isolated "
+      "%select{deinit|autoclosure|closure}2",
+      (DescriptiveDeclKind, DeclName, unsigned))
 ERROR(actor_isolated_non_self_reference,none,
         "actor-isolated %0 %1 can not be "
         "%select{referenced|mutated|used 'inout'}2 "
@@ -4511,7 +4534,7 @@ ERROR(distributed_actor_isolated_non_self_reference,none,
       "non-isolated context",
       (DescriptiveDeclKind, DeclName))
 ERROR(distributed_actor_needs_explicit_distributed_import,none,
-      "'_Distributed' module not imported, required for 'distributed actor'",
+      "'Distributed' module not imported, required for 'distributed actor'",
       ())
 ERROR(actor_isolated_inout_state,none,
       "actor-isolated %0 %1 cannot be passed 'inout' to"
@@ -4532,10 +4555,6 @@ ERROR(global_actor_from_nonactor_context,none,
       "%0 %1 isolated to global actor %2 can not be %select{referenced|mutated|used 'inout'}4"
       " from %select{this|a non-isolated}3%select{| synchronous}5 context",
       (DescriptiveDeclKind, DeclName, Type, bool, unsigned, bool))
-ERROR(global_actor_from_initializing_expr,none,
-      "expression requiring global actor %0 cannot appear in "
-        "default-value expression of %1 %2",
-      (Type, DescriptiveDeclKind, DeclName))
 ERROR(actor_isolated_call,none,
       "call to %0 function in a synchronous %1 context",
       (ActorIsolation, ActorIsolation))
@@ -4578,6 +4597,9 @@ NOTE(note_distributed_actor_isolated_method,none,
      (DescriptiveDeclKind, DeclName))
 ERROR(distributed_actor_isolated_method,none,
       "only 'distributed' instance methods can be called on a potentially remote distributed actor",
+      ())
+ERROR(distributed_local_cannot_be_used,none,
+      "'local' cannot be used in user-defined code currently",
       ())
 ERROR(distributed_actor_func_param_not_codable,none,
       "parameter '%0' of type %1 in %2 does not conform to serialization requirement '%3'",
@@ -4711,8 +4733,8 @@ ERROR(any_not_existential,none,
        "'any' has no effect on %select{concrete type|type parameter}0 %1",
        (bool, Type))
 ERROR(existential_requires_any,none,
-      "%select{protocol |}1%0 as a type must be explicitly marked as 'any'",
-      (Type, bool))
+      "use of %select{protocol |}2%0 as a type must be written %1",
+      (Type, Type, bool))
 
 ERROR(nonisolated_let,none,
       "'nonisolated' is meaningless on 'let' declarations because "
@@ -5605,9 +5627,13 @@ WARNING(public_decl_needs_availability, none,
         "public declarations should have an availability attribute when building "
         "with -require-explicit-availability", ())
 
-ERROR(availability_macro_in_inlinable, none,
-      "availability macro cannot be used in inlinable %0",
-      (DescriptiveDeclKind))
+ERROR(attr_requires_decl_availability_for_platform,none,
+      "'%0' requires that %1 have explicit availability for %2",
+      (DeclAttribute, DeclName, StringRef))
+
+ERROR(attr_requires_availability_for_platform,none,
+      "'%0' requires explicit availability for %1",
+      (DeclAttribute, StringRef))
 
 // This doesn't display as an availability diagnostic, but it's
 // implemented there and fires when these subscripts are marked
@@ -5697,7 +5723,8 @@ ERROR(usable_from_inline_attr_in_protocol,none,
   "an '@inlinable' function|" \
   "an '@_alwaysEmitIntoClient' function|" \
   "a default argument value|" \
-  "a property initializer in a '@frozen' type}"
+  "a property initializer in a '@frozen' type|" \
+  "a '@_backDeploy' function'}"
 
 #define DECL_OR_ACCESSOR "%select{%0|%0 for}"
 
@@ -5721,6 +5748,10 @@ ERROR(inlinable_decl_ref_from_hidden_module,
       "it is an SPI imported from %3|"
       "it is SPI}4",
       (DescriptiveDeclKind, DeclName, unsigned, Identifier, unsigned))
+
+ERROR(availability_macro_in_inlinable, none,
+      "availability macro cannot be used in " FRAGILE_FUNC_KIND "0",
+      (unsigned))
 
 #undef FRAGILE_FUNC_KIND
 
@@ -6090,6 +6121,15 @@ WARNING(result_builder_missing_limited_availability, none,
 ERROR(result_builder_static_buildblock, none,
       "result builder must provide at least one static 'buildBlock' "
       "method", ())
+ERROR(result_builder_static_buildblock_or_buildpartialblock, none,
+      "result builder must provide at least one static 'buildBlock' "
+      "method, or both 'buildPartialBlock(first:)' and "
+      "'buildPartialBlock(accumulated:next:)'", ())
+ERROR(result_builder_missing_available_buildpartialblock, none,
+      "result builder %0 does not implement any 'buildBlock' or a combination "
+      "of 'buildPartialBlock(first:)' and "
+      "'buildPartialBlock(accumulated:next:)' with sufficient availability for "
+      "this call site", (Type))
 NOTE(result_builder_non_static_buildblock, none,
      "did you mean to make instance method 'buildBlock' static?", ())
 NOTE(result_builder_buildblock_enum_case, none,
@@ -6157,6 +6197,10 @@ ERROR(marker_protocol_conditional_conformance,none,
 ERROR(differentiable_programming_attr_used_without_required_module, none,
       "'@%0' attribute used without importing module %1",
       (StringRef, Identifier))
+
+//------------------------------------------------------------------------------
+// MARK: OSLog
+//------------------------------------------------------------------------------
 
 ERROR(oslog_arg_must_be_bool_literal, none,
       "argument must be a bool literal", ())
@@ -6264,6 +6308,18 @@ ERROR(cannot_default_generic_parameter_invalid_requirement, none,
 ERROR(cannot_convert_default_value_type_to_argument_type, none,
       "cannot convert default value of type %0 to expected argument type %1 for parameter #%2",
       (Type, Type, unsigned))
+
+//------------------------------------------------------------------------------
+// MARK: Back deployment
+//------------------------------------------------------------------------------
+
+ERROR(attr_incompatible_with_back_deploy,none,
+      "'%0' cannot be applied to a back deployed %1",
+      (DeclAttribute, DescriptiveDeclKind))
+
+ERROR(back_deploy_not_on_coroutine,none,
+      "'%0' is not supported on coroutine %1",
+      (DeclAttribute, DescriptiveDeclKind))
 
 #define UNDEFINE_DIAGNOSTIC_MACROS
 #include "DefineDiagnosticMacros.h"

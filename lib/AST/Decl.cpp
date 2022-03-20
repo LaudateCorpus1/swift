@@ -377,6 +377,24 @@ Decl::getIntroducedOSVersion(PlatformKind Kind) const {
   return None;
 }
 
+Optional<llvm::VersionTuple>
+Decl::getBackDeployBeforeOSVersion(PlatformKind Kind) const {
+  for (auto *attr : getAttrs()) {
+    if (auto *backDeployAttr = dyn_cast<BackDeployAttr>(attr)) {
+      if (backDeployAttr->Platform == Kind && backDeployAttr->Version) {
+        return backDeployAttr->Version;
+      }
+    }
+  }
+
+  // Accessors may inherit `@_backDeploy`.
+  if (getKind() == DeclKind::Accessor) {
+    return cast<AccessorDecl>(this)->getStorage()->getBackDeployBeforeOSVersion(Kind);
+  }
+
+  return None;
+}
+
 llvm::raw_ostream &swift::operator<<(llvm::raw_ostream &OS,
                                      StaticSpellingKind SSK) {
   switch (SSK) {
@@ -2914,7 +2932,7 @@ CanType ValueDecl::getOverloadSignatureType() const {
                                     /*topLevelFunction=*/true, isMethod,
                                     /*isInitializer=*/isa<ConstructorDecl>(afd),
                                     getNumCurryLevels())
-        ->getMinimalCanonicalType();
+        ->getMinimalCanonicalType(afd);
   }
 
   if (isa<AbstractStorageDecl>(this)) {
@@ -2930,7 +2948,7 @@ CanType ValueDecl::getOverloadSignatureType() const {
                                    /*topLevelFunction=*/true,
                                    /*isMethod=*/false,
                                    /*isInitializer=*/false, getNumCurryLevels())
-              ->getMinimalCanonicalType();
+              ->getMinimalCanonicalType(cast<SubscriptDecl>(this));
     }
 
     // We want to curry the default signature type with the 'self' type of the
@@ -2938,14 +2956,14 @@ CanType ValueDecl::getOverloadSignatureType() const {
     // is unique across different contexts, such as between a protocol extension
     // and struct decl.
     return defaultSignatureType->addCurriedSelfType(getDeclContext())
-        ->getMinimalCanonicalType();
+        ->getCanonicalType();
   }
 
   if (isa<EnumElementDecl>(this)) {
     auto mappedType = mapSignatureFunctionType(
         getASTContext(), getInterfaceType(), /*topLevelFunction=*/false,
         /*isMethod=*/false, /*isInitializer=*/false, getNumCurryLevels());
-    return mappedType->getMinimalCanonicalType();
+    return mappedType->getMinimalCanonicalType(getDeclContext());
   }
 
   // Note: If you add more cases to this function, you should update the
@@ -3427,7 +3445,7 @@ static AccessLevel getMaximallyOpenAccessFor(const ValueDecl *decl) {
 
   // Non-final overridable class members are considered open to
   // @testable importers.
-  } else if (decl->isPotentiallyOverridable()) {
+  } else if (decl->isSyntacticallyOverridable()) {
     if (!cast<ValueDecl>(decl)->isSemanticallyFinal())
       return AccessLevel::Open;
   }
@@ -3781,7 +3799,7 @@ void ValueDecl::copyFormalAccessFrom(const ValueDecl *source,
     access = AccessLevel::FilePrivate;
 
   // Only certain declarations can be 'open'.
-  if (access == AccessLevel::Open && !isPotentiallyOverridable()) {
+  if (access == AccessLevel::Open && !isSyntacticallyOverridable()) {
     assert(!isa<ClassDecl>(this) &&
            "copying 'open' onto a class has complications");
     access = AccessLevel::Public;
@@ -4075,6 +4093,7 @@ GenericParameterReferenceInfo swift::findGenericParameterReferences(
 GenericParameterReferenceInfo ValueDecl::findExistentialSelfReferences(
     Type baseTy, bool treatNonResultCovariantSelfAsInvariant) const {
   assert(baseTy->isExistentialType());
+  assert(!baseTy->hasTypeParameter());
 
   // Types never refer to 'Self'.
   if (isa<TypeDecl>(this))
@@ -4086,7 +4105,12 @@ GenericParameterReferenceInfo ValueDecl::findExistentialSelfReferences(
   if (type->hasError())
     return GenericParameterReferenceInfo();
 
-  const auto sig = getASTContext().getOpenedArchetypeSignature(baseTy);
+  // Note: a non-null GenericSignature would violate the invariant that
+  // the protocol 'Self' type referenced from the requirement's interface
+  // type is the same as the existential 'Self' type.
+  auto sig = getASTContext().getOpenedArchetypeSignature(baseTy,
+      GenericSignature());
+
   auto genericParam = sig.getGenericParams().front();
   return findGenericParameterReferences(
       this, sig, genericParam, treatNonResultCovariantSelfAsInvariant, None);
@@ -4527,6 +4551,7 @@ AssociatedTypeDecl::AssociatedTypeDecl(DeclContext *dc, SourceLoc keywordLoc,
     : AbstractTypeParamDecl(DeclKind::AssociatedType, dc, name, nameLoc),
       KeywordLoc(keywordLoc), DefaultDefinition(defaultDefinition),
       TrailingWhere(trailingWhere) {
+  Bits.AssociatedTypeDecl.IsPrimary = 0;
 }
 
 AssociatedTypeDecl::AssociatedTypeDecl(DeclContext *dc, SourceLoc keywordLoc,
@@ -5294,11 +5319,6 @@ bool ProtocolDecl::isMarkerProtocol() const {
   return getAttrs().hasAttribute<MarkerAttr>();
 }
 
-bool ProtocolDecl::inheritsFromDistributedActor() const {
-  auto &C = getASTContext();
-  return inheritsFrom(C.getDistributedActorDecl());
-}
-
 ArrayRef<ProtocolDecl *> ProtocolDecl::getInheritedProtocols() const {
   auto *mutThis = const_cast<ProtocolDecl *>(this);
   return evaluateOrDefault(getASTContext().evaluator,
@@ -5549,7 +5569,7 @@ void ProtocolDecl::computeKnownProtocolKind() const {
       !module->getName().is("Foundation") &&
       !module->getName().is("_Differentiation") &&
       !module->getName().is("_Concurrency") &&
-      !module->getName().is("_Distributed")) {
+      !module->getName().is("Distributed")) {
     const_cast<ProtocolDecl *>(this)->Bits.ProtocolDecl.KnownProtocol = 1;
     return;
   }
@@ -6353,12 +6373,29 @@ bool VarDecl::isMemberwiseInitialized(bool preferDeclaredProperties) const {
   return true;
 }
 
+bool VarDecl::isLet() const {
+  // An awful hack that stabilizes the value of 'isLet' for ParamDecl instances.
+  //
+  // All of the callers in SIL are actually looking for the semantic
+  // "is immutable" predicate (present on ParamDecl) and should be migrated to
+  // a high-level request. Once this is done, all callers of the introducer and
+  // specifier setters can be removed.
+  if (auto *PD = dyn_cast<ParamDecl>(this)) {
+    return PD->isImmutable();
+  }
+  return getIntroducer() == Introducer::Let;
+}
+
 bool VarDecl::isAsyncLet() const {
   return getAttrs().hasAttribute<AsyncAttr>();
 }
 
 bool VarDecl::isDistributed() const {
   return getAttrs().hasAttribute<DistributedActorAttr>();
+}
+
+bool VarDecl::isKnownToBeLocal() const {
+  return getAttrs().hasAttribute<KnownToBeLocalAttr>();
 }
 
 bool VarDecl::isOrdinaryStoredProperty() const {
@@ -7357,6 +7394,20 @@ SubscriptDecl *SubscriptDecl::create(ASTContext &Context, DeclName Name,
   return SD;
 }
 
+SubscriptDecl *SubscriptDecl::create(ASTContext &Context, DeclName Name,
+                                     SourceLoc StaticLoc,
+                                     StaticSpellingKind StaticSpelling,
+                                     SourceLoc SubscriptLoc,
+                                     ParameterList *Indices, SourceLoc ArrowLoc,
+                                     Type ElementTy, DeclContext *Parent,
+                                     GenericParamList *GenericParams) {
+  auto *const SD = new (Context)
+      SubscriptDecl(Name, StaticLoc, StaticSpelling, SubscriptLoc, Indices,
+                    ArrowLoc, nullptr, Parent, GenericParams);
+  SD->setElementInterfaceType(ElementTy);
+  return SD;
+}
+
 SubscriptDecl *SubscriptDecl::createImported(ASTContext &Context, DeclName Name,
                                              SourceLoc SubscriptLoc,
                                              ParameterList *Indices,
@@ -7614,6 +7665,19 @@ bool AbstractFunctionDecl::argumentNameIsAPIByDefault() const {
 
 bool AbstractFunctionDecl::isSendable() const {
   return getAttrs().hasAttribute<SendableAttr>();
+}
+
+bool AbstractFunctionDecl::isBackDeployed() const {
+  if (getAttrs().hasAttribute<BackDeployAttr>())
+    return true;
+
+  // Property and subscript accessors inherit the attribute.
+  if (auto *AD = dyn_cast<AccessorDecl>(this)) {
+    if (AD->getStorage()->getAttrs().hasAttribute<BackDeployAttr>())
+      return true;
+  }
+
+  return false;
 }
 
 BraceStmt *AbstractFunctionDecl::getBody(bool canSynthesize) const {
@@ -7962,7 +8026,6 @@ ParamDecl *AbstractFunctionDecl::getImplicitSelfDecl(bool createIfNeeded) {
   *selfDecl = new (ctx) ParamDecl(SourceLoc(), SourceLoc(), Identifier(),
                                   getLoc(), ctx.Id_self, this);
   (*selfDecl)->setImplicit();
-
   return *selfDecl;
 }
 
@@ -8981,33 +9044,20 @@ ActorIsolation swift::getActorIsolationOfContext(DeclContext *dc) {
   if (auto *vd = dyn_cast_or_null<ValueDecl>(dc->getAsDecl()))
     return getActorIsolation(vd);
 
-  // In the context of the initializing or default-value expression of a
-  // stored property, the isolation varies between global and type members:
-  //   - For a static stored property, the isolation matches the VarDecl.
-  //   - For a field of a nominal type, the expression is not isolated.
-  // Without this distinction, a nominal can have non-async initializers
-  // with various kinds of isolation, so an impossible constraint can be
-  // created. See SE-0327 for details.
-  if (auto *var = dc->getNonLocalVarDecl()) {
-
-    // Isolation officially changes, as described above, in Swift 6+
-    if (dc->getASTContext().isSwiftVersionAtLeast(6) &&
-        var->isInstanceMember() &&
-        !var->getAttrs().hasAttribute<LazyAttr>()) {
-      return ActorIsolation::forUnspecified();
-    }
-
+  if (auto *var = dc->getNonLocalVarDecl())
      return getActorIsolation(var);
-  }
+
 
   if (auto *closure = dyn_cast<AbstractClosureExpr>(dc)) {
     switch (auto isolation = closure->getActorIsolation()) {
     case ClosureActorIsolation::Independent:
-      return ActorIsolation::forIndependent();
+      return ActorIsolation::forIndependent()
+                .withPreconcurrency(isolation.preconcurrency());
 
     case ClosureActorIsolation::GlobalActor: {
       return ActorIsolation::forGlobalActor(
-          isolation.getGlobalActor(), /*unsafe=*/false);
+          isolation.getGlobalActor(), /*unsafe=*/false)
+                .withPreconcurrency(isolation.preconcurrency());
     }
 
     case ClosureActorIsolation::ActorInstance: {
@@ -9016,15 +9066,18 @@ ActorIsolation swift::getActorIsolationOfContext(DeclContext *dc) {
           ->getClassOrBoundGenericClass();
       // FIXME: Doesn't work properly with generics
       assert(actorClass && "Bad closure actor isolation?");
-      return ActorIsolation::forActorInstance(actorClass);
+      return ActorIsolation::forActorInstance(actorClass)
+                .withPreconcurrency(isolation.preconcurrency());
     }
     }
   }
 
   if (auto *tld = dyn_cast<TopLevelCodeDecl>(dc)) {
-    if (dc->isAsyncContext()) {
+    if (dc->isAsyncContext() || dc->getASTContext().LangOpts.WarnConcurrency) {
       if (Type mainActor = dc->getASTContext().getMainActorType())
-        return ActorIsolation::forGlobalActor(mainActor, /*unsafe=*/false);
+        return ActorIsolation::forGlobalActor(
+            mainActor,
+            /*unsafe=*/!dc->getASTContext().isSwiftVersionAtLeast(6));
     }
   }
 

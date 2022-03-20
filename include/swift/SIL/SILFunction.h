@@ -224,6 +224,10 @@ private:
   /// For details see BasicBlockBitfield::bitfieldID;
   unsigned currentBitfieldID = 1;
 
+  /// Unique identifier for vector indexing and deterministic sorting.
+  /// May be reused when zombie functions are recovered.
+  unsigned index;
+
   /// The function's set of semantics attributes.
   ///
   /// TODO: Why is this using a std::string? Why don't we use uniqued
@@ -262,7 +266,7 @@ private:
   unsigned Transparent : 1;
 
   /// The function's serialized attribute.
-  unsigned Serialized : 2;
+  bool Serialized : 1;
 
   /// Specifies if this function is a thunk or a reabstraction thunk.
   ///
@@ -445,6 +449,8 @@ public:
     auto fnType = getLoweredFunctionTypeInContext(getTypeExpansionContext());
     return SILFunctionConventions(fnType, getModule());
   }
+
+  unsigned getIndex() const { return index; }
 
   SILProfiler *getProfiler() const { return Profiler; }
 
@@ -689,10 +695,7 @@ public:
 
   /// Returns true if this function can be inlined into a fragile function
   /// body.
-  bool hasValidLinkageForFragileInline() const {
-    return (isSerialized() == IsSerialized ||
-            isSerialized() == IsSerializable);
-  }
+  bool hasValidLinkageForFragileInline() const { return isSerialized(); }
 
   /// Returns true if this function can be referenced from a fragile function
   /// body.
@@ -914,7 +917,11 @@ public:
 
   /// Get this function's serialized attribute.
   IsSerialized_t isSerialized() const { return IsSerialized_t(Serialized); }
-  void setSerialized(IsSerialized_t isSerialized) { Serialized = isSerialized; }
+  void setSerialized(IsSerialized_t isSerialized) {
+    Serialized = isSerialized;
+    assert(this->isSerialized() == isSerialized &&
+           "too few bits for Serialized storage");
+  }
 
   /// Get this function's thunk attribute.
   IsThunk_t isThunk() const { return IsThunk_t(Thunk); }
@@ -1048,6 +1055,10 @@ public:
   void setGenericEnvironment(GenericEnvironment *env) {
     GenericEnv = env;
   }
+
+  /// Retrieve the generic signature from the generic environment of this
+  /// function, if any. Else returns the null \c GenericSignature.
+  GenericSignature getGenericSignature() const;
 
   /// Map the given type, which is based on an interface SILFunctionType and may
   /// therefore be dependent, to a type based on the context archetypes of this

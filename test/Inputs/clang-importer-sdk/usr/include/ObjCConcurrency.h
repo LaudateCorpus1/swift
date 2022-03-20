@@ -4,6 +4,7 @@
 #pragma clang assume_nonnull begin
 
 #define MAIN_ACTOR __attribute__((__swift_attr__("@MainActor")))
+#define UI_ACTOR __attribute__((swift_attr("@UIActor")))
 
 #ifdef __SWIFT_ATTR_SUPPORTS_SENDABLE_DECLS
   #define SENDABLE __attribute__((__swift_attr__("@Sendable")))
@@ -247,6 +248,17 @@ typedef NS_ERROR_ENUM(unsigned, NonSendableErrorCode, NonSendableErrorDomain) {
 } NONSENDABLE;
 // expected-warning@-3 {{cannot make error code type 'NonSendableErrorCode' non-sendable because Swift errors are always sendable}}
 
+UI_ACTOR
+@interface PictureFrame : NSObject
+- (instancetype)initWithSize:(NSInteger)frame NS_DESIGNATED_INITIALIZER;
+- (void)rotate;
+@end
+
+@interface NotIsolatedPictureFrame : NSObject
+- (instancetype)initWithSize:(NSInteger)frame NS_DESIGNATED_INITIALIZER;
+- (void)rotate;
+@end
+
 typedef NSString *SendableStringEnum NS_STRING_ENUM;
 typedef NSString *NonSendableStringEnum NS_STRING_ENUM NONSENDABLE;
 
@@ -254,5 +266,27 @@ typedef NSString *SendableStringStruct NS_EXTENSIBLE_STRING_ENUM;
 typedef NSString *NonSendableStringStruct NS_EXTENSIBLE_STRING_ENUM NONSENDABLE;
 
 ASSUME_NONSENDABLE_END
+
+typedef id ObjectTypedef;
+typedef void(^BlockTypedef)(id);
+
+@interface NXSender : NSObject
+
+- (void)sendAny:(SENDABLE id)obj;
+- (void)sendOptionalAny:(nullable SENDABLE id)obj;
+- (void)sendSendable:(SENDABLE SendableClass *)sendable;
+- (void)sendSendableSubclasses:(SENDABLE NonSendableClass *)sendableSubclass;
+- (void)sendProto:(SENDABLE id <LabellyProtocol>)obj;
+- (void)sendProtos:(SENDABLE id <LabellyProtocol, ObjCClub>)obj;
+- (void)sendAnyArray:(SENDABLE NSArray<id> *)array;
+- (void)sendGeneric:(SENDABLE GenericObject<SendableClass *> *)generic;
+- (void)sendPtr:(SENDABLE void *)val;    // bad
+- (void)sendStringArray:(SENDABLE NSArray<NSString *> *)obj;    // bad
+- (void)sendAnyTypedef:(SENDABLE ObjectTypedef)obj;
+- (void)sendAnyTypedefs:(SENDABLE NSArray<ObjectTypedef> *)objs;
+- (void)sendBlockTypedef:(SENDABLE BlockTypedef)block;
+- (void)sendBlockTypedefs:(SENDABLE NSArray<BlockTypedef> *)blocks;
+- (void)sendUnbound:(SENDABLE NSArray *)array;
+@end
 
 #pragma clang assume_nonnull end

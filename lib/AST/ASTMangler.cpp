@@ -857,6 +857,8 @@ void ASTMangler::appendSymbolKind(SymbolKind SKind) {
     case SymbolKind::DistributedThunk: return appendOperator("TE");
     case SymbolKind::DistributedAccessor: return appendOperator("TF");
     case SymbolKind::AccessibleFunctionRecord: return appendOperator("HF");
+    case SymbolKind::BackDeploymentThunk: return appendOperator("Twb");
+    case SymbolKind::BackDeploymentFallback: return appendOperator("TwB");
   }
 }
 
@@ -1267,8 +1269,11 @@ void ASTMangler::appendType(Type type, GenericSignature sig,
     }
 
     case TypeKind::ParameterizedProtocol: {
-      llvm::errs() << "Not implemented\n";
-      abort();
+      auto layout = type->getExistentialLayout();
+      appendExistentialLayout(layout, sig, forDecl);
+      bool isFirstArgList = true;
+      appendBoundGenericArgs(type, sig, isFirstArgList, forDecl);
+      return appendOperator("XP");
     }
 
     case TypeKind::Existential: {
@@ -1318,9 +1323,15 @@ void ASTMangler::appendType(Type type, GenericSignature sig,
 
       // type ::= archetype
     case TypeKind::PrimaryArchetype:
-    case TypeKind::OpenedArchetype:
     case TypeKind::SequenceArchetype:
       llvm_unreachable("Cannot mangle free-standing archetypes");
+
+    case TypeKind::OpenedArchetype: {
+      // Opened archetypes have always been mangled via their interface type,
+      // although those manglings aren't used in any stable manner.
+      auto openedType = cast<OpenedArchetypeType>(tybase);
+      return appendType(openedType->getInterfaceType(), sig, forDecl);
+    }
 
     case TypeKind::OpaqueTypeArchetype: {
       auto opaqueType = cast<OpaqueTypeArchetypeType>(tybase);
@@ -1572,6 +1583,9 @@ void ASTMangler::appendBoundGenericArgs(Type type, GenericSignature sig,
     if (Type parent = nominalType->getParent())
       appendBoundGenericArgs(parent->getDesugaredType(), sig, isFirstArgList,
                              forDecl);
+  } else if (auto *ppt = dyn_cast<ParameterizedProtocolType>(typePtr)) {
+    assert(!ppt->getBaseType()->getParent());
+    genericArgs = ppt->getArgs();
   } else {
     auto boundType = cast<BoundGenericType>(typePtr);
     genericArgs = boundType->getGenericArgs();
@@ -3442,4 +3456,12 @@ ASTMangler::mangleOpaqueTypeDescriptorRecord(const OpaqueTypeDecl *decl) {
   appendOpaqueDeclName(decl);
   appendOperator("Ho");
   return finalize();
+}
+
+std::string ASTMangler::mangleDistributedThunk(const FuncDecl *thunk) {
+  // Marker protocols cannot be checked at runtime, so there is no point
+  // in recording them for distributed thunks.
+  llvm::SaveAndRestore<bool> savedAllowMarkerProtocols(AllowMarkerProtocols,
+                                                       false);
+  return mangleEntity(thunk, SymbolKind::DistributedThunk);
 }

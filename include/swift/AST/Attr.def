@@ -57,6 +57,7 @@ TYPE_ATTR(async)
 TYPE_ATTR(Sendable)
 TYPE_ATTR(unchecked)
 TYPE_ATTR(_typeSequence)
+TYPE_ATTR(_local)
 
 // SIL-specific attributes
 TYPE_ATTR(block_storage)
@@ -494,7 +495,7 @@ SIMPLE_DECL_ATTR(_implementationOnly, ImplementationOnly,
   ABIStableToAdd | ABIStableToRemove | APIStableToAdd | APIStableToRemove,
   84)
 DECL_ATTR(_custom, Custom,
-  OnAnyDecl | UserInaccessible |
+  OnAnyDecl | RejectByParser |
   ABIStableToAdd | ABIStableToRemove | APIStableToAdd | APIStableToRemove,
   85)
 SIMPLE_DECL_ATTR(propertyWrapper, PropertyWrapper,
@@ -661,10 +662,7 @@ CONTEXTUAL_SIMPLE_DECL_ATTR(distributed, DistributedActor,
   APIBreakingToAdd | APIBreakingToRemove,
   118)
 
-SIMPLE_DECL_ATTR(_primaryAssociatedType,
-  PrimaryAssociatedType, OnAssociatedType | UserInaccessible |
-  APIStableToAdd | ABIStableToAdd | APIBreakingToRemove | ABIStableToRemove,
-  119)
+// 119 is unused
 
 SIMPLE_DECL_ATTR(_assemblyVision, EmitAssemblyVisionRemarks,
   OnFunc | UserInaccessible | NotSerialized | OnNominalType |
@@ -718,10 +716,17 @@ DECL_ATTR(exclusivity, Exclusivity,
   128)
 
 DECL_ATTR(_backDeploy, BackDeploy,
-  OnAbstractFunction |
+  OnAbstractFunction | OnAccessor | OnSubscript | OnVar |
   AllowMultipleAttributes | LongAttribute | UserInaccessible |
   ABIStableToAdd | ABIStableToRemove | APIStableToAdd | APIBreakingToRemove,
   129)
+
+CONTEXTUAL_SIMPLE_DECL_ATTR(_local, KnownToBeLocal,
+  DeclModifier | OnFunc | OnParam | OnVar |
+  DistributedOnly |
+  ABIBreakingToAdd | ABIBreakingToRemove |
+  APIBreakingToAdd | APIBreakingToRemove,
+  130)
 
 // If you're adding a new underscored attribute here, please document it in
 // docs/ReferenceGuides/UnderscoredAttributes.md.

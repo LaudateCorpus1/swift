@@ -360,6 +360,9 @@ static void ParseModuleInterfaceArgs(ModuleInterfaceOptions &Opts,
       Opts.PrintSPIs = true;
     }
   }
+  for (auto val: Args.getAllArgValues(OPT_skip_import_in_public_interface)) {
+    Opts.ModulesToSkipInPublicInterface.push_back(val);
+  }
 }
 
 /// Save a copy of any flags marked as ModuleInterfaceOption, if running
@@ -453,6 +456,9 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
                  OPT_disable_experimental_opened_existential_types,
                  false);
 
+  Opts.EnableExperimentalVariadicGenerics |=
+    Args.hasArg(OPT_enable_experimental_variadic_generics);
+
   // SwiftOnoneSupport produces different symbols when opening existentials,
   // so disable it.
   if (FrontendOpts.ModuleName == SWIFT_ONONE_SUPPORT)
@@ -484,16 +490,15 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   Opts.DisableImplicitConcurrencyModuleImport |=
     Args.hasArg(OPT_disable_implicit_concurrency_module_import);
 
-  Opts.EnableExperimentalAsyncTopLevel |=
-    Args.hasArg(OPT_enable_experimental_async_top_level);
-
   /// experimental distributed also implicitly enables experimental concurrency
   Opts.EnableExperimentalDistributed |=
     Args.hasArg(OPT_enable_experimental_distributed);
   Opts.EnableExperimentalConcurrency |=
     Args.hasArg(OPT_enable_experimental_distributed);
-  Opts.EnableExperimentalConcurrency |=
-    Args.hasArg(OPT_enable_experimental_async_top_level);
+
+  if (Args.hasArg(OPT_enable_experimental_async_top_level))
+    Diags.diagnose(SourceLoc(), diag::warn_flag_deprecated,
+                   "-enable-experimental-async-top-level");
 
   Opts.DiagnoseInvalidEphemeralnessAsError |=
       Args.hasArg(OPT_enable_invalid_ephemeralness_as_error);
@@ -797,29 +802,60 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
     Diags.diagnose(SourceLoc(), diag::error_unsupported_target_os, TargetArgOS);
   }
 
-  // Parse the SDK version.
-  if (Arg *A = Args.getLastArg(options::OPT_target_sdk_version)) {
-    auto vers = version::Version::parseVersionString(
-      A->getValue(), SourceLoc(), &Diags);
-    if (vers.hasValue()) {
-      Opts.SDKVersion = *vers;
-    } else {
-      Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
-                     A->getAsString(Args), A->getValue());
-    }
-  }
+  // First, set up default minimum inlining target versions.
+  auto getDefaultMinimumInliningTargetVersion =
+      [&](const llvm::Triple &triple) -> llvm::VersionTuple {
+#if SWIFT_DEFAULT_TARGET_MIN_INLINING_VERSION_TO_MIN
+    // In ABI-stable modules, default to the version when Swift first became
+    // available.
+    if (FrontendOpts.EnableLibraryEvolution)
+      if (auto minTriple = minimumAvailableOSVersionForTriple(triple))
+        return minTriple;
+#endif
 
-  // Parse the target variant SDK version.
-  if (Arg *A = Args.getLastArg(options::OPT_target_variant_sdk_version)) {
-    auto vers = version::Version::parseVersionString(
-      A->getValue(), SourceLoc(), &Diags);
-    if (vers.hasValue()) {
-      Opts.VariantSDKVersion = *vers;
-    } else {
-      Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
-                     A->getAsString(Args), A->getValue());
-    }
-  }
+    // In ABI-unstable modules, we will never have to interoperate with
+    // older versions of the module, so we should default to the minimum
+    // deployment target.
+    unsigned major, minor, patch;
+    if (triple.isMacOSX())
+      triple.getMacOSXVersion(major, minor, patch);
+    else
+      triple.getOSVersion(major, minor, patch);
+    return llvm::VersionTuple(major, minor, patch);
+  };
+
+  Opts.MinimumInliningTargetVersion =
+      getDefaultMinimumInliningTargetVersion(Opts.Target);
+
+  // Parse OS version number arguments.
+  auto parseVersionArg = [&](OptSpecifier opt) -> Optional<llvm::VersionTuple> {
+    Arg *A = Args.getLastArg(opt);
+    if (!A)
+      return None;
+
+    if (StringRef(A->getValue()) == "min")
+      return minimumAvailableOSVersionForTriple(Opts.Target);
+    if (StringRef(A->getValue()) == "target")
+      return Opts.getMinPlatformVersion();
+
+    if (auto vers = version::Version::parseVersionString(A->getValue(),
+                                                         SourceLoc(), &Diags))
+      return (llvm::VersionTuple)*vers;
+
+    Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
+                   A->getAsString(Args), A->getValue());
+    return None;
+  };
+
+  if (auto vers = parseVersionArg(OPT_min_inlining_target_version))
+    // FIXME: Should we diagnose if it's below the default?
+    Opts.MinimumInliningTargetVersion = *vers;
+
+  if (auto vers = parseVersionArg(OPT_target_sdk_version))
+    Opts.SDKVersion = *vers;
+
+  if (auto vers = parseVersionArg(OPT_target_variant_sdk_version))
+    Opts.VariantSDKVersion = *vers;
 
   // Get the SDK name.
   if (Arg *A = Args.getLastArg(options::OPT_target_sdk_name)) {
@@ -881,6 +917,7 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
         .Case("off", RequirementMachineMode::Disabled)
         .Case("on", RequirementMachineMode::Enabled)
         .Case("verify", RequirementMachineMode::Verify)
+        .Case("check", RequirementMachineMode::Check)
         .Default(None);
 
     if (value)
@@ -895,6 +932,7 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
         .Case("off", RequirementMachineMode::Disabled)
         .Case("on", RequirementMachineMode::Enabled)
         .Case("verify", RequirementMachineMode::Verify)
+        .Case("check", RequirementMachineMode::Check)
         .Default(None);
 
     if (value)
@@ -909,6 +947,7 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
         .Case("off", RequirementMachineMode::Disabled)
         .Case("on", RequirementMachineMode::Enabled)
         .Case("verify", RequirementMachineMode::Verify)
+        .Case("check", RequirementMachineMode::Check)
         .Default(None);
 
     if (value)
@@ -958,6 +997,15 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
       Opts.RequirementMachineMaxConcreteNesting = limit;
     }
   }
+
+  if (Args.hasArg(OPT_disable_requirement_machine_concrete_contraction))
+    Opts.EnableRequirementMachineConcreteContraction = false;
+
+  if (Args.hasArg(OPT_enable_requirement_machine_loop_normalization))
+    Opts.EnableRequirementMachineLoopNormalization = true;
+
+  if (Args.hasArg(OPT_enable_requirement_machine_opaque_archetypes))
+    Opts.EnableRequirementMachineOpaqueArchetypes = true;
 
   Opts.DumpTypeWitnessSystems = Args.hasArg(OPT_dump_type_witness_systems);
 
@@ -1542,6 +1590,10 @@ static bool ParseSILArgs(SILOptions &Opts, ArgList &Args,
             .Case("false", false)
             .Default(None);
   }
+
+  // Allow command line flags to override the default value of
+  // Opts.LexicalLifetimes. If no explicit flags are passed, then
+  // Opts.LexicalLifetimes retains its initial value.
   Optional<bool> enableLexicalLifetimesFlag;
   if (Arg *A = Args.getLastArg(OPT_enable_lexical_lifetimes)) {
     enableLexicalLifetimesFlag =
@@ -1658,6 +1710,8 @@ static bool ParseSILArgs(SILOptions &Opts, ArgList &Args,
   Opts.EnableDynamicReplacementCanCallPreviousImplementation = !Args.hasArg(
       OPT_disable_previous_implementation_calls_in_dynamic_replacements);
   Opts.ParseStdlib = FEOpts.ParseStdlib;
+
+  Opts.emitTBD = FEOpts.InputsAndOutputs.hasTBDPath();
 
   if (const Arg *A = Args.getLastArg(OPT_save_optimization_record_EQ)) {
     llvm::Expected<llvm::remarks::Format> formatOrErr =

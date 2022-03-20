@@ -505,6 +505,11 @@ protected:
     IsOpaqueType : 1
   );
 
+  SWIFT_INLINE_BITFIELD_FULL(AssociatedTypeDecl, AbstractTypeParamDecl, 1,
+    /// Whether this is a primary associated type.
+    IsPrimary : 1
+  );
+
   SWIFT_INLINE_BITFIELD_EMPTY(GenericTypeDecl, TypeDecl);
 
   SWIFT_INLINE_BITFIELD(TypeAliasDecl, GenericTypeDecl, 1+1,
@@ -825,6 +830,11 @@ public:
   /// This function won't consider the parent context to get the information.
   Optional<llvm::VersionTuple> getIntroducedOSVersion(PlatformKind Kind) const;
 
+  /// Returns the OS version in which the decl became ABI as specified by the
+  /// @_backDeploy attribute.
+  Optional<llvm::VersionTuple>
+  getBackDeployBeforeOSVersion(PlatformKind Kind) const;
+
   /// Returns the starting location of the entire declaration.
   SourceLoc getStartLoc() const { return getSourceRange().Start; }
 
@@ -998,12 +1008,10 @@ public:
   /// deployment target.
   bool isWeakImported(ModuleDecl *fromModule) const;
 
-  /// Returns true if the nature of this declaration allows overrides.
-  /// Note that this does not consider whether it is final or whether
-  /// the class it's on is final.
+  /// Returns true if the nature of this declaration allows overrides syntactically.
   ///
   /// If this returns true, the decl can be safely casted to ValueDecl.
-  bool isPotentiallyOverridable() const;
+  bool isSyntacticallyOverridable() const;
 
   /// Retrieve the global actor attribute that applies to this declaration,
   /// if any.
@@ -1021,6 +1029,8 @@ public:
   // Is this Decl an SPI? It can be directly marked with @_spi or is defined in
   // an @_spi context.
   bool isSPI() const;
+
+  bool isAvailableAsSPI() const;
 
   // List the SPI groups declared with @_spi or inherited by this decl.
   //
@@ -3203,6 +3213,14 @@ public:
                      LazyMemberLoader *definitionResolver,
                      uint64_t resolverData);
 
+  bool isPrimary() const {
+    return Bits.AssociatedTypeDecl.IsPrimary;
+  }
+
+  void setPrimary() {
+    Bits.AssociatedTypeDecl.IsPrimary = true;
+  }
+
   /// Get the protocol in which this associated type is declared.
   ProtocolDecl *getProtocol() const {
     return cast<ProtocolDecl>(getDeclContext());
@@ -3475,8 +3493,11 @@ public:
   /// Find, or potentially synthesize, the implicit 'id' property of this actor.
   VarDecl *getDistributedActorIDProperty() const;
 
-  /// Find the 'RemoteCallTarget.init(_mangledName:)' initializer function
+  /// Find the 'RemoteCallTarget.init(_:)' initializer function
   ConstructorDecl* getDistributedRemoteCallTargetInitFunction() const;
+
+  /// Find the 'RemoteCallArgument(label:name:value:)' initializer function
+  ConstructorDecl* getDistributedRemoteCallArgumentInitFunction() const;
 
   /// Collect the set of protocols to which this type should implicitly
   /// conform, such as AnyObject (for classes).
@@ -4371,6 +4392,7 @@ class ProtocolDecl final : public NominalTypeDecl {
   friend class ProtocolDependenciesRequest;
   friend class RequirementSignatureRequest;
   friend class RequirementSignatureRequestRQM;
+  friend class RequirementSignatureRequestGSB;
   friend class ProtocolRequiresClassRequest;
   friend class ExistentialConformsToSelfRequest;
   friend class ExistentialRequiresAnyRequest;
@@ -4471,10 +4493,6 @@ public:
   /// Determine whether this is a "marker" protocol, meaning that is indicates
   /// semantics but has no corresponding witness table.
   bool isMarkerProtocol() const;
-
-  /// Is a protocol that can only be conformed by distributed actors.
-  /// Such protocols are allowed to contain distributed functions.
-  bool inheritsFromDistributedActor() const;
 
 private:
   void computeKnownProtocolKind() const;
@@ -5045,6 +5063,13 @@ protected:
           SourceLoc nameLoc, Identifier name, DeclContext *dc,
           StorageIsMutable_t supportsMutation);
 
+protected:
+  // Only \c ParamDecl::setSpecifier is allowed to flip this - and it's also
+  // on the way out of that business.
+  void setIntroducer(Introducer value) {
+    Bits.VarDecl.Introducer = uint8_t(value);
+  }
+
 public:
   VarDecl(bool isStatic, Introducer introducer,
           SourceLoc nameLoc, Identifier name, DeclContext *dc)
@@ -5226,9 +5251,8 @@ public:
   
   /// Is this an immutable 'let' property?
   ///
-  /// If this is a ParamDecl, isLet() is true iff
-  /// getSpecifier() == Specifier::Default.
-  bool isLet() const { return getIntroducer() == Introducer::Let; }
+  /// For \c ParamDecl instances, using \c isImmutable is preferred.
+  bool isLet() const;
 
   /// Is this an "async let" property?
   bool isAsyncLet() const;
@@ -5236,16 +5260,16 @@ public:
   /// Does this have a 'distributed' modifier?
   bool isDistributed() const;
 
+  /// Is this var known to be a "local" distributed actor,
+  /// if so the implicit throwing ans some isolation checks can be skipped.
+  bool isKnownToBeLocal() const;
+
   /// Is this a stored property that will _not_ trigger any user-defined code
   /// upon any kind of access?
   bool isOrdinaryStoredProperty() const;
 
   Introducer getIntroducer() const {
     return Introducer(Bits.VarDecl.Introducer);
-  }
-
-  void setIntroducer(Introducer value) {
-    Bits.VarDecl.Introducer = uint8_t(value);
   }
 
   CaptureListExpr *getParentCaptureList() const {
@@ -5930,6 +5954,14 @@ public:
                                DeclContext *Parent,
                                GenericParamList *GenericParams);
 
+  static SubscriptDecl *create(ASTContext &Context, DeclName Name,
+                               SourceLoc StaticLoc,
+                               StaticSpellingKind StaticSpelling,
+                               SourceLoc SubscriptLoc, ParameterList *Indices,
+                               SourceLoc ArrowLoc, Type ElementTy,
+                               DeclContext *Parent,
+                               GenericParamList *GenericParams);
+
   static SubscriptDecl *createImported(ASTContext &Context, DeclName Name,
                                        SourceLoc SubscriptLoc,
                                        ParameterList *Indices,
@@ -6282,6 +6314,17 @@ public:
   /// Returns 'true' if the function is distributed.
   bool isDistributed() const;
 
+  /// For a 'distributed' target (func or computed property),
+  /// get the 'thunk' responsible for performing the 'remoteCall'.
+  ///
+  /// \return the synthesized thunk, or null if the base of the call has
+  ///         diagnosed errors during type checking.
+  FuncDecl *getDistributedThunk() const;
+  
+  /// Returns 'true' if the function has (or inherits) the @c @_backDeploy
+  /// attribute.
+  bool isBackDeployed() const;
+
   PolymorphicEffectKind getPolymorphicEffectKind(EffectKind kind) const;
 
   // FIXME: Hack that provides names with keyword arguments for accessors.
@@ -6425,6 +6468,16 @@ public:
   /// which is used as ad-hoc protocol requirement by the
   /// 'DistributedActorSystem' protocol.
   bool isDistributedActorSystemRemoteCall(bool isVoidReturn) const;
+
+  /// Determines whether this function is a 'makeInvocationEncoder' function,
+  /// which is used as ad-hoc protocol requirement by the
+  /// 'DistributedActorSystem' protocol.
+  bool isDistributedActorSystemMakeInvocationEncoder() const;
+
+  /// Determines if this function is a 'recordGenericSubstitution' function,
+  /// which is used as ad-hoc protocol requirement by the
+  /// 'DistributedTargetInvocationEncoder' protocol.
+  bool isDistributedTargetInvocationEncoderRecordGenericSubstitution() const;
 
   /// Determines if this function is a 'recordArgument' function,
   /// which is used as ad-hoc protocol requirement by the
@@ -7919,13 +7972,16 @@ inline unsigned ValueDecl::getNumCurryLevels() const {
   return curryLevels;
 }
 
-inline bool Decl::isPotentiallyOverridable() const {
+inline bool Decl::isSyntacticallyOverridable() const {
   if (isa<VarDecl>(this) ||
       isa<SubscriptDecl>(this) ||
       isa<FuncDecl>(this) ||
       isa<DestructorDecl>(this)) {
+    if (static_cast<const ValueDecl*>(this)->isFinal()) {
+      return false;
+    }
     auto classDecl = getDeclContext()->getSelfClassDecl();
-    return classDecl && !classDecl->isActor();
+    return classDecl && !classDecl->isActor() && !classDecl->isFinal();
   } else {
     return false;
   }

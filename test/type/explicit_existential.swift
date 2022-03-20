@@ -244,8 +244,8 @@ protocol Output {
   associatedtype A
 }
 
-// expected-warning@+2{{protocol 'Input' as a type must be explicitly marked as 'any'}}
-// expected-warning@+1{{protocol 'Output' as a type must be explicitly marked as 'any'}}
+// expected-warning@+2{{use of protocol 'Input' as a type must be written 'any Input'}}{{30-35=any Input}}
+// expected-warning@+1{{use of protocol 'Output' as a type must be written 'any Output'}}{{40-46=any Output}}
 typealias InvalidFunction = (Input) -> Output
 func testInvalidFunctionAlias(fn: InvalidFunction) {}
 
@@ -253,7 +253,7 @@ typealias ExistentialFunction = (any Input) -> any Output
 func testFunctionAlias(fn: ExistentialFunction) {}
 
 typealias Constraint = Input
-func testConstraintAlias(x: Constraint) {} // expected-warning{{'Constraint' (aka 'Input') as a type must be explicitly marked as 'any'}}
+func testConstraintAlias(x: Constraint) {} // expected-warning{{use of 'Constraint' (aka 'Input') as a type must be written 'any Constraint'}}{{29-39=any Constraint}}
 
 typealias Existential = any Input
 func testExistentialAlias(x: Existential, y: any Constraint) {}
@@ -266,15 +266,46 @@ class C : any Empty {} // expected-error {{inheritance from non-protocol, non-cl
 
 // FIXME: Diagnostics are not great in the enum case because we confuse this with a raw type
 
-enum E : any Empty { // expected-error {{raw type 'Empty' is not expressible by a string, integer, or floating-point literal}}
-// expected-error@-1 {{'E' declares raw type 'Empty', but does not conform to RawRepresentable and conformance could not be synthesized}}
-// expected-error@-2 {{RawRepresentable conformance cannot be synthesized because raw type 'Empty' is not Equatable}}
+enum E : any Empty { // expected-error {{raw type 'any Empty' is not expressible by a string, integer, or floating-point literal}}
+// expected-error@-1 {{'E' declares raw type 'any Empty', but does not conform to RawRepresentable and conformance could not be synthesized}}
+// expected-error@-2 {{RawRepresentable conformance cannot be synthesized because raw type 'any Empty' is not Equatable}}
   case hack
 }
 
-enum EE : Equatable, any Empty { // expected-error {{raw type 'Empty' is not expressible by a string, integer, or floating-point literal}}
-// expected-error@-1 {{'EE' declares raw type 'Empty', but does not conform to RawRepresentable and conformance could not be synthesized}}
-// expected-error@-2 {{RawRepresentable conformance cannot be synthesized because raw type 'Empty' is not Equatable}}
-// expected-error@-3 {{raw type 'Empty' must appear first in the enum inheritance clause}}
+enum EE : Equatable, any Empty { // expected-error {{raw type 'any Empty' is not expressible by a string, integer, or floating-point literal}}
+// expected-error@-1 {{'EE' declares raw type 'any Empty', but does not conform to RawRepresentable and conformance could not be synthesized}}
+// expected-error@-2 {{RawRepresentable conformance cannot be synthesized because raw type 'any Empty' is not Equatable}}
+// expected-error@-3 {{raw type 'any Empty' must appear first in the enum inheritance clause}}
   case hack
+}
+
+func testAnyFixIt() {
+  struct ConformingType : HasAssoc {
+    typealias Assoc = Int
+    func foo() {}
+
+    func method() -> any HasAssoc {}
+  }
+
+  // expected-warning@+1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}{{10-18=any HasAssoc}}
+  let _: HasAssoc = ConformingType()
+  // expected-warning@+1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}{{19-27=any HasAssoc}}
+  let _: Optional<HasAssoc> = nil
+  // expected-warning@+1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}{{10-23=any HasAssoc.Type}}
+  let _: HasAssoc.Type = ConformingType.self
+  // expected-warning@+1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}{{10-25=any (HasAssoc).Type}}
+  let _: (HasAssoc).Type = ConformingType.self
+  // expected-warning@+1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}{{10-27=any ((HasAssoc)).Type}}
+  let _: ((HasAssoc)).Type = ConformingType.self
+  // expected-warning@+2 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}{{10-18=(any HasAssoc)}}
+  // expected-warning@+1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}{{30-38=(any HasAssoc)}}
+  let _: HasAssoc.Protocol = HasAssoc.self
+  // expected-warning@+1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}{{11-19=any HasAssoc}}
+  let _: (HasAssoc).Protocol = (any HasAssoc).self
+  // expected-warning@+1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}{{10-18=(any HasAssoc)}}
+  let _: HasAssoc? = ConformingType()
+  // expected-warning@+1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}{{10-23=(any HasAssoc.Type)}}
+  let _: HasAssoc.Type? = ConformingType.self
+  // expected-warning@+1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}{{10-18=(any HasAssoc)}}
+  let _: HasAssoc.Protocol? = (any HasAssoc).self
 }

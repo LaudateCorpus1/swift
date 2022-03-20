@@ -373,9 +373,13 @@ function(_add_target_variant_c_compile_flags)
   if(SWIFT_STDLIB_SUPPORTS_BACKTRACE_REPORTING)
     list(APPEND result "-DSWIFT_STDLIB_SUPPORTS_BACKTRACE_REPORTING")
   endif()
-  
+
   if(SWIFT_STDLIB_ENABLE_UNICODE_DATA)
     list(APPEND result "-D" "SWIFT_STDLIB_ENABLE_UNICODE_DATA")
+  endif()
+
+  if(SWIFT_STDLIB_CONCURRENCY_TRACING)
+    list(APPEND result "-DSWIFT_STDLIB_CONCURRENCY_TRACING")
   endif()
 
   list(APPEND result ${SWIFT_STDLIB_EXTRA_C_COMPILE_FLAGS})
@@ -418,7 +422,7 @@ function(_add_target_variant_link_flags)
     MACCATALYST_BUILD_FLAVOR  "${LFLAGS_MACCATALYST_BUILD_FLAVOR}")
   if("${LFLAGS_SDK}" STREQUAL "LINUX")
     list(APPEND link_libraries "pthread" "dl")
-    if("${LFLAGS_ARCH}" MATCHES "armv6|armv7|i686")
+    if("${LFLAGS_ARCH}" MATCHES "armv5|armv6|armv7|i686")
       list(APPEND link_libraries "atomic")
     endif()
   elseif("${LFLAGS_SDK}" STREQUAL "FREEBSD")
@@ -846,6 +850,9 @@ function(add_swift_target_library_single target name)
   foreach(def ${SWIFT_STDLIB_AVAILABILITY_DEFINITIONS})
     list(APPEND SWIFTLIB_SINGLE_SWIFT_COMPILE_FLAGS "-Xfrontend" "-define-availability" "-Xfrontend" "${def}") 
   endforeach()
+
+  # Enable -target-min-inlining-version
+  list(APPEND SWIFTLIB_SINGLE_SWIFT_COMPILE_FLAGS "-Xfrontend" "-target-min-inlining-version" "-Xfrontend" "min")
 
   # Don't install the Swift module content for back-deployment libraries.
   if (SWIFTLIB_SINGLE_BACK_DEPLOYMENT_LIBRARY)
@@ -1743,7 +1750,7 @@ function(add_swift_target_library name)
   # Turn off implicit import of _Concurrency when building libraries
   list(APPEND SWIFTLIB_SWIFT_COMPILE_FLAGS "-Xfrontend;-disable-implicit-concurrency-module-import")
 
-  # Turn off implicit import of _Distributed when building libraries
+  # Turn off implicit import of Distributed when building libraries
   if(SWIFT_ENABLE_EXPERIMENTAL_DISTRIBUTED)
     list(APPEND SWIFTLIB_SWIFT_COMPILE_FLAGS
                       "-Xfrontend;-disable-implicit-distributed-module-import")

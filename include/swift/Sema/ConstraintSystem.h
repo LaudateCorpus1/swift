@@ -386,6 +386,10 @@ public:
 
   bool isTypeSequence() const;
 
+  /// Determine whether this type variable represents a code completion
+  /// expression.
+  bool isCodeCompletionToken() const;
+
   /// Retrieve the representative of the equivalence class to which this
   /// type variable belongs.
   ///
@@ -563,6 +567,13 @@ template <typename T> bool isExpr(ASTNode node) {
 template <typename T = Decl> T *getAsDecl(ASTNode node) {
   if (auto *E = node.dyn_cast<Decl *>())
     return dyn_cast_or_null<T>(E);
+  return nullptr;
+}
+
+template <typename T = Stmt>
+T *getAsStmt(ASTNode node) {
+  if (auto *S = node.dyn_cast<Stmt *>())
+    return dyn_cast_or_null<T>(S);
   return nullptr;
 }
 
@@ -968,6 +979,7 @@ public:
     stmtCondElement,
     expr,
     stmt,
+    pattern,
     patternBindingEntry,
     varDecl,
   };
@@ -981,6 +993,8 @@ private:
     const Expr *expr;
 
     const Stmt *stmt;
+
+    const Pattern *pattern;
 
     struct PatternBindingEntry {
       const PatternBindingDecl *patternBinding;
@@ -1009,6 +1023,11 @@ public:
   SolutionApplicationTargetsKey(const Stmt *stmt) {
     kind = Kind::stmt;
     storage.stmt = stmt;
+  }
+
+  SolutionApplicationTargetsKey(const Pattern *pattern) {
+    kind = Kind::pattern;
+    storage.pattern = pattern;
   }
 
   SolutionApplicationTargetsKey(
@@ -1041,6 +1060,9 @@ public:
 
     case Kind::stmt:
       return lhs.storage.stmt == rhs.storage.stmt;
+
+    case Kind::pattern:
+      return lhs.storage.pattern == rhs.storage.pattern;
 
     case Kind::patternBindingEntry:
       return (lhs.storage.patternBindingEntry.patternBinding
@@ -1082,6 +1104,11 @@ public:
       return hash_combine(
           DenseMapInfo<unsigned>::getHashValue(static_cast<unsigned>(kind)),
           DenseMapInfo<void *>::getHashValue(storage.stmt));
+
+    case Kind::pattern:
+      return hash_combine(
+          DenseMapInfo<unsigned>::getHashValue(static_cast<unsigned>(kind)),
+          DenseMapInfo<void *>::getHashValue(storage.pattern));
 
     case Kind::patternBindingEntry:
       return hash_combine(
@@ -1701,6 +1728,13 @@ public:
                             ContextualTypePurpose contextualPurpose,
                             TypeLoc convertType, bool isDiscarded);
 
+  SolutionApplicationTarget(Expr *expr, DeclContext *dc, ExprPattern *pattern,
+                            Type patternType)
+      : SolutionApplicationTarget(expr, dc, CTP_ExprPattern, patternType,
+                                  /*isDiscarded=*/false) {
+    setPattern(pattern);
+  }
+
   SolutionApplicationTarget(AnyFunctionRef fn)
       : SolutionApplicationTarget(fn, fn.getBody()) { }
 
@@ -1785,6 +1819,12 @@ public:
   /// Form a target for a synthesized property wrapper initializer.
   static SolutionApplicationTarget forPropertyWrapperInitializer(
       VarDecl *wrappedVar, DeclContext *dc, Expr *initializer);
+
+  static SolutionApplicationTarget forExprPattern(Expr *expr, DeclContext *dc,
+                                                  ExprPattern *pattern,
+                                                  Type patternTy) {
+    return {expr, dc, pattern, patternTy};
+  }
 
   Expr *getAsExpr() const {
     switch (kind) {
@@ -1886,6 +1926,12 @@ public:
     assert(kind == Kind::expression);
     assert(expression.contextualPurpose == CTP_Initialization);
     return expression.pattern;
+  }
+
+  ExprPattern *getExprPattern() const {
+    assert(kind == Kind::expression);
+    assert(expression.contextualPurpose == CTP_ExprPattern);
+    return cast<ExprPattern>(expression.pattern);
   }
 
   /// For a pattern initialization target, retrieve the contextual pattern.
@@ -2008,7 +2054,8 @@ public:
     assert(kind == Kind::expression);
     assert(expression.contextualPurpose == CTP_Initialization ||
            expression.contextualPurpose == CTP_ForEachStmt ||
-           expression.contextualPurpose == CTP_ForEachSequence);
+           expression.contextualPurpose == CTP_ForEachSequence ||
+           expression.contextualPurpose == CTP_ExprPattern);
     expression.pattern = pattern;
   }
 
@@ -2365,6 +2412,10 @@ private:
   /// Tracking this information is useful to avoid producing duplicate
   /// diagnostics when result builder has multiple overloads.
   llvm::SmallDenseSet<AnyFunctionRef> InvalidResultBuilderBodies;
+
+  /// Arguments after the code completion token that were thus ignored (i.e.
+  /// assigned fresh type variables) for type checking.
+  llvm::SetVector<Expr *> IgnoredArguments;
 
   /// Maps node types used within all portions of the constraint
   /// system, instead of directly using the types on the
@@ -3131,9 +3182,31 @@ public:
     return TypeVariables.count(typeVar) > 0;
   }
 
-  /// Whether the given expression's source range contains the code
+  /// Whether the given ASTNode's source range contains the code
   /// completion location.
-  bool containsCodeCompletionLoc(Expr *expr) const;
+  bool containsCodeCompletionLoc(ASTNode node) const;
+  bool containsCodeCompletionLoc(const ArgumentList *args) const;
+
+  /// Marks the argument \p Arg as being ignored because it occurs after the
+  /// code completion token. This assumes that the argument is not type checked
+  /// (by assigning it a fresh type variable) and prevents fixes from being
+  /// generated for this argument.
+  void markArgumentIgnoredForCodeCompletion(Expr *Arg) {
+    IgnoredArguments.insert(Arg);
+  }
+
+  /// Whether the argument \p Arg occurs after the code completion token and
+  /// thus should be ignored and not generate any fixes.
+  bool isArgumentIgnoredForCodeCompletion(Expr *Arg) const {
+    return IgnoredArguments.count(Arg) > 0;
+  }
+
+  /// Whether the constraint system has ignored any arguments for code
+  /// completion, i.e. whether there is an expression for which
+  /// \c isArgumentIgnoredForCodeCompletion returns \c true.
+  bool hasArgumentsIgnoredForCodeCompletion() const {
+    return !IgnoredArguments.empty();
+  }
 
   void setClosureType(const ClosureExpr *closure, FunctionType *type) {
     assert(closure);
@@ -3903,12 +3976,6 @@ public:
   /// due to a change.
   ConstraintList &getActiveConstraints() { return ActiveConstraints; }
 
-  void findConstraints(SmallVectorImpl<Constraint *> &found,
-                       llvm::function_ref<bool(const Constraint &)> pred) {
-    filterConstraints(ActiveConstraints, pred, found);
-    filterConstraints(InactiveConstraints, pred, found);
-  }
-
   /// Retrieve the representative of the equivalence class containing
   /// this type variable.
   TypeVariableType *getRepresentative(TypeVariableType *typeVar) const {
@@ -4080,16 +4147,6 @@ private:
   /// Introduce the constraints associated with the given type variable
   /// into the worklist.
   void addTypeVariableConstraintsToWorkList(TypeVariableType *typeVar);
-
-  static void
-  filterConstraints(ConstraintList &constraints,
-                    llvm::function_ref<bool(const Constraint &)> pred,
-                    SmallVectorImpl<Constraint *> &found) {
-    for (auto &constraint : constraints) {
-      if (pred(constraint))
-        found.push_back(&constraint);
-    }
-  }
 
 public:
 
@@ -5107,6 +5164,15 @@ private:
                              = FreeTypeVariableBinding::Disallow);
 
 public:
+  /// Pre-check the target, validating any types that occur in it
+  /// and folding sequence expressions.
+  ///
+  /// \param replaceInvalidRefsWithErrors Indicates whether it's allowed
+  /// to replace any discovered invalid member references with `ErrorExpr`.
+  static bool preCheckTarget(SolutionApplicationTarget &target,
+                             bool replaceInvalidRefsWithErrors,
+                             bool leaveClosureBodiesUnchecked);
+
   /// Pre-check the expression, validating any types that occur in the
   /// expression and folding sequence expressions.
   ///
@@ -5501,7 +5567,43 @@ public:
   /// \returns true to indicate that this should cause a failure, false
   /// otherwise.
   virtual bool relabelArguments(ArrayRef<Identifier> newNames);
+
+  /// \returns true if matchCallArguments should try to claim the argument at
+  /// \p argIndex while recovering from a failure. This is used to prevent
+  /// claiming of arguments after the code completion token.
+  virtual bool shouldClaimArgDuringRecovery(unsigned argIdx);
+
+  /// \returns true if \p arg can be claimed even though its argument label
+  /// doesn't match. This is the case for arguments representing the code
+  /// completion token if they don't contain a label. In these cases completion
+  /// will suggest the label.
+  virtual bool
+  canClaimArgIgnoringNameMismatch(const AnyFunctionType::Param &arg);
 };
+
+/// For a callsite containing a code completion expression, stores the index of
+/// the arg containing it along with the index of the first trailing closure and
+/// how many arguments were passed in total.
+struct CompletionArgInfo {
+  unsigned completionIdx;
+  Optional<unsigned> firstTrailingIdx;
+  unsigned argCount;
+
+  /// \returns true if the given argument index is possibly about to be written
+  /// by the user (given the completion index) so shouldn't be penalised as
+  /// missing when ranking solutions.
+  bool allowsMissingArgAt(unsigned argInsertIdx, AnyFunctionType::Param param);
+
+  /// \returns true if the argument containing the completion location is before
+  /// the argument with the given index.
+  bool isBefore(unsigned argIdx) { return completionIdx < argIdx; }
+};
+
+/// Extracts the index of the argument containing the code completion location
+/// from the provided anchor if it's a \c CallExpr, \c SubscriptExpr, or
+/// \c ObjectLiteralExpr.
+Optional<CompletionArgInfo> getCompletionArgInfo(ASTNode anchor,
+                                                 ConstraintSystem &cs);
 
 /// Match the call arguments (as described by the given argument type) to
 /// the parameters (as described by the given parameter type).
@@ -5540,7 +5642,8 @@ Expr *getArgumentLabelTargetExpr(Expr *fn);
 /// the given type variable, type-erase occurences of that opened type
 /// variable and anything that depends on it to their non-dependent bounds.
 Type typeEraseOpenedExistentialReference(Type type, Type existentialBaseType,
-                                         TypeVariableType *openedTypeVar);
+                                         TypeVariableType *openedTypeVar,
+                                         const DeclContext *useDC);
 
 /// Returns true if a reference to a member on a given base type will apply
 /// its curried self parameter, assuming it has one.

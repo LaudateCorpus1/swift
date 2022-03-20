@@ -424,7 +424,7 @@ ERROR(initializer_has_name,PointsToFirstBadToken,
 
 // Destructor
 ERROR(destructor_decl_outside_class,none,
-      "deinitializers may only be declared within a class", ())
+      "deinitializers may only be declared within a class or actor", ())
 ERROR(expected_lbrace_destructor,PointsToFirstBadToken,
       "expected '{' for deinitializer", ())
 ERROR(destructor_has_name,PointsToFirstBadToken,
@@ -804,6 +804,8 @@ ERROR(expected_dynamic_func_attr,none,
 ERROR(async_after_throws,none,
       "%select{'async'|'reasync'}0 must precede %select{'throws'|'rethrows'}1",
       (bool, bool))
+ERROR(await_in_function_type,none,
+      "expected async specifier; did you mean 'async'?", ())
 ERROR(duplicate_effects_specifier,none,
       "'%0' has already been specified", (StringRef))
 
@@ -1559,17 +1561,8 @@ ERROR(attr_availability_duplicate,none,
       (StringRef, StringRef))
 
 // originallyDefinedIn
-// FIXME(backDeploy): Refactor to share with back deployment attr
 ERROR(originally_defined_in_missing_rparen,none,
       "expected ')' in @_originallyDefinedIn argument list", ())
-
-// FIXME(backDeploy): Refactor to share with back deployment attr
-ERROR(originally_defined_in_unrecognized_platform,none,
-      "unrecognized platform name in @_originallyDefinedIn argument list", ())
-
-// FIXME: This is unused and can be removed
-ERROR(originally_defined_in_unrecognized_property,none,
-      "unrecognized property in @_originallyDefinedIn argument list", ())
 
 ERROR(originally_defined_in_need_original_module_name,none,
       "expected 'module: \"original\"' in the first argument to "
@@ -1577,27 +1570,6 @@ ERROR(originally_defined_in_need_original_module_name,none,
 
 ERROR(originally_defined_in_need_nonempty_module_name,none,
       "original module name cannot be empty in @_originallyDefinedIn", ())
-
-// FIXME(backDeploy): Refactor to share with back deployment attr
-ERROR(originally_defined_in_need_platform_version,none,
-     "expected at least one platform version in @_originallyDefinedIn", ())
-
-// FIXME(backDeploy): Refactor to share with back deployment attr
-WARNING(originally_defined_in_major_minor_only,none,
-        "@_originallyDefinedIn only uses major and minor version number", ())
-
-// FIXME(backDeploy): Refactor to share with back deployment attr
-WARNING(originally_defined_in_missing_platform_name,none,
-        "* as platform name has no effect", ())
-
-// FIXME(backDeploy): Refactor to share with back deployment attr
-WARNING(originally_defined_in_swift_version, none,
-        "Swift language version checks has no effect "
-        "in @_originallyDefinedIn", ())
-
-WARNING(originally_defined_in_package_description, none,
-        "PackageDescription version checks has no effect "
-        "in @_originallyDefinedIn", ())
 
 // backDeploy
 ERROR(attr_back_deploy_missing_rparen,none,
@@ -1797,8 +1769,14 @@ ERROR(redundant_class_requirement,none,
 ERROR(late_class_requirement,none,
       "'class' must come first in the requirement list", ())
 ERROR(where_inside_brackets,none,
-        "'where' clause next to generic parameters is obsolete, "
-        "must be written following the declaration's type", ())
+      "'where' clause next to generic parameters is obsolete, "
+      "must be written following the declaration's type", ())
+
+
+ERROR(expected_rangle_primary_associated_type_list,PointsToFirstBadToken,
+      "expected '>' to complete primary associated type list", ())
+ERROR(expected_primary_associated_type_name,PointsToFirstBadToken,
+      "expected an identifier to name primary associated type", ())
 
 //------------------------------------------------------------------------------
 // MARK: Conditional compilation parsing diagnostics
@@ -1907,11 +1885,6 @@ ERROR(availability_query_repeated_platform, none,
 ERROR(attr_requires_concurrency, none,
       "'%0' %select{attribute|modifier}1 is only valid when experimental "
       "concurrency is enabled",
-      (StringRef, bool))
-
-ERROR(attr_requires_distributed, none,
-      "'%0' %select{attribute|modifier}1 is only valid when experimental "
-      "distributed support is enabled",
       (StringRef, bool))
 
 //------------------------------------------------------------------------------

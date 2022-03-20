@@ -68,9 +68,9 @@ SubstitutionMap SILGenModule::mapSubstitutionsForWitnessOverride(
 /// Return the abstraction pattern to use when calling a function value.
 static AbstractionPattern
 getIndirectApplyAbstractionPattern(SILGenFunction &SGF,
+                                   AbstractionPattern pattern,
                                    CanFunctionType fnType) {
   assert(fnType);
-  AbstractionPattern pattern(fnType);
   switch (fnType->getRepresentation()) {
   case FunctionTypeRepresentation::Swift:
   case FunctionTypeRepresentation::Thin:
@@ -875,9 +875,9 @@ public:
 
     ManagedValue fn = SGF.emitRValueAsSingleValue(e);
     auto substType = cast<FunctionType>(e->getType()->getCanonicalType());
-
+    auto origType = AbstractionPattern(substType);
     // When calling an C or block function, there's implicit bridging.
-    auto origType = getIndirectApplyAbstractionPattern(SGF, substType);
+    origType = getIndirectApplyAbstractionPattern(SGF, origType, substType);
 
     setCallee(Callee::forIndirect(fn, origType, substType, e));
   }
@@ -1030,6 +1030,9 @@ public:
   }
 
   void processClassMethod(DeclRefExpr *e, AbstractFunctionDecl *afd) {
+    assert(!afd->isBackDeployed() &&
+           "cannot back deploy dynamically dispatched methods");
+
     ArgumentSource selfArgSource(selfApply->getBase());
     setSelfParam(std::move(selfArgSource));
 
@@ -1055,8 +1058,8 @@ public:
     }
 
     SILDeclRef constant = SILDeclRef(afd);
-    if (afd->isDistributed()) {
-      constant = constant.asDistributed(true);
+    if (auto distributedThunk = afd->getDistributedThunk()) {
+      constant = SILDeclRef(distributedThunk).asDistributed();
     } else {
       constant = constant.asForeign(requiresForeignEntryPoint(afd));
     }
@@ -1116,9 +1119,19 @@ public:
     }
 
     // Otherwise, we have a statically-dispatched call.
-    auto constant = SILDeclRef(e->getDecl());
+    SILDeclRef constant = SILDeclRef(e->getDecl());
+
+    /// Some special handling may be necessary for thunks:
     if (callSite && callSite->shouldApplyDistributedThunk()) {
-      constant = constant.asDistributed(true);
+      if (auto distributedThunk = cast<AbstractFunctionDecl>(e->getDecl())->getDistributedThunk()) {
+        constant = SILDeclRef(distributedThunk).asDistributed();
+      }
+    } else if (afd->isBackDeployed()) {
+      // If we're calling a back deployed function then we need to call a
+      // thunk instead that will handle the fallback when the original
+      // function is unavailable at runtime.
+      constant =
+          constant.asBackDeploymentKind(SILDeclRef::BackDeploymentKind::Thunk);
     } else {
       constant = constant.asForeign(
                    !isConstructorWithGeneratedAllocatorThunk(e->getDecl())
@@ -1171,10 +1184,6 @@ public:
   }
   
   void visitMemberRefExpr(MemberRefExpr *e) {
-    // If we're loading a closure-type property out of a generic aggregate,
-    // we might reabstract it under normal circumstances, but since we're
-    // going to apply it immediately here, there's no reason to. We can
-    // invoke the function value at whatever abstraction level we get.
     assert(isa<VarDecl>(e->getMember().getDecl()));
 
     // Any writebacks for this access are tightly scoped.
@@ -1186,9 +1195,12 @@ public:
 
     ManagedValue fn = SGF.emitLoadOfLValue(e, std::move(lv), SGFContext())
       .getAsSingleValue(SGF, e);
-    
-    setCallee(Callee::forIndirect(fn, lv.getOrigFormalType(),
-                               cast<FunctionType>(lv.getSubstFormalType()), e));
+    auto substType = cast<FunctionType>(lv.getSubstFormalType());
+    auto origType = lv.getOrigFormalType();
+    // When calling an C or block function, there's implicit bridging.
+    origType = getIndirectApplyAbstractionPattern(SGF, origType, substType);
+
+    setCallee(Callee::forIndirect(fn, origType, substType, e));
   }
   
   void visitAbstractClosureExpr(AbstractClosureExpr *e) {
@@ -1300,6 +1312,7 @@ public:
 
     } else if (auto *declRef = dyn_cast<DeclRefExpr>(fn)) {
       assert(isa<FuncDecl>(declRef->getDecl()) && "non-function super call?!");
+      // FIXME(backDeploy): Handle calls to back deployed methods on super?
       constant = SILDeclRef(declRef->getDecl())
         .asForeign(requiresForeignEntryPoint(declRef->getDecl()));
 
@@ -4414,6 +4427,27 @@ public:
 #endif
   }
 };
+
+class EmitBreadcrumbCleanup : public Cleanup {
+  ExecutorBreadcrumb breadcrumb;
+
+public:
+  EmitBreadcrumbCleanup(ExecutorBreadcrumb &&breadcrumb)
+    : breadcrumb(std::move(breadcrumb)) {}
+
+  void emit(SILGenFunction &SGF, CleanupLocation l,
+            ForUnwind_t forUnwind) override {
+    breadcrumb.emit(SGF, l);
+  }
+
+  void dump(SILGenFunction &SGF) const override {
+#ifndef NDEBUG
+    llvm::errs() << "EmitBreadcrumbCleanup "
+                 << "State:" << getState()
+                 << "NeedsEmit:" << breadcrumb.needsEmit();
+#endif
+  }
+};
 } // end anonymous namespace
 
 //===----------------------------------------------------------------------===//
@@ -4573,7 +4607,7 @@ RValue SILGenFunction::emitApply(
   // generates `await_async_continuation`.
   // Lifetime is extended by creating unmanaged copies here and by pushing the
   // cleanups required just before the result plan is generated.
-  SmallVector<ManagedValue, 8> unmanagedCopies;
+  SmallVector<SILValue, 8> unmanagedCopies;
   if (calleeTypeInfo.foreign.async) {
     for (auto arg : args) {
       if (arg.hasCleanup()) {
@@ -4660,31 +4694,22 @@ RValue SILGenFunction::emitApply(
                               *foreignError, calleeTypeInfo.foreign.async);
   }
 
-  // For objc async calls, push cleanup to be used on throw paths in the result
-  // planner.
-  for (unsigned i : indices(unmanagedCopies)) {
-    SILValue value = unmanagedCopies[i].getValue();
-    Cleanups.pushCleanup<FixLifetimeDestroyCleanup>(value);
-    unmanagedCopies[i] = ManagedValue(value, Cleanups.getTopCleanup());
+  // For objc async calls, push cleanups to be used on
+  // both result and throw paths prior to finishing the result plan.
+  if (calleeTypeInfo.foreign.async) {
+    for (auto unmanagedCopy : unmanagedCopies) {
+      Cleanups.pushCleanup<FixLifetimeDestroyCleanup>(unmanagedCopy);
+    }
+    // save breadcrumb as a clean-up so it is emitted in result / throw cases.
+    Cleanups.pushCleanup<EmitBreadcrumbCleanup>(std::move(breadcrumb));
+  } else {
+    assert(unmanagedCopies.empty());
   }
 
   auto directResultsArray = makeArrayRef(directResults);
   RValue result = resultPlan->finish(*this, loc, substResultType,
                                      directResultsArray, bridgedForeignError);
   assert(directResultsArray.empty() && "didn't claim all direct results");
-
-  // For objc async calls, generate cleanup on the resume path here and forward
-  // the previously pushed cleanups.
-  if (calleeTypeInfo.foreign.async) {
-    for (auto unmanagedCopy : unmanagedCopies) {
-      auto value = unmanagedCopy.forward(*this);
-      B.emitFixLifetime(loc, value);
-      B.emitDestroyOperation(loc, value);
-    }
-
-    // hop back to the current executor
-    breadcrumb.emit(*this, loc);
-  }
 
   return result;
 }
@@ -5135,8 +5160,11 @@ RValue SILGenFunction::emitApplyMethod(SILLocation loc, ConcreteDeclRef declRef,
   auto callRef = SILDeclRef(call, SILDeclRef::Kind::Func)
                      .asForeign(requiresForeignEntryPoint(declRef.getDecl()));
 
-  if (call->isDistributed()) {
-    callRef = callRef.asDistributed(true);
+  if (auto distributedThunk = call->getDistributedThunk()) {
+    callRef = SILDeclRef(distributedThunk).asDistributed();
+  } else if (call->isBackDeployed()) {
+    callRef =
+        callRef.asBackDeploymentKind(SILDeclRef::BackDeploymentKind::Thunk);
   }
 
   auto declRefConstant = getConstantInfo(getTypeExpansionContext(), callRef);
@@ -5740,8 +5768,11 @@ SILGenFunction::prepareSubscriptIndices(SubscriptDecl *subscript,
 }
 
 SILDeclRef SILGenModule::getAccessorDeclRef(AccessorDecl *accessor) {
-  return SILDeclRef(accessor, SILDeclRef::Kind::Func)
-    .asForeign(requiresForeignEntryPoint(accessor));
+  auto declRef = SILDeclRef(accessor, SILDeclRef::Kind::Func);
+  if (accessor->isBackDeployed())
+    return declRef.asBackDeploymentKind(SILDeclRef::BackDeploymentKind::Thunk);
+
+  return declRef.asForeign(requiresForeignEntryPoint(accessor));
 }
 
 /// Emit a call to a getter.

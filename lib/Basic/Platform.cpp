@@ -79,6 +79,25 @@ bool swift::triplesAreValidForZippering(const llvm::Triple &target,
   return false;
 }
 
+const Optional<llvm::VersionTuple>
+swift::minimumAvailableOSVersionForTriple(const llvm::Triple &triple) {
+  if (triple.isMacOSX())
+    return llvm::VersionTuple(10, 10, 0);
+
+  // Note: this must come before checking iOS since that returns true for
+  // both iOS and tvOS.
+  if (triple.isTvOS())
+    return llvm::VersionTuple(9, 0);
+
+  if (triple.isiOS())
+    return llvm::VersionTuple(8, 0);
+
+  if (triple.isWatchOS())
+    return llvm::VersionTuple(2, 0);
+
+  return None;
+}
+
 bool swift::tripleRequiresRPathForSwiftLibrariesInOS(
     const llvm::Triple &triple) {
   if (triple.isMacOSX()) {
@@ -218,6 +237,8 @@ StringRef swift::getMajorArchitectureName(const llvm::Triple &Triple) {
       return "armv7";
     case llvm::Triple::SubArchType::ARMSubArch_v6:
       return "armv6";
+    case llvm::Triple::SubArchType::ARMSubArch_v5:
+      return "armv5";
     default:
       break;
     }

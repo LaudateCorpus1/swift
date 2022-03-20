@@ -306,6 +306,7 @@ private:
     case Node::Kind::MetatypeRepresentation:
     case Node::Kind::Module:
     case Node::Kind::Tuple:
+    case Node::Kind::ParameterizedProtocol:
     case Node::Kind::Protocol:
     case Node::Kind::ProtocolSymbolicReference:
     case Node::Kind::ReturnType:
@@ -591,6 +592,8 @@ private:
     case Node::Kind::AsyncAwaitResumePartialFunction:
     case Node::Kind::AsyncSuspendResumePartialFunction:
     case Node::Kind::AccessibleFunctionRecord:
+    case Node::Kind::BackDeploymentThunk:
+    case Node::Kind::BackDeploymentFallback:
       return false;
     }
     printer_unreachable("bad node kind");
@@ -2022,7 +2025,7 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
     return nullptr;
   case Node::Kind::DistributedThunk:
     if (!Options.ShortenThunk) {
-      Printer << "distributed thunk for ";
+      Printer << "distributed thunk ";
     }
     return nullptr;
   case Node::Kind::DistributedAccessor:
@@ -2049,6 +2052,14 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
     if (!Options.ShortenThunk) {
       Printer << "dynamically replaceable variable for ";
     }
+    return nullptr;
+  case Node::Kind::BackDeploymentThunk:
+    if (!Options.ShortenThunk) {
+      Printer << "back deployment thunk for ";
+    }
+    return nullptr;
+  case Node::Kind::BackDeploymentFallback:
+    Printer << "back deployment fallback for ";
     return nullptr;
   case Node::Kind::ProtocolSymbolicReference:
     Printer << "protocol symbolic reference 0x";
@@ -2258,6 +2269,10 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
     } else {
       Printer << ".Type";
     }
+    return nullptr;
+  }
+  case Node::Kind::ParameterizedProtocol: {
+    printBoundGeneric(Node, depth);
     return nullptr;
   }
   case Node::Kind::ExistentialMetatype: {

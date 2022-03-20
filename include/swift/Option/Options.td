@@ -626,15 +626,15 @@ def no_emit_module_separately:
 
 def requirement_machine_protocol_signatures_EQ : Joined<["-"], "requirement-machine-protocol-signatures=">,
   Flags<[FrontendOption]>,
-  HelpText<"Control usage of experimental protocol requirement signature minimization: 'on', 'off', or 'verify'">;
+  HelpText<"Control usage of experimental protocol requirement signature minimization: 'on', 'off', 'verify' or 'check'">;
 
 def requirement_machine_abstract_signatures_EQ : Joined<["-"], "requirement-machine-abstract-signatures=">,
   Flags<[FrontendOption]>,
-  HelpText<"Control usage of experimental generic signature minimization: 'on', 'off', or 'verify'">;
+  HelpText<"Control usage of experimental generic signature minimization: 'on', 'off', 'verify' or 'check'">;
 
 def requirement_machine_inferred_signatures_EQ : Joined<["-"], "requirement-machine-inferred-signatures=">,
   Flags<[FrontendOption]>,
-  HelpText<"Control usage of experimental generic signature minimization: 'on', 'off', or 'verify'">;
+  HelpText<"Control usage of experimental generic signature minimization: 'on', 'off', 'verify' or 'check'">;
 
 def experimental_hermetic_seal_at_link:
   Flag<["-"], "experimental-hermetic-seal-at-link">,
@@ -1155,6 +1155,11 @@ def clang_target : Separate<["-"], "clang-target">,
 def disable_clang_target : Flag<["-"], "disable-clang-target">,
   Flags<[NewDriverOnlyOption]>,
   HelpText<"Disable a separately specified target triple for Clang instance to use">;
+
+def min_inlining_target_version : Separate<["-"], "target-min-inlining-version">,
+  Flags<[FrontendOption, ModuleInterfaceOptionIgnorable]>,
+  HelpText<"Require inlinable code with no '@available' attribute to back-deploy "
+           "to this version of the '-target' OS">;
 
 def profile_generate : Flag<["-"], "profile-generate">,
   Flags<[FrontendOption, NoInteractiveOption]>,

@@ -662,9 +662,8 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   TaskContinuationFunctionPtrTy = TaskContinuationFunctionTy->getPointerTo();
 
   SwiftContextTy->setBody({
-    SwiftContextPtrTy,    // Parent
-    TaskContinuationFunctionPtrTy, // ResumeParent,
-    SizeTy,               // Flags
+    SwiftContextPtrTy,             // Parent
+    TaskContinuationFunctionPtrTy, // ResumeParent
   });
 
   AsyncTaskAndContextTy = createStructType(
@@ -674,6 +673,7 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   ContinuationAsyncContextTy = createStructType(
       *this, "swift.continuation_context",
       {SwiftContextTy,       // AsyncContext header
+       SizeTy,               // flags
        SizeTy,               // await synchronization
        ErrorPtrTy,           // error result pointer
        OpaquePtrTy,          // normal result address
@@ -1152,7 +1152,7 @@ bool IRGenerator::canEmitWitnessTableLazily(SILWitnessTable *wt) {
 }
 
 void IRGenerator::addLazyWitnessTable(const ProtocolConformance *Conf) {
-  if (auto *wt = SIL.lookUpWitnessTable(Conf, /*deserializeLazily=*/false)) {
+  if (auto *wt = SIL.lookUpWitnessTable(Conf)) {
     // Add it to the queue if it hasn't already been put there.
     if (canEmitWitnessTableLazily(wt) &&
         LazilyEmittedWitnessTables.insert(wt).second) {
@@ -1745,7 +1745,7 @@ bool IRGenModule::useDllStorage() { return ::useDllStorage(Triple); }
 
 bool IRGenModule::shouldPrespecializeGenericMetadata() {
   auto canPrespecializeTarget =
-      (Triple.isOSDarwin() ||
+      (Triple.isOSDarwin() || Triple.isOSWindows() ||
        (Triple.isOSLinux() && !(Triple.isARM() && Triple.isArch32Bit())));
   if (canPrespecializeTarget && isStandardLibrary()) {
     return IRGen.Opts.PrespecializeGenericMetadata;

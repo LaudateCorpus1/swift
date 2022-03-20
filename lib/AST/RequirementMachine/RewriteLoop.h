@@ -219,11 +219,11 @@ struct RewriteStep {
 
   /// The size of the left whisker, which is the position within the term where
   /// the rule is being applied. In A.(X => Y).B, this is |A|=1.
-  unsigned StartOffset : 16;
+  unsigned StartOffset : 13;
 
   /// The size of the right whisker, which is the length of the remaining suffix
   /// after the rule is applied. In A.(X => Y).B, this is |B|=1.
-  unsigned EndOffset : 16;
+  unsigned EndOffset : 13;
 
   /// If Kind is Rule, the index of the rule in the rewrite system.
   ///
@@ -355,6 +355,11 @@ struct RewriteStep {
             RewritePathEvaluator &evaluator,
             const RewriteSystem &system) const;
 
+  bool isInverseOf(const RewriteStep &other) const;
+
+  bool maybeSwapRewriteSteps(RewriteStep &other,
+                             const RewriteSystem &system);
+
 private:
   static unsigned getConcreteProjectionArg(unsigned differenceID,
                                            unsigned substitutionIndex) {
@@ -402,9 +407,23 @@ public:
 
   RewritePath splitCycleAtRule(unsigned ruleID) const;
 
+  bool replaceRulesWithPaths(llvm::function_ref<const RewritePath *(unsigned)> fn);
+
   bool replaceRuleWithPath(unsigned ruleID, const RewritePath &path);
 
+  SmallVector<unsigned, 1> getRulesInEmptyContext(const MutableTerm &term,
+                                                  const RewriteSystem &system);
+
   void invert();
+
+  bool computeFreelyReducedForm();
+
+  bool computeCyclicallyReducedForm(MutableTerm &basepoint,
+                                    const RewriteSystem &system);
+
+  bool computeLeftCanonicalForm(const RewriteSystem &system);
+
+  bool computeNormalForm(const RewriteSystem &system);
 
   void dump(llvm::raw_ostream &out,
             MutableTerm term,
@@ -440,12 +459,21 @@ private:
   /// Cached value for getDecomposeCount().
   unsigned DecomposeCount : 15;
 
-  /// Loops are deleted once they no longer contain rules in empty context,
-  /// since at that point they don't participate in minimization and do not
-  /// need to be considered.
+  /// Cached value for hasConcreteTypeAliasRule().
+  unsigned HasConcreteTypeAliasRule : 1;
+
+  /// A useful loop contains at least one rule in empty context, even if that
+  /// rule appears multiple times or also in non-empty context. The only loops
+  /// that are elimination candidates contain a rule in empty context *exactly
+  /// once*. A useful loop can become an elimination candidate after
+  /// normalization.
+  unsigned Useful : 1;
+
+  /// Loops are deleted once they are no longer useful, as defined above.
   unsigned Deleted : 1;
 
-  /// If true, RulesInEmptyContext should be recomputed.
+  /// If true, Useful, RulesInEmptyContext, ProjectionCount, and DecomposeCount
+  /// should be recomputed.
   unsigned Dirty : 1;
 
   void recompute(const RewriteSystem &system);
@@ -455,11 +483,12 @@ public:
     : Basepoint(basepoint), Path(path) {
     ProjectionCount = 0;
     DecomposeCount = 0;
-
+    HasConcreteTypeAliasRule = 0;
+    Useful = 0;
     Deleted = 0;
 
-    // Initially, RulesInEmptyContext and ProjectionCount are not valid because
-    // they have not been computed yet.
+    // Initially, cached values are not valid because they have not been
+    // computed yet.
     Dirty = 1;
   }
 
@@ -477,7 +506,7 @@ public:
     Dirty = 1;
   }
 
-  bool isInContext(const RewriteSystem &system) const;
+  bool isUseful(const RewriteSystem &system) const;
 
   ArrayRef<unsigned>
   findRulesAppearingOnceInEmptyContext(const RewriteSystem &system) const;
@@ -486,10 +515,14 @@ public:
 
   unsigned getDecomposeCount(const RewriteSystem &system) const;
 
+  bool hasConcreteTypeAliasRule(const RewriteSystem &system) const;
+
   void findProtocolConformanceRules(
       llvm::SmallDenseMap<const ProtocolDecl *,
                           ProtocolConformanceRules, 2> &result,
       const RewriteSystem &system) const;
+
+  void computeNormalForm(const RewriteSystem &system);
 
   void verify(const RewriteSystem &system) const;
 

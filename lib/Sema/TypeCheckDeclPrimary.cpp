@@ -335,19 +335,11 @@ static void checkInheritanceClause(
       }
     }
 
-    // FIXME: The inherited type is printed directly here because
-    // the current default is to not print `any` for existential
-    // types, but this error message is super confusing without `any`
-    // if the user wrote it explicitly.
-    PrintOptions options;
-    options.PrintExplicitAny = true;
-    auto inheritedTyString = inheritedTy.getString(options);
-
     // We can't inherit from a non-class, non-protocol type.
     decl->diagnose(canHaveSuperclass
                    ? diag::inheritance_from_non_protocol_or_class
                    : diag::inheritance_from_non_protocol,
-                   inheritedTyString);
+                   inheritedTy);
     // FIXME: Note pointing to the declaration 'inheritedTy' references?
   }
 }
@@ -358,7 +350,7 @@ static void installCodingKeysIfNecessary(NominalTypeDecl *NTD) {
   (void)evaluateOrDefault(NTD->getASTContext().evaluator, req, {});
 }
 
-// TODO: same ugly hack as Codable does...
+// TODO(distributed): same ugly hack as Codable does...
 static void installDistributedActorIfNecessary(NominalTypeDecl *NTD) {
   auto req =
     ResolveImplicitMemberRequest{NTD, ImplicitMemberAction::ResolveDistributedActor};
@@ -2276,7 +2268,7 @@ public:
     auto kind = DC->getFragileFunctionKind();
     if (kind.kind != FragileFunctionKind::None) {
       NTD->diagnose(diag::local_type_in_inlinable_function, NTD->getName(),
-                    static_cast<unsigned>(kind.kind));
+                    kind.getSelector());
     }
 
     // We don't support protocols outside the top level of a file.
@@ -2507,7 +2499,7 @@ public:
     }
 
     if (CD->isDistributedActor()) {
-      TypeChecker::checkDistributedActor(CD);
+      TypeChecker::checkDistributedActor(SF, CD);
     }
 
     // Force lowering of stored properties.
@@ -2543,7 +2535,7 @@ public:
 
         for (auto *member : superclass->getMembers()) {
           if (auto *vd = dyn_cast<ValueDecl>(member)) {
-            if (vd->isPotentiallyOverridable()) {
+            if (vd->isSyntacticallyOverridable()) {
               (void) vd->isObjC();
             }
           }
@@ -2698,12 +2690,20 @@ public:
       llvm::errs() << "\n";
     }
 
-
-#ifndef NDEBUG
-    // In asserts builds, also verify some invariants of the requirement
-    // signature.
-    PD->getGenericSignature().verify(reqSig);
-#endif
+    if (getASTContext().LangOpts.RequirementMachineProtocolSignatures ==
+        RequirementMachineMode::Disabled) {
+  #ifndef NDEBUG
+      // The GenericSignatureBuilder outputs incorrectly-minimized signatures
+      // sometimes, so only check invariants in asserts builds.
+      PD->getGenericSignature().verify(reqSig);
+  #endif
+    } else {
+      // When using the Requirement Machine, always verify signatures.
+      // An incorrect signature indicates a serious problem which can cause
+      // miscompiles or inadvertent ABI dependencies on compiler bugs, so
+      // we really want to avoid letting one slip by.
+      PD->getGenericSignature().verify(reqSig);
+    }
 
     (void) reqSig;
 
@@ -3059,7 +3059,7 @@ public:
     checkExplicitAvailability(ED);
 
     if (nominal->isDistributedActor())
-      TypeChecker::checkDistributedActor(dyn_cast<ClassDecl>(nominal));
+      TypeChecker::checkDistributedActor(SF, nominal);
   }
 
   void visitTopLevelCodeDecl(TopLevelCodeDecl *TLCD) {

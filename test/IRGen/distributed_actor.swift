@@ -1,9 +1,9 @@
-// RUN: %target-swift-frontend -emit-ir %s -swift-version 5 -enable-experimental-distributed -disable-availability-checking | %IRGenFileCheck %s
+// RUN: %target-swift-frontend -emit-ir %s -swift-version 5 -disable-availability-checking | %IRGenFileCheck %s
 // UNSUPPORTED: back_deploy_concurrency
 // REQUIRES: concurrency
 // REQUIRES: distributed
 
-import _Distributed
+import Distributed
 
 // Type descriptor.
 // CHECK-LABEL: @"$s17distributed_actor7MyActorC2idAA0D7AddressVvpWvd"
@@ -102,7 +102,7 @@ public struct FakeInvocationEncoder: DistributedTargetInvocationEncoder {
   public typealias SerializationRequirement = Codable
 
   public mutating func recordGenericSubstitution<T>(_ type: T.Type) throws {}
-  public mutating func recordArgument<Argument: SerializationRequirement>(_ argument: Argument) throws {}
+  public mutating func recordArgument<Value: SerializationRequirement>(_ argument: RemoteCallArgument<Value>) throws {}
   public mutating func recordReturnType<R: SerializationRequirement>(_ type: R.Type) throws {}
   public mutating func recordErrorType<E: Error>(_ type: E.Type) throws {}
   public mutating func doneRecording() throws {}

@@ -797,6 +797,14 @@ void InferredGenericSignatureRequest::noteCycleStep(DiagnosticEngine &d) const {
   // into this request.  See rdar://55263708
 }
 
+void InferredGenericSignatureRequestGSB::noteCycleStep(DiagnosticEngine &d) const {
+  // For now, the GSB does a better job of describing the exact structure of
+  // the cycle.
+  //
+  // FIXME: We should consider merging the circularity handling the GSB does
+  // into this request.  See rdar://55263708
+}
+
 void InferredGenericSignatureRequestRQM::noteCycleStep(DiagnosticEngine &d) const {
   // For now, the GSB does a better job of describing the exact structure of
   // the cycle.
@@ -1551,7 +1559,8 @@ ActorIsolation ActorIsolation::subst(SubstitutionMap subs) const {
   case GlobalActor:
   case GlobalActorUnsafe:
     return forGlobalActor(
-        getGlobalActor().subst(subs), kind == GlobalActorUnsafe);
+        getGlobalActor().subst(subs), kind == GlobalActorUnsafe)
+              .withPreconcurrency(preconcurrency());
   }
   llvm_unreachable("unhandled actor isolation kind!");
 }

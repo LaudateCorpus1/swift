@@ -109,368 +109,6 @@ Solution::computeSubstitutions(GenericSignature sig,
                               lookupConformanceFn);
 }
 
-// On Windows and 32-bit platforms we need to force "Int" to actually be
-// re-imported as "Int." This is needed because otherwise, we cannot round-trip
-// "Int" and "UInt". For example, on Windows, "Int" will be imported into C++ as
-// "long long" and then back into Swift as "Int64" not "Int."
-static ValueDecl *rewriteIntegerTypes(SubstitutionMap subst, ValueDecl *oldDecl,
-                                      AbstractFunctionDecl *newDecl) {
-  auto originalFnSubst = cast<AbstractFunctionDecl>(oldDecl)
-                             ->getInterfaceType()
-                             ->getAs<GenericFunctionType>()
-                             ->substGenericArgs(subst);
-  // The constructor type is a function type as follows:
-  //   (CType.Type) -> (Generic) -> CType
-  // And a method's function type is as follows:
-  //   (inout CType) -> (Generic) -> Void
-  // In either case, we only want the result of that function type because that
-  // is the function type with the generic params that need to be substituted:
-  //   (Generic) -> CType
-  if (isa<ConstructorDecl>(oldDecl) || oldDecl->isInstanceMember() ||
-      oldDecl->isStatic())
-    originalFnSubst = cast<FunctionType>(originalFnSubst->getResult().getPointer());
-
-  SmallVector<ParamDecl *, 4> fixedParameters;
-  unsigned parameterIndex = 0;
-  for (auto *newFnParam : *newDecl->getParameters()) {
-    // If the user substituted this param with an (U)Int, use (U)Int.
-    auto substParamType =
-        originalFnSubst->getParams()[parameterIndex].getParameterType();
-    if (substParamType->isEqual(newDecl->getASTContext().getIntType()) ||
-        substParamType->isEqual(newDecl->getASTContext().getUIntType())) {
-      auto intParam =
-          ParamDecl::cloneWithoutType(newDecl->getASTContext(), newFnParam);
-      intParam->setInterfaceType(substParamType);
-      fixedParameters.push_back(intParam);
-    } else {
-      fixedParameters.push_back(newFnParam);
-    }
-    parameterIndex++;
-  }
-
-  auto fixedParams =
-      ParameterList::create(newDecl->getASTContext(), fixedParameters);
-  newDecl->setParameters(fixedParams);
-
-  // Now fix the result type:
-  if (originalFnSubst->getResult()->isEqual(
-          newDecl->getASTContext().getIntType()) ||
-      originalFnSubst->getResult()->isEqual(
-          newDecl->getASTContext().getUIntType())) {
-    // Constructors don't have a result.
-    if (auto func = dyn_cast<FuncDecl>(newDecl)) {
-      // We have to rebuild the whole function.
-      auto newFnDecl = FuncDecl::createImported(
-          func->getASTContext(), func->getNameLoc(),
-          func->getName(), func->getNameLoc(),
-          func->hasAsync(), func->hasThrows(),
-          fixedParams, originalFnSubst->getResult(),
-          /*genericParams=*/nullptr, func->getDeclContext(), newDecl->getClangDecl());
-      if (func->isStatic()) newFnDecl->setStatic();
-      if (func->isImportAsStaticMember()) newFnDecl->setImportAsStaticMember();
-      if (func->getImportAsMemberStatus().isInstance()) {
-        newFnDecl->setSelfAccessKind(func->getSelfAccessKind());
-        newFnDecl->setSelfIndex(func->getSelfIndex());
-      }
-
-      return newFnDecl;
-    }
-  }
-
-  return newDecl;
-}
-
-static Expr *createSelfExpr(FuncDecl *fnDecl) {
-  ASTContext &ctx = fnDecl->getASTContext();
-
-  auto selfDecl = fnDecl->getImplicitSelfDecl();
-  auto selfRefExpr = new (ctx) DeclRefExpr(selfDecl, DeclNameLoc(),
-                                           /*implicit*/ true);
-
-  if (!fnDecl->isMutating()) {
-    selfRefExpr->setType(selfDecl->getInterfaceType());
-    return selfRefExpr;
-  }
-  selfRefExpr->setType(LValueType::get(selfDecl->getInterfaceType()));
-
-  auto inoutSelfExpr = new (ctx) InOutExpr(
-      SourceLoc(), selfRefExpr,
-      fnDecl->mapTypeIntoContext(selfDecl->getValueInterfaceType()),
-      /*isImplicit*/ true);
-  inoutSelfExpr->setType(InOutType::get(selfDecl->getInterfaceType()));
-  return inoutSelfExpr;
-}
-
-// Synthesize a thunk body for the function created in
-// "addThunkForDependentTypes". This will just cast all params and forward them
-// along to the specialized function. It will also cast the result before
-// returning it.
-static std::pair<BraceStmt *, bool>
-synthesizeDependentTypeThunkParamForwarding(AbstractFunctionDecl *afd, void *context) {
-  ASTContext &ctx = afd->getASTContext();
-
-  auto thunkDecl = cast<FuncDecl>(afd);
-  auto specializedFuncDecl = static_cast<FuncDecl *>(context);
-
-  SmallVector<Argument, 8> forwardingParams;
-  unsigned paramIndex = 0;
-  for (auto param : *thunkDecl->getParameters()) {
-    if (isa<MetatypeType>(param->getType().getPointer())) {
-      paramIndex++;
-      continue;
-    }
-
-    Expr *paramRefExpr = new (ctx) DeclRefExpr(param, DeclNameLoc(),
-                                               /*Implicit=*/true);
-    paramRefExpr->setType(param->getType());
-
-    if (param->isInOut()) {
-      paramRefExpr->setType(LValueType::get(param->getType()));
-
-      paramRefExpr = new (ctx) InOutExpr(
-          SourceLoc(), paramRefExpr, param->getType(), /*isImplicit*/ true);
-      paramRefExpr->setType(InOutType::get(param->getType()));
-    }
-
-    auto specParamTy = specializedFuncDecl->getParameters()->get(paramIndex)->getType();
-
-    Expr *argExpr = nullptr;
-    if (specParamTy->isEqual(param->getType())) {
-      argExpr = paramRefExpr;
-    } else {
-      argExpr = ForcedCheckedCastExpr::createImplicit(ctx, paramRefExpr,
-                                                      specParamTy);
-    }
-
-    forwardingParams.push_back(Argument(SourceLoc(), Identifier(), argExpr));
-    paramIndex++;
-  }
-
-  Expr *specializedFuncDeclRef = new (ctx) DeclRefExpr(ConcreteDeclRef(specializedFuncDecl),
-                                                       DeclNameLoc(), true);
-  specializedFuncDeclRef->setType(specializedFuncDecl->getInterfaceType());
-
-  if (specializedFuncDecl->isInstanceMember()) {
-    auto selfExpr = createSelfExpr(thunkDecl);
-    auto *memberCall = DotSyntaxCallExpr::create(ctx, specializedFuncDeclRef, SourceLoc(), selfExpr);
-    memberCall->setThrows(false);
-    auto resultType = specializedFuncDecl->getInterfaceType()->getAs<FunctionType>()->getResult();
-    specializedFuncDeclRef = memberCall;
-    specializedFuncDeclRef->setType(resultType);
-  } else if (specializedFuncDecl->isStatic()) {
-    auto resultType = specializedFuncDecl->getInterfaceType()->getAs<FunctionType>()->getResult();
-    auto selfType = cast<NominalTypeDecl>(thunkDecl->getDeclContext()->getAsDecl())->getDeclaredInterfaceType();
-    auto selfTypeExpr = TypeExpr::createImplicit(selfType, ctx);
-    auto *memberCall = DotSyntaxCallExpr::create(ctx, specializedFuncDeclRef, SourceLoc(), selfTypeExpr);
-    memberCall->setThrows(false);
-    specializedFuncDeclRef = memberCall;
-    specializedFuncDeclRef->setType(resultType);
-  }
-
-  auto argList = ArgumentList::createImplicit(ctx, forwardingParams);
-  auto *specializedFuncCallExpr = CallExpr::createImplicit(ctx, specializedFuncDeclRef, argList);
-  specializedFuncCallExpr->setType(specializedFuncDecl->getResultInterfaceType());
-  specializedFuncCallExpr->setThrows(false);
-
-  Expr *resultExpr = nullptr;
-  if (specializedFuncCallExpr->getType()->isEqual(thunkDecl->getResultInterfaceType())) {
-    resultExpr = specializedFuncCallExpr;
-  } else {
-    resultExpr = ForcedCheckedCastExpr::createImplicit(
-        ctx, specializedFuncCallExpr, thunkDecl->getResultInterfaceType());
-  }
-
-  auto returnStmt = new (ctx)
-      ReturnStmt(SourceLoc(), resultExpr, /*implicit=*/true);
-  auto body = BraceStmt::create(ctx, SourceLoc(), {returnStmt}, SourceLoc(),
-                                /*implicit=*/true);
-  return {body, /*isTypeChecked=*/true};
-}
-
-// Create a thunk to map functions with dependent types to their specialized
-// version. For example, create a thunk with type (Any) -> Any to wrap a
-// specialized function template with type (Dependent<T>) -> Dependent<T>.
-static ValueDecl *addThunkForDependentTypes(FuncDecl *oldDecl,
-                                            FuncDecl *newDecl) {
-  bool updatedAnyParams = false;
-
-  SmallVector<ParamDecl *, 4> fixedParameters;
-  unsigned parameterIndex = 0;
-  for (auto *newFnParam : *newDecl->getParameters()) {
-    // If the un-specialized function had a parameter with type "Any" preserve
-    // that parameter. Otherwise, use the new function parameter.
-    auto oldParamType = oldDecl->getParameters()->get(parameterIndex)->getType();
-    if (oldParamType->isEqual(newDecl->getASTContext().TheAnyType)) {
-      updatedAnyParams = true;
-      auto newParam =
-          ParamDecl::cloneWithoutType(newDecl->getASTContext(), newFnParam);
-      newParam->setInterfaceType(oldParamType);
-      fixedParameters.push_back(newParam);
-    } else {
-      fixedParameters.push_back(newFnParam);
-    }
-    parameterIndex++;
-  }
-
-  // If we don't need this thunk, bail out.
-  if (!updatedAnyParams &&
-      !oldDecl->getResultInterfaceType()->isEqual(
-          oldDecl->getASTContext().TheAnyType))
-    return newDecl;
-
-  auto fixedParams =
-      ParameterList::create(newDecl->getASTContext(), fixedParameters);
-
-  Type fixedResultType;
-  if (oldDecl->getResultInterfaceType()->isEqual(
-          oldDecl->getASTContext().TheAnyType))
-      fixedResultType = oldDecl->getASTContext().TheAnyType;
-  else
-    fixedResultType = newDecl->getResultInterfaceType();
-
-  // We have to rebuild the whole function.
-  auto newFnDecl = FuncDecl::createImplicit(
-      newDecl->getASTContext(), newDecl->getStaticSpelling(),
-      newDecl->getName(), newDecl->getNameLoc(), newDecl->hasAsync(),
-      newDecl->hasThrows(), /*genericParams=*/nullptr, fixedParams,
-      fixedResultType, newDecl->getDeclContext());
-  newFnDecl->copyFormalAccessFrom(newDecl);
-  newFnDecl->setBodySynthesizer(synthesizeDependentTypeThunkParamForwarding, newDecl);
-  newFnDecl->setSelfAccessKind(newDecl->getSelfAccessKind());
-  if (newDecl->isStatic()) newFnDecl->setStatic();
-  newFnDecl->getAttrs().add(
-      new (newDecl->getASTContext()) TransparentAttr(/*IsImplicit=*/true));
-  return newFnDecl;
-}
-
-// Synthesizes the body of a thunk that takes extra metatype arguments and
-// skips over them to forward them along to the FuncDecl contained by context.
-// This is used when importing a C++ templated function where the template params
-// are not used in the function signature. We supply the type params as explicit
-// metatype arguments to aid in typechecking, but they shouldn't be forwarded to
-// the corresponding C++ function.
-static std::pair<BraceStmt *, bool>
-synthesizeForwardingThunkBody(AbstractFunctionDecl *afd, void *context) {
-  ASTContext &ctx = afd->getASTContext();
-
-  auto thunkDecl = cast<FuncDecl>(afd);
-  auto specializedFuncDecl = static_cast<FuncDecl *>(context);
-
-  SmallVector<Argument, 8> forwardingParams;
-  for (auto param : *thunkDecl->getParameters()) {
-    if (isa<MetatypeType>(param->getType().getPointer())) {
-      continue;
-    }
-    Expr *paramRefExpr = new (ctx) DeclRefExpr(param, DeclNameLoc(),
-                                               /*Implicit=*/true);
-    paramRefExpr->setType(param->getType());
-
-    if (param->isInOut()) {
-      paramRefExpr->setType(LValueType::get(param->getType()));
-
-      paramRefExpr = new (ctx) InOutExpr(
-          SourceLoc(), paramRefExpr, param->getType(), /*isImplicit*/ true);
-      paramRefExpr->setType(InOutType::get(param->getType()));
-    }
-
-    forwardingParams.push_back(Argument(SourceLoc(), Identifier(), paramRefExpr));
-  }
-
-  Expr *specializedFuncDeclRef = new (ctx) DeclRefExpr(ConcreteDeclRef(specializedFuncDecl),
-                                                DeclNameLoc(), true);
-  specializedFuncDeclRef->setType(specializedFuncDecl->getInterfaceType());
-
-  if (specializedFuncDecl->isInstanceMember()) {
-    auto selfExpr = createSelfExpr(thunkDecl);
-    auto *memberCall = DotSyntaxCallExpr::create(ctx, specializedFuncDeclRef, SourceLoc(), selfExpr);
-    memberCall->setThrows(false);
-    auto resultType = specializedFuncDecl->getInterfaceType()->getAs<FunctionType>()->getResult();
-    specializedFuncDeclRef = memberCall;
-    specializedFuncDeclRef->setType(resultType);
-  } else if (specializedFuncDecl->isStatic()) {
-    auto resultType = specializedFuncDecl->getInterfaceType()->getAs<FunctionType>()->getResult();
-    auto selfType = cast<NominalTypeDecl>(thunkDecl->getDeclContext()->getAsDecl())->getDeclaredInterfaceType();
-    auto selfTypeExpr = TypeExpr::createImplicit(selfType, ctx);
-    auto *memberCall = DotSyntaxCallExpr::create(ctx, specializedFuncDeclRef, SourceLoc(), selfTypeExpr);
-    memberCall->setThrows(false);
-    specializedFuncDeclRef = memberCall;
-    specializedFuncDeclRef->setType(resultType);
-  }
-
-  auto argList = ArgumentList::createImplicit(ctx, forwardingParams);
-  auto *specializedFuncCallExpr = CallExpr::createImplicit(ctx, specializedFuncDeclRef, argList);
-  specializedFuncCallExpr->setType(thunkDecl->getResultInterfaceType());
-  specializedFuncCallExpr->setThrows(false);
-
-  auto returnStmt = new (ctx) ReturnStmt(SourceLoc(), specializedFuncCallExpr,
-                                        /*implicit=*/true);
-
-  auto body = BraceStmt::create(ctx, SourceLoc(), {returnStmt}, SourceLoc(),
-                               /*implicit=*/true);
-  return {body, /*isTypeChecked=*/true};
-}
-
-static ValueDecl *generateThunkForExtraMetatypes(SubstitutionMap subst,
-                                                 FuncDecl *oldDecl,
-                                                 FuncDecl *newDecl) {
-  // We added additional metatype parameters to aid template
-  // specialization, which are no longer now that we've specialized
-  // this function. Create a thunk that only forwards the original
-  // parameters along to the clang function.
-  SmallVector<ParamDecl *, 4> newParams;
-
-  for (auto param : *newDecl->getParameters()) {
-    auto *newParamDecl = ParamDecl::clone(newDecl->getASTContext(), param);
-    newParams.push_back(newParamDecl);
-  }
-
-  auto originalFnSubst = cast<AbstractFunctionDecl>(oldDecl)
-                             ->getInterfaceType()
-                             ->getAs<GenericFunctionType>()
-                             ->substGenericArgs(subst);
-  // The constructor type is a function type as follows:
-  //   (CType.Type) -> (Generic) -> CType
-  // And a method's function type is as follows:
-  //   (inout CType) -> (Generic) -> Void
-  // In either case, we only want the result of that function type because that
-  // is the function type with the generic params that need to be substituted:
-  //   (Generic) -> CType
-  if (isa<ConstructorDecl>(oldDecl) || oldDecl->isInstanceMember() ||
-      oldDecl->isStatic())
-    originalFnSubst = cast<FunctionType>(originalFnSubst->getResult().getPointer());
-
-  for (auto paramTy : originalFnSubst->getParams()) {
-    if (!paramTy.getPlainType()->is<MetatypeType>())
-      continue;
-
-    auto dc = newDecl->getDeclContext();
-    auto paramVarDecl =
-        new (newDecl->getASTContext()) ParamDecl(
-            SourceLoc(), SourceLoc(), Identifier(), SourceLoc(),
-            newDecl->getASTContext().getIdentifier("_"), dc);
-    paramVarDecl->setInterfaceType(paramTy.getPlainType());
-    paramVarDecl->setSpecifier(ParamSpecifier::Default);
-    newParams.push_back(paramVarDecl);
-  }
-
-  auto *newParamList =
-      ParameterList::create(newDecl->getASTContext(), SourceLoc(), newParams, SourceLoc());
-
-  auto thunk = FuncDecl::createImplicit(
-      newDecl->getASTContext(), newDecl->getStaticSpelling(), oldDecl->getName(),
-      newDecl->getNameLoc(), newDecl->hasAsync(), newDecl->hasThrows(),
-      /*genericParams=*/nullptr, newParamList,
-      newDecl->getResultInterfaceType(), newDecl->getDeclContext());
-  thunk->copyFormalAccessFrom(newDecl);
-  thunk->setBodySynthesizer(synthesizeForwardingThunkBody, newDecl);
-  thunk->setSelfAccessKind(newDecl->getSelfAccessKind());
-  if (newDecl->isStatic()) thunk->setStatic();
-  thunk->getAttrs().add(
-      new (newDecl->getASTContext()) TransparentAttr(/*IsImplicit=*/true));
-
-  return thunk;
-}
-
 // Lazily instantiate function definitions for class template specializations.
 // Members of a class template specialization will be instantiated here (not
 // when imported). If this method has already be instantiated, then this is a
@@ -488,48 +126,6 @@ static void maybeInstantiateCXXMethodDefinition(ValueDecl *decl) {
   }
 }
 
-static ConcreteDeclRef getCXXFunctionTemplateSpecialization(SubstitutionMap subst,
-                                                            ValueDecl *decl) {
-  assert(isa<clang::FunctionTemplateDecl>(decl->getClangDecl()) &&
-      "This API should only be used with function templates.");
-
-  auto *newFn =
-      decl->getASTContext()
-          .getClangModuleLoader()
-          ->instantiateCXXFunctionTemplate(
-              decl->getASTContext(),
-              const_cast<clang::FunctionTemplateDecl *>(
-                  cast<clang::FunctionTemplateDecl>(decl->getClangDecl())),
-              subst);
-  // We failed to specialize this function template. The compiler is going to
-  // exit soon. Return something valid in the meantime.
-  if (!newFn)
-    return ConcreteDeclRef(decl);
-
-  auto newDecl = cast_or_null<ValueDecl>(
-      decl->getASTContext().getClangModuleLoader()->importDeclDirectly(
-          newFn));
-
-  if (auto fn = dyn_cast<AbstractFunctionDecl>(newDecl)) {
-    if (!subst.empty()) {
-      newDecl = rewriteIntegerTypes(subst, decl, fn);
-    }
-  }
-
-  if (auto fn = dyn_cast<FuncDecl>(decl)) {
-    newDecl = addThunkForDependentTypes(fn, cast<FuncDecl>(newDecl));
-  }
-
-  if (auto fn = dyn_cast<FuncDecl>(decl)) {
-    if (newFn->getNumParams() != fn->getParameters()->size()) {
-      newDecl = generateThunkForExtraMetatypes(subst, fn,
-                                               cast<FuncDecl>(newDecl));
-    }
-  }
-
-  return ConcreteDeclRef(newDecl);
-}
-
 ConcreteDeclRef
 Solution::resolveConcreteDeclRef(ValueDecl *decl,
                                  ConstraintLocator *locator) const {
@@ -545,7 +141,8 @@ Solution::resolveConcreteDeclRef(ValueDecl *decl,
   // If this is a C++ function template, get it's specialization for the given
   // substitution map and update the decl accordingly.
   if (isa_and_nonnull<clang::FunctionTemplateDecl>(decl->getClangDecl())) {
-    return getCXXFunctionTemplateSpecialization(subst, decl);
+    auto moduleLoader = decl->getASTContext().getClangModuleLoader();
+    return moduleLoader->getCXXFunctionTemplateSpecialization(subst, decl);
   }
 
   return ConcreteDeclRef(decl, subst);
@@ -781,10 +378,12 @@ namespace {
     ///
     /// \param expr The expression to be coerced.
     /// \param toType The type to which the expression will be coerced.
+    /// \param locator Locator describing where this existential conversion occurs.
     ///
     /// \return The coerced expression, whose type will be equivalent to
     /// \c toType.
-    Expr *coerceExistential(Expr *expr, Type toType);
+    Expr *coerceExistential(Expr *expr, Type toType,
+                            ConstraintLocatorBuilder locator);
 
     /// Coerce an expression of (possibly unchecked) optional
     /// type to have a different (possibly unchecked) optional type.
@@ -1259,8 +858,8 @@ namespace {
       Type resultTy;
       resultTy = cs.getType(result);
       if (resultTy->hasOpenedExistentialWithRoot(record.Archetype)) {
-        Type erasedTy =
-            resultTy->typeEraseOpenedArchetypesWithRoot(record.Archetype);
+        Type erasedTy = resultTy->typeEraseOpenedArchetypesWithRoot(
+            record.Archetype, cs.DC);
         auto range = result->getSourceRange();
         result = coerceToType(result, erasedTy, locator);
         // FIXME: Implement missing tuple-to-tuple conversion
@@ -1755,7 +1354,7 @@ namespace {
           // Erase opened existentials from the type of the thunk; we're
           // going to open the existential inside the thunk's body.
           containerTy = containerTy->typeEraseOpenedArchetypesWithRoot(
-              knownOpened->second);
+              knownOpened->second, cs.DC);
           selfTy = containerTy;
         }
       }
@@ -1815,7 +1414,7 @@ namespace {
         // existential.
         if (openedExistential) {
           refType = refType->typeEraseOpenedArchetypesWithRoot(
-              baseTy->castTo<OpenedArchetypeType>());
+              baseTy->castTo<OpenedArchetypeType>(), cs.DC);
         }
 
         cs.setType(ref, refType);
@@ -1954,10 +1553,10 @@ namespace {
                              getConstraintSystem().getConstraintLocator(
                                memberLocator));
         if (knownOpened != solution.OpenedExistentialTypes.end()) {
-          curryThunkTy =
-              curryThunkTy
-                  ->typeEraseOpenedArchetypesWithRoot(knownOpened->second)
-                  ->castTo<FunctionType>();
+          curryThunkTy = curryThunkTy
+                             ->typeEraseOpenedArchetypesWithRoot(
+                                 knownOpened->second, cs.DC)
+                             ->castTo<FunctionType>();
         }
 
         auto discriminator = AutoClosureExpr::InvalidDiscriminator;
@@ -2682,7 +2281,8 @@ namespace {
     ExprRewriter(ConstraintSystem &cs, Solution &solution,
                  Optional<SolutionApplicationTarget> target,
                  bool suppressDiagnostics)
-        : cs(cs), dc(cs.DC), solution(solution), target(target),
+        : cs(cs), dc(target ? target->getDeclContext() : cs.DC),
+          solution(solution), target(target),
           SuppressDiagnostics(suppressDiagnostics) {}
 
     ConstraintSystem &getConstraintSystem() const { return cs; }
@@ -5635,8 +5235,9 @@ Expr *ExprRewriter::coerceSuperclass(Expr *expr, Type toType) {
   if (fromInstanceType->isExistentialType()) {
     // Coercion from superclass-constrained existential to its
     // concrete superclass.
-    auto fromArchetype = OpenedArchetypeType::getAny(
-        fromType->getCanonicalType());
+    auto fromArchetype =
+        OpenedArchetypeType::getAny(fromType->getCanonicalType(),
+                                    cs.DC->getGenericSignatureOfContext());
 
     auto *archetypeVal = cs.cacheType(new (ctx) OpaqueValueExpr(
         expr->getSourceRange(), fromArchetype));
@@ -5675,50 +5276,6 @@ collectExistentialConformances(Type fromType, Type toType,
   }
 
   return toType->getASTContext().AllocateCopy(conformances);
-}
-
-Expr *ExprRewriter::coerceExistential(Expr *expr, Type toType) {
-  Type fromType = cs.getType(expr);
-  Type fromInstanceType = fromType;
-  Type toInstanceType = toType;
-
-  // Look through metatypes
-  while ((fromInstanceType->is<UnresolvedType>() ||
-          fromInstanceType->is<AnyMetatypeType>()) &&
-         toInstanceType->is<ExistentialMetatypeType>()) {
-    if (!fromInstanceType->is<UnresolvedType>())
-      fromInstanceType = fromInstanceType->castTo<AnyMetatypeType>()->getInstanceType();
-    toInstanceType = toInstanceType->castTo<ExistentialMetatypeType>()->getExistentialInstanceType();
-  }
-
-  ASTContext &ctx = cs.getASTContext();
-
-  auto conformances =
-    collectExistentialConformances(fromInstanceType, toInstanceType,
-                                   cs.DC->getParentModule());
-
-  // For existential-to-existential coercions, open the source existential.
-  if (fromType->isAnyExistentialType()) {
-    fromType = OpenedArchetypeType::getAny(fromType->getCanonicalType());
-
-    auto *archetypeVal = cs.cacheType(
-        new (ctx) OpaqueValueExpr(expr->getSourceRange(), fromType));
-
-    auto *result = cs.cacheType(ErasureExpr::create(ctx, archetypeVal, toType,
-                                                    conformances));
-    return cs.cacheType(
-        new (ctx) OpenExistentialExpr(expr, archetypeVal, result,
-                                      cs.getType(result)));
-  }
-
-  // Load tuples with lvalue elements.
-  if (auto tupleType = fromType->getAs<TupleType>()) {
-    if (tupleType->hasLValueType()) {
-      expr = cs.coerceToRValue(expr);
-    }
-  }
-
-  return cs.cacheType(ErasureExpr::create(ctx, expr, toType, conformances));
 }
 
 /// Given that the given expression is an implicit conversion added
@@ -5858,22 +5415,25 @@ static bool hasCurriedSelf(ConstraintSystem &cs, ConcreteDeclRef callee,
 
 /// Apply the contextually Sendable flag to the given expression,
 static void applyContextualClosureFlags(
-      Expr *expr, bool implicitSelfCapture, bool inheritActorContext) {
+      Expr *expr, bool implicitSelfCapture, bool inheritActorContext,
+      bool isolatedByPreconcurrency) {
   if (auto closure = dyn_cast<ClosureExpr>(expr)) {
     closure->setAllowsImplicitSelfCapture(implicitSelfCapture);
     closure->setInheritsActorContext(inheritActorContext);
+    closure->setIsolatedByPreconcurrency(isolatedByPreconcurrency);
     return;
   }
 
   if (auto captureList = dyn_cast<CaptureListExpr>(expr)) {
     applyContextualClosureFlags(
         captureList->getClosureBody(), implicitSelfCapture,
-        inheritActorContext);
+        inheritActorContext, isolatedByPreconcurrency);
   }
 
   if (auto identity = dyn_cast<IdentityExpr>(expr)) {
     applyContextualClosureFlags(
-        identity->getSubExpr(), implicitSelfCapture, inheritActorContext);
+        identity->getSubExpr(), implicitSelfCapture, inheritActorContext,
+        isolatedByPreconcurrency);
   }
 }
 
@@ -5899,6 +5459,8 @@ ArgumentList *ExprRewriter::coerceCallArguments(
   bool skipCurriedSelf = apply ? hasCurriedSelf(cs, callee, apply) : true;
   // Determine the parameter bindings.
   ParameterListInfo paramInfo(params, callee.getDecl(), skipCurriedSelf);
+
+  bool preconcurrency = callee && callee.getDecl()->preconcurrency();
 
   // If this application is an init(wrappedValue:) call that needs an injected
   // wrapped value placeholder, the first non-defaulted argument must be
@@ -5938,7 +5500,8 @@ ArgumentList *ExprRewriter::coerceCallArguments(
     auto paramLabel = param.getLabel();
 
     // Handle variadic generic parameters.
-    if (paramInfo.isVariadicGenericParameter(paramIdx)) {
+    if (ctx.LangOpts.EnableExperimentalVariadicGenerics &&
+        paramInfo.isVariadicGenericParameter(paramIdx)) {
       assert(param.isVariadic());
       assert(!param.isInOut());
 
@@ -6070,7 +5633,7 @@ ArgumentList *ExprRewriter::coerceCallArguments(
     bool isImplicitSelfCapture = paramInfo.isImplicitSelfCapture(paramIdx);
     bool inheritsActorContext = paramInfo.inheritsActorContext(paramIdx);
     applyContextualClosureFlags(
-        argExpr, isImplicitSelfCapture, inheritsActorContext);
+        argExpr, isImplicitSelfCapture, inheritsActorContext, preconcurrency);
 
     // If the types exactly match, this is easy.
     auto paramType = param.getOldType();
@@ -6440,15 +6003,9 @@ static Expr *buildElementConversion(ExprRewriter &rewriter,
 
 static CollectionUpcastConversionExpr::ConversionPair
 buildOpaqueElementConversion(ExprRewriter &rewriter, SourceRange srcRange,
-                             Type srcCollectionType, Type destCollectionType,
+                             Type srcType, Type destType,
                              bool bridged, ConstraintLocatorBuilder locator,
                              unsigned typeArgIndex) {
-  // We don't need this stuff unless we've got generalized casts.
-  Type srcType = srcCollectionType->castTo<BoundGenericType>()
-                                  ->getGenericArgs()[typeArgIndex];
-  Type destType = destCollectionType->castTo<BoundGenericType>()
-                                    ->getGenericArgs()[typeArgIndex];
-
   // Build the conversion.
   auto &cs = rewriter.getConstraintSystem();
   ASTContext &ctx = cs.getASTContext();
@@ -6597,9 +6154,12 @@ Expr *ExprRewriter::buildCollectionUpcastExpr(
 
   ASTContext &ctx = cs.getASTContext();
   // Build the first value conversion.
+  auto fromArgs = cs.getType(expr)->castTo<BoundGenericType>()->getGenericArgs();
+  auto toArgs = toType->castTo<BoundGenericType>()->getGenericArgs();
   auto conv =
-    buildOpaqueElementConversion(*this, expr->getLoc(), cs.getType(expr),
-                                 toType, bridged, locator, 0);
+    buildOpaqueElementConversion(*this, expr->getLoc(),
+                                 fromArgs[0], toArgs[0],
+                                 bridged, locator, 0);
 
   // For single-parameter collections, form the upcast.
   if (ConstraintSystem::isArrayType(toType) ||
@@ -6613,8 +6173,9 @@ Expr *ExprRewriter::buildCollectionUpcastExpr(
 
   // Build the second value conversion.
   auto conv2 =
-    buildOpaqueElementConversion(*this, expr->getLoc(), cs.getType(expr),
-                                 toType, bridged, locator, 1);
+    buildOpaqueElementConversion(*this, expr->getLoc(),
+                                 fromArgs[1], toArgs[1],
+                                 bridged, locator, 1);
 
   return cs.cacheType(
            new (ctx) CollectionUpcastConversionExpr(expr, toType, conv, conv2));
@@ -6664,6 +6225,106 @@ Expr *ExprRewriter::buildObjCBridgeExpr(Expr *expr, Type toType,
 
   // Bridging from an Objective-C class type to a Swift type.
   return forceBridgeFromObjectiveC(expr, toType);
+}
+
+Expr *ExprRewriter::coerceExistential(Expr *expr, Type toType,
+                                      ConstraintLocatorBuilder locator) {
+  Type fromType = cs.getType(expr);
+  Type fromInstanceType = fromType;
+  Type toInstanceType = toType;
+
+  // Look through metatypes
+  while ((fromInstanceType->is<UnresolvedType>() ||
+          fromInstanceType->is<AnyMetatypeType>()) &&
+         toInstanceType->is<ExistentialMetatypeType>()) {
+    if (!fromInstanceType->is<UnresolvedType>())
+      fromInstanceType = fromInstanceType->castTo<AnyMetatypeType>()->getInstanceType();
+    toInstanceType = toInstanceType->castTo<ExistentialMetatypeType>()->getExistentialInstanceType();
+  }
+
+  ASTContext &ctx = cs.getASTContext();
+
+  auto conformances =
+    collectExistentialConformances(fromInstanceType, toInstanceType,
+                                   cs.DC->getParentModule());
+
+  // Use the requirements of any parameterized protocols to build out fake
+  // argument conversions that can be used to infer opaque types.
+  SmallVector<CollectionUpcastConversionExpr::ConversionPair, 4> argConversions;
+
+  auto fromConstraintType = fromInstanceType;
+  if (auto existential = fromConstraintType->getAs<ExistentialType>())
+    fromConstraintType = existential->getConstraintType();
+
+  auto toConstraintType = toInstanceType;
+  if (auto existential = toConstraintType->getAs<ExistentialType>())
+    toConstraintType = existential->getConstraintType();
+
+  auto fromPPT = fromConstraintType->getAs<ParameterizedProtocolType>();
+  auto toPPT = toConstraintType->getAs<ParameterizedProtocolType>();
+
+  if (fromPPT && toPPT) {
+    assert(fromPPT->getArgs().size() >= toPPT->getArgs().size());
+    for (unsigned i = 0; i < toPPT->getArgs().size(); ++i) {
+      auto firstTy = fromPPT->getArgs()[i];
+      auto secondTy = toPPT->getArgs()[i];
+      auto conv =
+        buildOpaqueElementConversion(*this, expr->getLoc(),
+                                     firstTy,
+                                     secondTy,
+                                     /*bridged*/ false,
+                                     locator, i);
+      argConversions.push_back(conv);
+    }
+  } else if ((fromPPT || toPPT) &&
+             !fromInstanceType->isExistentialType()) {
+    auto parameterized = fromConstraintType;
+    auto base = toConstraintType;
+    if (toPPT)
+      std::swap(parameterized, base);
+
+    SmallVector<Requirement, 4> reqs;
+    parameterized->castTo<ParameterizedProtocolType>()
+                 ->getRequirements(base, reqs);
+
+    for (unsigned i = 0; i < reqs.size(); ++i) {
+      const auto &req = reqs[i];
+      assert(req.getKind() == RequirementKind::SameType);
+      auto conv =
+        buildOpaqueElementConversion(*this, expr->getLoc(),
+                                     req.getFirstType(),
+                                     req.getSecondType(),
+                                     /*bridged*/ false,
+                                     locator, i);
+      argConversions.push_back(conv);
+    }
+  }
+
+  // For existential-to-existential coercions, open the source existential.
+  if (fromType->isAnyExistentialType()) {
+    fromType = OpenedArchetypeType::getAny(fromType->getCanonicalType(),
+                                           cs.DC->getGenericSignatureOfContext());
+
+    auto *archetypeVal = cs.cacheType(
+        new (ctx) OpaqueValueExpr(expr->getSourceRange(), fromType));
+
+    auto *result = cs.cacheType(ErasureExpr::create(ctx, archetypeVal, toType,
+                                                    conformances,
+                                                    argConversions));
+    return cs.cacheType(
+        new (ctx) OpenExistentialExpr(expr, archetypeVal, result,
+                                      cs.getType(result)));
+  }
+
+  // Load tuples with lvalue elements.
+  if (auto tupleType = fromType->getAs<TupleType>()) {
+    if (tupleType->hasLValueType()) {
+      expr = cs.coerceToRValue(expr);
+    }
+  }
+
+  return cs.cacheType(ErasureExpr::create(ctx, expr, toType,
+                                          conformances, argConversions));
 }
 
 Expr *ConstraintSystem::addImplicitLoadExpr(Expr *expr) {
@@ -6755,7 +6416,7 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
 
     case ConversionRestrictionKind::Existential:
     case ConversionRestrictionKind::MetatypeToExistentialMetatype:
-      return coerceExistential(expr, toType);
+      return coerceExistential(expr, toType, locator);
 
     case ConversionRestrictionKind::ClassMetatypeToAnyObject: {
       assert(ctx.LangOpts.EnableObjCInterop &&
@@ -7301,7 +6962,7 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
   case TypeKind::ProtocolComposition:
   case TypeKind::ParameterizedProtocol:
   case TypeKind::Protocol:
-    return coerceExistential(expr, toType);
+    return coerceExistential(expr, toType, locator);
 
   // Coercion to Optional<T>.
   case TypeKind::BoundGenericEnum: {
@@ -7905,8 +7566,8 @@ Expr *ExprRewriter::finishApply(ApplyExpr *apply, Type openedType,
     apply->setArgs(args);
     cs.setType(apply, fnType->getResult());
 
-    // If this is a call to a distributed method thunk, let's mark the
-    // call as implicitly throwing.
+    // If this is a call to a distributed method thunk,
+    // let's mark the call as implicitly throwing.
     if (isDistributedThunk(callee, apply->getFn())) {
       auto *FD = cast<AbstractFunctionDecl>(callee.getDecl());
       if (!FD->hasThrows())
@@ -8936,6 +8597,7 @@ ExprWalker::rewriteTarget(SolutionApplicationTarget target) {
     case CTP_Unused:
     case CTP_CaseStmt:
     case CTP_ReturnStmt:
+    case CTP_ExprPattern:
     case swift::CTP_ReturnSingleExpr:
     case swift::CTP_YieldByValue:
     case swift::CTP_YieldByReference:
@@ -9005,6 +8667,31 @@ ExprWalker::rewriteTarget(SolutionApplicationTarget target) {
     // Figure out the pattern type.
     Type patternType = solution.simplifyType(solution.getType(info.pattern));
     patternType = patternType->reconstituteSugar(/*recursive=*/false);
+
+    // Check whether this enum element is resolved via ~= application.
+    if (auto *enumElement = dyn_cast<EnumElementPattern>(info.pattern)) {
+      if (auto target = cs.getSolutionApplicationTarget(enumElement)) {
+        auto *EP = target->getExprPattern();
+        auto enumType = solution.simplifyType(EP->getType());
+
+        auto *matchCall = target->getAsExpr();
+
+        auto *result = matchCall->walk(*this);
+        if (!result)
+          return None;
+
+        {
+          auto *matchVar = EP->getMatchVar();
+          matchVar->setInterfaceType(enumType->mapTypeOutOfContext());
+        }
+
+        EP->setMatchExpr(result);
+        EP->setType(enumType);
+
+        (*caseLabelItem)->setPattern(EP, /*resolved=*/true);
+        return target;
+      }
+    }
 
     // Coerce the pattern to its appropriate type.
     TypeResolutionOptions patternOptions(TypeResolverContext::InExpression);
