@@ -978,6 +978,7 @@ public:
     tombstone,
     stmtCondElement,
     expr,
+    closure,
     stmt,
     pattern,
     patternBindingEntry,
@@ -1020,6 +1021,11 @@ public:
     storage.expr = expr;
   }
 
+  SolutionApplicationTargetsKey(const ClosureExpr *closure) {
+    kind = Kind::closure;
+    storage.expr = closure;
+  }
+
   SolutionApplicationTargetsKey(const Stmt *stmt) {
     kind = Kind::stmt;
     storage.stmt = stmt;
@@ -1056,6 +1062,7 @@ public:
       return lhs.storage.stmtCondElement == rhs.storage.stmtCondElement;
 
     case Kind::expr:
+    case Kind::closure:
       return lhs.storage.expr == rhs.storage.expr;
 
     case Kind::stmt:
@@ -1096,6 +1103,7 @@ public:
           DenseMapInfo<void *>::getHashValue(storage.stmtCondElement));
 
     case Kind::expr:
+    case Kind::closure:
       return hash_combine(
           DenseMapInfo<unsigned>::getHashValue(static_cast<unsigned>(kind)),
           DenseMapInfo<void *>::getHashValue(storage.expr));
@@ -1279,6 +1287,24 @@ public:
   /// Simplify the given type by substituting all occurrences of
   /// type variables for their fixed types.
   Type simplifyType(Type type) const;
+
+  // To aid code completion, we need to attempt to convert type placeholders
+  // back into underlying generic parameters if possible, since type
+  // of the code completion expression is used as "expected" (or contextual)
+  // type so it's helpful to know what requirements it has to filter
+  // the list of possible member candidates e.g.
+  //
+  // \code
+  // func test<T: P>(_: [T]) {}
+  //
+  // test(42.#^MEMBERS^#)
+  // \code
+  //
+  // It's impossible to resolve `T` in this case but code completion
+  // expression should still have a type of `[T]` instead of `[<<hole>>]`
+  // because it helps to produce correct contextual member list based on
+  // a conformance requirement associated with generic parameter `T`.
+  Type simplifyTypeForCodeCompletion(Type type) const;
 
   /// Coerce the given expression to the given type.
   ///
@@ -1489,6 +1515,10 @@ enum class ConstraintSystemFlags {
   /// calling conventions, say due to Clang attributes such as
   /// `__attribute__((ns_consumed))`.
   UseClangFunctionTypes = 0x80,
+
+  /// When set, nominal typedecl contexts are asynchronous contexts.
+  /// This is set while searching for the main function
+  ConsiderNominalTypeContextsAsync = 0x100,
 };
 
 /// Options that affect the constraint system as a whole.
@@ -1623,6 +1653,7 @@ class SolutionApplicationTarget {
 public:
   enum class Kind {
     expression,
+    closure,
     function,
     stmtCondition,
     caseLabelItem,
@@ -1685,6 +1716,14 @@ private:
     } expression;
 
     struct {
+      /// The closure expression being type-checked.
+      ClosureExpr *closure;
+
+      /// The type to which the expression should be converted.
+      Type convertType;
+    } closure;
+
+    struct {
       AnyFunctionRef function;
       BraceStmt *body;
     } function;
@@ -1733,6 +1772,12 @@ public:
       : SolutionApplicationTarget(expr, dc, CTP_ExprPattern, patternType,
                                   /*isDiscarded=*/false) {
     setPattern(pattern);
+  }
+
+  SolutionApplicationTarget(ClosureExpr *closure, Type convertType) {
+    kind = Kind::closure;
+    this->closure.closure = closure;
+    this->closure.convertType = convertType;
   }
 
   SolutionApplicationTarget(AnyFunctionRef fn)
@@ -1831,6 +1876,7 @@ public:
     case Kind::expression:
       return expression.expression;
 
+    case Kind::closure:
     case Kind::function:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
@@ -1845,6 +1891,9 @@ public:
     switch (kind) {
     case Kind::expression:
       return expression.dc;
+
+    case Kind::closure:
+      return closure.closure;
 
     case Kind::function:
       return function.function.getAsDeclContext();
@@ -1932,6 +1981,11 @@ public:
     assert(kind == Kind::expression);
     assert(expression.contextualPurpose == CTP_ExprPattern);
     return cast<ExprPattern>(expression.pattern);
+  }
+
+  Type getClosureContextualType() const {
+    assert(kind == Kind::closure);
+    return closure.convertType;
   }
 
   /// For a pattern initialization target, retrieve the contextual pattern.
@@ -2062,6 +2116,7 @@ public:
   Optional<AnyFunctionRef> getAsFunction() const {
     switch (kind) {
     case Kind::expression:
+    case Kind::closure:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
     case Kind::patternBinding:
@@ -2077,6 +2132,7 @@ public:
   Optional<StmtCondition> getAsStmtCondition() const {
     switch (kind) {
     case Kind::expression:
+    case Kind::closure:
     case Kind::function:
     case Kind::caseLabelItem:
     case Kind::patternBinding:
@@ -2092,6 +2148,7 @@ public:
   Optional<CaseLabelItem *> getAsCaseLabelItem() const {
     switch (kind) {
     case Kind::expression:
+    case Kind::closure:
     case Kind::function:
     case Kind::stmtCondition:
     case Kind::patternBinding:
@@ -2107,6 +2164,7 @@ public:
   PatternBindingDecl *getAsPatternBinding() const {
     switch (kind) {
     case Kind::expression:
+    case Kind::closure:
     case Kind::function:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
@@ -2122,6 +2180,7 @@ public:
   VarDecl *getAsUninitializedWrappedVar() const {
     switch (kind) {
     case Kind::expression:
+    case Kind::closure:
     case Kind::function:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
@@ -2137,6 +2196,7 @@ public:
   Pattern *getAsUninitializedVar() const {
     switch (kind) {
     case Kind::expression:
+    case Kind::closure:
     case Kind::function:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
@@ -2152,6 +2212,7 @@ public:
   Type getTypeOfUninitializedVar() const {
     switch (kind) {
     case Kind::expression:
+    case Kind::closure:
     case Kind::function:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
@@ -2167,6 +2228,7 @@ public:
   PatternBindingDecl *getPatternBindingOfUninitializedVar() const {
     switch (kind) {
     case Kind::expression:
+    case Kind::closure:
     case Kind::function:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
@@ -2182,6 +2244,7 @@ public:
   unsigned getIndexOfUninitializedVar() const {
     switch (kind) {
     case Kind::expression:
+    case Kind::closure:
     case Kind::function:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
@@ -2209,6 +2272,9 @@ public:
     switch (kind) {
     case Kind::expression:
       return expression.expression->getSourceRange();
+
+    case Kind::closure:
+      return closure.closure->getSourceRange();
 
     case Kind::function:
       return function.body->getSourceRange();
@@ -2239,6 +2305,9 @@ public:
     switch (kind) {
     case Kind::expression:
       return expression.expression->getLoc();
+
+    case Kind::closure:
+      return closure.closure->getLoc();
 
     case Kind::function:
       return function.function.getLoc();
@@ -5113,6 +5182,10 @@ private:
                                   SourceLoc referenceLoc);
 
 public:
+  /// If the given argument, specified by its type and expression, a reference
+  /// to a generic function?
+  bool isArgumentGenericFunction(Type argType, Expr *argExpr);
+
   // Given a type variable, attempt to find the disjunction of
   // bind overloads associated with it. This may return null in cases where
   // the disjunction has either not been created or binds the type variable
@@ -5643,7 +5716,7 @@ Expr *getArgumentLabelTargetExpr(Expr *fn);
 /// variable and anything that depends on it to their non-dependent bounds.
 Type typeEraseOpenedExistentialReference(Type type, Type existentialBaseType,
                                          TypeVariableType *openedTypeVar,
-                                         const DeclContext *useDC);
+                                         TypePosition outermostPosition);
 
 /// Returns true if a reference to a member on a given base type will apply
 /// its curried self parameter, assuming it has one.

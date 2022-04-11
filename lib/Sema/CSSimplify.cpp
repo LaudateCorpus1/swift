@@ -1275,6 +1275,9 @@ public:
     if (ArgInfo.isBefore(argIdx)) {
       return false;
     }
+    if (argIdx == 0 && ArgInfo.completionIdx == 0) {
+      return false;
+    }
     return ArgumentFailureTracker::extraArgument(argIdx);
   }
 
@@ -1432,12 +1435,13 @@ namespace {
 /// \param argTy The type of the argument.
 ///
 /// \returns If the argument type is existential and opening it can bind a
-/// generic parameter in the callee, returns the type variable (from the
-/// opened parameter type) the existential type that needs to be opened
-/// (from the argument type), and the adjustements that need to be applied to
-/// the existential type after it is opened.
+/// generic parameter in the callee, returns the generic parameter, type
+/// variable (from the opened parameter type) the existential type that needs
+/// to be opened (from the argument type), and the adjustements that need to be
+/// applied to the existential type after it is opened.
 static Optional<
-    std::tuple<TypeVariableType *, Type, OpenedExistentialAdjustments>>
+    std::tuple<GenericTypeParamType *, TypeVariableType *, Type,
+               OpenedExistentialAdjustments>>
 shouldOpenExistentialCallArgument(
     ValueDecl *callee, unsigned paramIdx, Type paramTy, Type argTy,
     Expr *argExpr, ConstraintSystem &cs) {
@@ -1477,9 +1481,9 @@ shouldOpenExistentialCallArgument(
   // An argument expression that explicitly coerces to an existential
   // disables the implicit opening of the existential.
   if (argExpr) {
-    if (auto argCoercion = dyn_cast<CoerceExpr>(
+    if (auto argCast = dyn_cast<ExplicitCastExpr>(
             argExpr->getSemanticsProvidingExpr())) {
-      if (auto typeRepr = argCoercion->getCastTypeRepr()) {
+      if (auto typeRepr = argCast->getCastTypeRepr()) {
         if (auto toType = cs.getType(typeRepr)) {
           if (toType->isAnyExistentialType())
             return None;
@@ -1541,6 +1545,31 @@ shouldOpenExistentialCallArgument(
           genericSig.getGenericParams().back()->getDepth())
     return None;
 
+  // If the existential argument conforms to all of protocol requirements on
+  // the formal parameter's type, don't open.
+  // If all of the conformance requirements on the formal parameter's type
+  // are self-conforming, don't open.
+  {
+    Type existentialObjectType;
+    if (auto existentialMetaTy = argTy->getAs<ExistentialMetatypeType>())
+      existentialObjectType = existentialMetaTy->getInstanceType();
+    else
+      existentialObjectType = argTy;
+    auto module = cs.DC->getParentModule();
+    bool containsNonSelfConformance = false;
+    for (auto proto : genericSig->getRequiredProtocols(genericParam)) {
+      auto conformance = module->lookupExistentialConformance(
+          existentialObjectType, proto);
+      if (conformance.isInvalid()) {
+        containsNonSelfConformance = true;
+        break;
+      }
+    }
+
+    if (!containsNonSelfConformance)
+      return None;
+  }
+
   // Ensure that the formal parameter is only used in covariant positions,
   // because it won't match anywhere else.
   auto referenceInfo = findGenericParameterReferences(
@@ -1551,7 +1580,7 @@ shouldOpenExistentialCallArgument(
       referenceInfo.assocTypeRef > TypePosition::Covariant)
     return None;
 
-  return std::make_tuple(paramTypeVar, argTy, adjustments);
+  return std::make_tuple(genericParam, paramTypeVar, argTy, adjustments);
 }
 
 // Match the argument of a call to the parameter.
@@ -1748,16 +1777,24 @@ static ConstraintSystem::TypeMatchResult matchCallArguments(
     // If type inference from default arguments is enabled, let's
     // add a constraint from the parameter if necessary, otherwise
     // there is nothing to do but move to the next parameter.
-    if (parameterBindings[paramIdx].empty()) {
+    if (parameterBindings[paramIdx].empty() && callee) {
       auto &ctx = cs.getASTContext();
 
-      if (ctx.TypeCheckerOpts.EnableTypeInferenceFromDefaultArguments) {
+      // Type inference from default value expressions.
+      {
         auto *paramList = getParameterList(callee);
-        auto *PD = paramList->get(paramIdx);
+        if (!paramList)
+          continue;
 
         // There is nothing to infer if parameter doesn't have any
         // generic parameters in its type.
+        auto *PD = paramList->get(paramIdx);
         if (!PD->getInterfaceType()->hasTypeParameter())
+          continue;
+
+        // The type of the default value is going to be determined
+        // based on a type deduced for the parameter at this call site.
+        if (PD->hasCallerSideDefaultExpr())
           continue;
 
         auto defaultExprType = PD->getTypeOfDefaultExpr();
@@ -1792,7 +1829,6 @@ static ConstraintSystem::TypeMatchResult matchCallArguments(
       auto *argExpr = getArgumentExpr(locator.getAnchor(), argIdx);
       if (param.isAutoClosure() && !isSynthesizedArgument(argument)) {
         auto &ctx = cs.getASTContext();
-        auto *fnType = paramTy->castTo<FunctionType>();
 
         // If this is a call to a function with a closure argument and the
         // parameter is an autoclosure, let's just increment the score here
@@ -1812,7 +1848,9 @@ static ConstraintSystem::TypeMatchResult matchCallArguments(
         if (ctx.isSwiftVersionAtLeast(5) || !isAutoClosureArgument(argExpr)) {
           // In Swift >= 5 mode there is no @autoclosure forwarding,
           // so let's match result types.
-          paramTy = fnType->getResult();
+          if (auto *fnType = paramTy->getAs<FunctionType>()) {
+            paramTy = fnType->getResult();
+          }
         } else {
           // Matching @autoclosure argument to @autoclosure parameter
           // directly would mean introducting a function conversion
@@ -1831,15 +1869,29 @@ static ConstraintSystem::TypeMatchResult matchCallArguments(
             cs, cs.getConstraintLocator(loc)));
       }
 
+      // Type-erase any opened existentials from subsequent parameter types
+      // unless the argument itself is a generic function, which could handle
+      // the opened existentials.
+      if (!openedExistentials.empty() && paramTy->hasTypeVariable() &&
+          !cs.isArgumentGenericFunction(argTy, argExpr)) {
+        for (const auto &opened : openedExistentials) {
+          paramTy = typeEraseOpenedExistentialReference(
+              paramTy, opened.second->getExistentialType(), opened.first,
+              TypePosition::Contravariant);
+        }
+      }
+
       // If the argument is an existential type and the parameter is generic,
       // consider opening the existential type.
       if (auto existentialArg = shouldOpenExistentialCallArgument(
               callee, paramIdx, paramTy, argTy, argExpr, cs)) {
         // My kingdom for a decent "if let" in C++.
+        GenericTypeParamType *openedGenericParam;
         TypeVariableType *openedTypeVar;
         Type existentialType;
         OpenedExistentialAdjustments adjustments;
-        std::tie(openedTypeVar, existentialType, adjustments) = *existentialArg;
+        std::tie(openedGenericParam, openedTypeVar, existentialType,
+                 adjustments) = *existentialArg;
 
         OpenedArchetypeType *opened;
         std::tie(argTy, opened) = cs.openExistentialType(
@@ -1927,14 +1979,8 @@ static ConstraintSystem::TypeMatchResult matchCallArguments(
         auto *locator = cs.getConstraintLocator(loc);
         SourceRange range;
         // simplify locator so the anchor is the exact argument.
-        locator = simplifyLocator(cs, locator, range);
-        if (locator->getPath().empty() &&
-            locator->getAnchor().isExpr(ExprKind::UnresolvedMemberChainResult)) {
-          locator =
-            cs.getConstraintLocator(cast<UnresolvedMemberChainResultExpr>(
-              locator->getAnchor().get<Expr*>())->getChainBase());
-        }
-        cs.recordFix(NotCompileTimeConst::create(cs, paramTy, locator));
+        cs.recordFix(NotCompileTimeConst::create(cs, paramTy,
+          simplifyLocator(cs, locator, range)));
       }
 
       cs.addConstraint(
@@ -4258,6 +4304,12 @@ static bool repairOutOfOrderArgumentsInBinaryFunction(
 
   auto currArgIdx =
       locator->castLastElementTo<LocatorPathElt::ApplyArgToParam>().getArgIdx();
+
+  // Argument is extraneous and has been re-ordered to match one
+  // of two parameter types.
+  if (currArgIdx >= 2)
+    return false;
+
   auto otherArgIdx = currArgIdx == 0 ? 1 : 0;
 
   auto argType = cs.getType(argument);
@@ -4825,6 +4877,27 @@ bool ConstraintSystem::repairFailures(
 
   case ConstraintLocator::ApplyArgToParam: {
     auto loc = getConstraintLocator(locator);
+
+    // If this type mismatch is associated with a synthesized argument,
+    // let's just ignore it because the main problem is the absence of
+    // the argument.
+    if (auto applyLoc = elt.getAs<LocatorPathElt::ApplyArgToParam>()) {
+      if (auto *argumentList = getArgumentList(loc)) {
+        // This is either synthesized argument or a default value.
+        if (applyLoc->getArgIdx() >= argumentList->size()) {
+          auto *calleeLoc = getCalleeLocator(loc);
+          auto overload = findSelectedOverloadFor(calleeLoc);
+          // If this cannot be a default value matching, let's ignore.
+          if (!(overload && overload->choice.isDecl()))
+            return true;
+
+          if (!getParameterList(overload->choice.getDecl())
+                   ->get(applyLoc->getParamIdx())
+                   ->getTypeOfDefaultExpr())
+            return true;
+        }
+      }
+    }
 
     // Don't attempt to fix an argument being passed to a
     // _OptionalNilComparisonType parameter. Such an overload should only take
@@ -7433,13 +7506,20 @@ static ConstraintFix *maybeWarnAboutExtraneousCast(
   // we need to store the difference as a signed integer.
   int extraOptionals = fromOptionals.size() - toOptionals.size();
 
-  // "from" expression could be a type variable with value-to-optional
-  // restrictions that we have to account for optionality mismatch.
+  // "from" expression could be a type variable wrapped in an optional e.g.
+  // Optional<$T0>. So when that is the case we have to add this additional
+  // optionality levels to from type.
   const auto subExprType = cs.getType(castExpr->getSubExpr());
-  if (cs.hasConversionRestriction(fromType, subExprType,
-                                  ConversionRestrictionKind::ValueToOptional)) {
-    extraOptionals++;
-    origFromType = OptionalType::get(origFromType);
+  if (subExprType->getOptionalObjectType()) {
+    SmallVector<Type, 4> subExprOptionals;
+    const auto unwrappedSubExprType =
+        subExprType->lookThroughAllOptionalTypes(subExprOptionals);
+    if (unwrappedSubExprType->is<TypeVariableType>()) {
+      extraOptionals += subExprOptionals.size();
+      for (size_t i = 0; i != subExprOptionals.size(); ++i) {
+        origFromType = OptionalType::get(origFromType);
+      }
+    }
   }
 
   // Removing the optionality from to type when the force cast expr is an IUO.
@@ -8865,6 +8945,9 @@ static bool inferEnumMemberThroughTildeEqualsOperator(
 
   std::tie(matchVar, matchCall) = *tildeEqualsApplication;
 
+  cs.setType(matchVar, enumTy);
+  cs.setType(EP, enumTy);
+
   // result of ~= operator is always a `Bool`.
   auto target = SolutionApplicationTarget::forExprPattern(
       matchCall, DC, EP, ctx.getBoolDecl()->getDeclaredInterfaceType());
@@ -8893,7 +8976,6 @@ static bool inferEnumMemberThroughTildeEqualsOperator(
   // Store the $match variable and binary expression for solution application.
   EP->setMatchVar(matchVar);
   EP->setMatchExpr(matchCall);
-  EP->setType(enumTy);
 
   cs.setSolutionApplicationTarget(pattern, target);
 
@@ -9917,6 +9999,9 @@ bool ConstraintSystem::resolveClosure(TypeVariableType *typeVar,
     }
   }
 
+  SolutionApplicationTarget target(closure, contextualType);
+  setSolutionApplicationTarget(closure, target);
+
   // Generate constraints from the body of this closure.
   return !generateConstraints(closure);
 }
@@ -10771,8 +10856,12 @@ bool ConstraintSystem::simplifyAppliedOverloadsImpl(
   // Don't attempt to filter overloads when solving for code completion
   // because presence of code completion token means that any call
   // could be malformed e.g. missing arguments e.g. `foo([.#^MEMBER^#`
-  if (isForCodeCompletion())
-    return false;
+  if (isForCodeCompletion()) {
+    bool ArgContainsCCTypeVar = Type(argFnType).findIf(isCodeCompletionTypeVar);
+    if (ArgContainsCCTypeVar || isCodeCompletionTypeVar(fnTypeVar)) {
+      return false;
+    }
+  }
 
   if (shouldAttemptFixes()) {
     auto arguments = argFnType->getParams();
@@ -11314,7 +11403,8 @@ ConstraintSystem::simplifyApplicableFnConstraint(
     if (result2->hasTypeVariable() && !openedExistentials.empty()) {
       for (const auto &opened : openedExistentials) {
         result2 = typeEraseOpenedExistentialReference(
-            result2, opened.second->getExistentialType(), opened.first, DC);
+            result2, opened.second->getExistentialType(), opened.first,
+            TypePosition::Covariant);
       }
     }
 

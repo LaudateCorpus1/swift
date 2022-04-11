@@ -671,8 +671,15 @@ public:
   /// skipUntilDeclStmtRBrace - Skip to the next decl or '}'.
   void skipUntilDeclRBrace();
 
-  void skipUntilDeclStmtRBrace(tok T1);
-  void skipUntilDeclStmtRBrace(tok T1, tok T2);
+  template <typename ...T>
+  void skipUntilDeclStmtRBrace(T... K) {
+    while (Tok.isNot(K..., tok::eof, tok::r_brace, tok::pound_endif,
+                     tok::pound_else, tok::pound_elseif,
+                     tok::code_complete) &&
+           !isStartOfStmt() && !isStartOfSwiftDecl()) {
+      skipSingle();
+    }
+  }
 
   void skipUntilDeclRBrace(tok T1, tok T2);
   
@@ -895,6 +902,22 @@ public:
   /// close brace.
   SourceLoc getErrorOrMissingLoc() const;
 
+  enum class ParseListItemResult {
+    /// There are more list items to parse.
+    Continue,
+    /// The list ended inside a string literal interpolation context.
+    FinishedInStringInterpolation,
+    /// The list ended for another reason.
+    Finished,
+  };
+
+  /// Parses a single item from a comma separated list and updates `Status`.
+  ParseListItemResult
+  parseListItem(ParserStatus &Status, tok RightK, SourceLoc LeftLoc,
+                SourceLoc &RightLoc, bool AllowSepAfterLast,
+                SyntaxKind ElementKind,
+                llvm::function_ref<ParserStatus()> callback);
+
   /// Parse a comma separated list of some elements.
   ParserStatus parseList(tok RightK, SourceLoc LeftLoc, SourceLoc &RightLoc,
                          bool AllowSepAfterLast, Diag<> ErrorDiag,
@@ -1070,6 +1093,10 @@ public:
   ParserResult<TransposeAttr> parseTransposeAttribute(SourceLoc AtLoc,
                                                       SourceLoc Loc);
 
+  /// Parse the @_backDeploy attribute.
+  bool parseBackDeployAttribute(DeclAttributes &Attributes, StringRef AttrName,
+                                SourceLoc AtLoc, SourceLoc Loc);
+
   /// Parse a specific attribute.
   ParserStatus parseDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc,
                                   PatternBindingInitializer *&initContext,
@@ -1193,9 +1220,9 @@ public:
   parseAbstractFunctionBodyDelayed(AbstractFunctionDecl *AFD);
 
   ParserStatus parsePrimaryAssociatedTypes(
-      SmallVectorImpl<AssociatedTypeDecl *> &AssocTypes);
+      SmallVectorImpl<PrimaryAssociatedTypeName> &AssocTypeNames);
   ParserStatus parsePrimaryAssociatedTypeList(
-      SmallVectorImpl<AssociatedTypeDecl *> &AssocTypes);
+      SmallVectorImpl<PrimaryAssociatedTypeName> &AssocTypeNames);
   ParserResult<ProtocolDecl> parseDeclProtocol(ParseDeclOptions Flags,
                                                DeclAttributes &Attributes);
 

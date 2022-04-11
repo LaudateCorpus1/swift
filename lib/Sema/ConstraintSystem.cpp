@@ -1397,6 +1397,38 @@ AnyFunctionType *ConstraintSystem::adjustFunctionTypeForConcurrency(
       fnType, decl, dc, numApplies, isMainDispatchQueue, GetClosureType{*this});
 }
 
+/// For every parameter in \p type that has an error type, replace that
+/// parameter's type by a placeholder type, where \p value is the declaration
+/// that declared \p type. This is useful for code completion so we can match
+/// the types we do know instead of bailing out completely because \p type
+/// contains an error type.
+static Type replaceParamErrorTypeByPlaceholder(Type type, ValueDecl *value) {
+  if (!type->is<AnyFunctionType>() || !isa<AbstractFunctionDecl>(value)) {
+    return type;
+  }
+  auto funcType = type->castTo<AnyFunctionType>();
+  auto funcDecl = cast<AbstractFunctionDecl>(value);
+
+  auto declParams = funcDecl->getParameters();
+  auto typeParams = funcType->getParams();
+  assert(declParams->size() == typeParams.size());
+  SmallVector<AnyFunctionType::Param, 4> newParams;
+  newParams.reserve(declParams->size());
+  for (auto i : indices(typeParams)) {
+    AnyFunctionType::Param param = typeParams[i];
+    if (param.getPlainType()->is<ErrorType>()) {
+      auto paramDecl = declParams->get(i);
+      auto placeholder =
+          PlaceholderType::get(paramDecl->getASTContext(), paramDecl);
+      newParams.push_back(param.withType(placeholder));
+    } else {
+      newParams.push_back(param);
+    }
+  }
+  assert(newParams.size() == declParams->size());
+  return FunctionType::get(newParams, funcType->getResult());
+}
+
 std::pair<Type, Type>
 ConstraintSystem::getTypeOfReference(ValueDecl *value,
                                      FunctionRefKind functionRefKind,
@@ -1457,6 +1489,12 @@ ConstraintSystem::getTypeOfReference(ValueDecl *value,
     openedType = unwrapPropertyWrapperParameterTypes(*this, funcDecl, functionRefKind,
                                                      openedType->getAs<FunctionType>(),
                                                      locator);
+
+    if (isForCodeCompletion() && openedType->hasError()) {
+      // In code completion, replace error types by placeholder types so we can
+      // match the types we know instead of bailing out completely.
+      openedType = replaceParamErrorTypeByPlaceholder(openedType, value);
+    }
 
     // If we opened up any type variables, record the replacements.
     recordOpenedTypes(locator, replacements);
@@ -1794,16 +1832,17 @@ static bool isMainDispatchQueueMember(ConstraintLocator *locator) {
 /// \note If a 'Self'-rooted type parameter is bound to a concrete type, this
 /// routine will recurse into the concrete type.
 static Type
-typeEraseCovariantExistentialSelfReferences(Type refTy, Type baseTy,
-                                            const DeclContext *useDC) {
+typeEraseExistentialSelfReferences(
+    Type refTy, Type baseTy,
+    TypePosition outermostPosition) {
   assert(baseTy->isExistentialType());
   if (!refTy->hasTypeParameter()) {
     return refTy;
   }
 
-  auto contextSig = useDC->getGenericSignatureOfContext();
   const auto existentialSig =
-      baseTy->getASTContext().getOpenedArchetypeSignature(baseTy, contextSig);
+      baseTy->getASTContext().getOpenedArchetypeSignature(baseTy,
+                                                          GenericSignature());
 
   unsigned metatypeDepth = 0;
 
@@ -1910,12 +1949,12 @@ typeEraseCovariantExistentialSelfReferences(Type refTy, Type baseTy,
     });
   };
 
-  return transformFn(refTy, TypePosition::Covariant);
+  return transformFn(refTy, outermostPosition);
 }
 
 Type constraints::typeEraseOpenedExistentialReference(
     Type type, Type existentialBaseType, TypeVariableType *openedTypeVar,
-    const DeclContext *useDC) {
+    TypePosition outermostPosition) {
   Type selfGP = GenericTypeParamType::get(false, 0, 0, type->getASTContext());
 
   // First, temporarily reconstitute the 'Self' generic parameter.
@@ -1932,8 +1971,8 @@ Type constraints::typeEraseOpenedExistentialReference(
   });
 
   // Then, type-erase occurrences of covariant 'Self'-rooted type parameters.
-  type = typeEraseCovariantExistentialSelfReferences(type, existentialBaseType,
-                                                     useDC);
+  type = typeEraseExistentialSelfReferences(type, existentialBaseType,
+                                            outermostPosition);
 
   // Finally, swap the 'Self'-corresponding type variable back in.
   return type.transformRec([&](TypeBase *t) -> Optional<Type> {
@@ -1947,38 +1986,6 @@ Type constraints::typeEraseOpenedExistentialReference(
     // Recurse.
     return None;
   });
-}
-
-/// For every parameter in \p type that has an error type, replace that
-/// parameter's type by a placeholder type, where \p value is the declaration
-/// that declared \p type. This is useful for code completion so we can match
-/// the types we do know instead of bailing out completely because \p type
-/// contains an error type.
-static Type replaceParamErrorTypeByPlaceholder(Type type, ValueDecl *value) {
-  if (!type->is<AnyFunctionType>() || !isa<AbstractFunctionDecl>(value)) {
-    return type;
-  }
-  auto funcType = type->castTo<AnyFunctionType>();
-  auto funcDecl = cast<AbstractFunctionDecl>(value);
-
-  auto declParams = funcDecl->getParameters();
-  auto typeParams = funcType->getParams();
-  assert(declParams->size() == typeParams.size());
-  SmallVector<AnyFunctionType::Param, 4> newParams;
-  newParams.reserve(declParams->size());
-  for (auto i : indices(typeParams)) {
-    AnyFunctionType::Param param = typeParams[i];
-    if (param.getPlainType()->is<ErrorType>()) {
-      auto paramDecl = declParams->get(i);
-      auto placeholder =
-          PlaceholderType::get(paramDecl->getASTContext(), paramDecl);
-      newParams.push_back(param.withType(placeholder));
-    } else {
-      newParams.push_back(param);
-    }
-  }
-  assert(newParams.size() == declParams->size());
-  return FunctionType::get(newParams, funcType->getResult());
 }
 
 std::pair<Type, Type>
@@ -2053,13 +2060,6 @@ ConstraintSystem::getTypeOfMemberReference(
 
   AnyFunctionType *funcType;
 
-  // Check if we need to apply a layer of optionality to the resulting type.
-  auto isReferenceOptional = false;
-  if (!isRequirementOrWitness(locator)) {
-    if (isDynamicResult || value->getAttrs().hasAttribute<OptionalAttr>())
-      isReferenceOptional = true;
-  }
-
   if (isa<AbstractFunctionDecl>(value) ||
       isa<EnumElementDecl>(value)) {
     if (auto ErrorTy = value->getInterfaceType()->getAs<ErrorType>()) {
@@ -2087,12 +2087,6 @@ ConstraintSystem::getTypeOfMemberReference(
 
       if (doesStorageProduceLValue(subscript, baseTy, useDC, locator))
         elementTy = LValueType::get(elementTy);
-
-      // Optional and dynamic subscripts are a special case, because the
-      // optionality is applied to the result type and not the type of the
-      // reference.
-      if (isReferenceOptional)
-        elementTy = OptionalType::get(elementTy->getRValueType());
 
       auto indices = subscript->getInterfaceType()
                               ->castTo<AnyFunctionType>()->getParams();
@@ -2238,6 +2232,38 @@ ConstraintSystem::getTypeOfMemberReference(
     }
   }
 
+  // Check if we need to apply a layer of optionality to the uncurried type.
+  if (!isRequirementOrWitness(locator)) {
+    if (isDynamicResult || value->getAttrs().hasAttribute<OptionalAttr>()) {
+      const auto applyOptionality = [&](FunctionType *fnTy) -> Type {
+        Type resultTy;
+        // Optional and dynamic subscripts are a special case, because the
+        // optionality is applied to the result type and not the type of the
+        // reference.
+        if (isa<SubscriptDecl>(value)) {
+          auto *innerFn = fnTy->getResult()->castTo<FunctionType>();
+          resultTy = FunctionType::get(
+              innerFn->getParams(),
+              OptionalType::get(innerFn->getResult()->getRValueType()),
+              innerFn->getExtInfo());
+        } else {
+          resultTy = OptionalType::get(fnTy->getResult()->getRValueType());
+        }
+
+        return FunctionType::get(fnTy->getParams(), resultTy,
+                                 fnTy->getExtInfo());
+      };
+
+      // FIXME: Refactor 'replaceCovariantResultType' not to rely on the passed
+      // uncurry level.
+      //
+      // This is done after handling dynamic 'Self' to make
+      // 'replaceCovariantResultType' work, so we have to transform both types.
+      openedType = applyOptionality(openedType->castTo<FunctionType>());
+      type = applyOptionality(type->castTo<FunctionType>());
+    }
+  }
+
   if (hasAppliedSelf) {
     // For a static member referenced through a metatype or an instance
     // member referenced through an instance, strip off the 'self'.
@@ -2259,8 +2285,8 @@ ConstraintSystem::getTypeOfMemberReference(
     const auto selfGP = cast<GenericTypeParamType>(
         outerDC->getSelfInterfaceType()->getCanonicalType());
     auto openedTypeVar = replacements.lookup(selfGP);
-    type =
-        typeEraseOpenedExistentialReference(type, baseObjTy, openedTypeVar, DC);
+    type = typeEraseOpenedExistentialReference(type, baseObjTy, openedTypeVar,
+                                               TypePosition::Covariant);
   }
 
   // Construct an idealized parameter type of the initializer associated
@@ -2290,10 +2316,6 @@ ConstraintSystem::getTypeOfMemberReference(
           FunctionType::get(params, fnType->getResult(), fnType->getExtInfo());
     }
   }
-
-  // If we need to wrap the type in an optional, do so now.
-  if (isReferenceOptional && !isa<SubscriptDecl>(value))
-    type = OptionalType::get(type->getRValueType());
 
   if (isForCodeCompletion() && type->hasError()) {
     // In code completion, replace error types by placeholder types so we can
@@ -2440,9 +2462,14 @@ Type ConstraintSystem::getEffectiveOverloadType(ConstraintLocator *locator,
         }
       }
 
+      auto hasAppliedSelf =
+          doesMemberRefApplyCurriedSelf(overload.getBaseType(), decl);
+      unsigned numApplies = getNumApplications(
+          decl, hasAppliedSelf, overload.getFunctionRefKind());
+
       type = adjustFunctionTypeForConcurrency(
           type->castTo<FunctionType>(),
-          subscript, useDC, /*numApplies=*/2, /*isMainDispatchQueue=*/false)
+          decl, useDC, numApplies, /*isMainDispatchQueue=*/false)
         ->getResult();
     }
   }
@@ -2873,6 +2900,11 @@ bool ConstraintSystem::isAsynchronousContext(DeclContext *dc) {
         FunctionType::ExtInfo()).isAsync();
   }
 
+  if (Options.contains(
+          ConstraintSystemFlags::ConsiderNominalTypeContextsAsync) &&
+      isa<NominalTypeDecl>(dc))
+    return true;
+
   return false;
 }
 
@@ -2996,6 +3028,14 @@ void ConstraintSystem::bindOverloadType(
     // Subscripts have optionality applied to their result type rather than
     // the type of their reference, so there's nothing to adjust here.
     if (isa<SubscriptDecl>(choice.getDecl())) {
+      bindTypeOrIUO(openedType);
+      return;
+    }
+
+    // The opened type of an unbound member reference has optionality applied
+    // to the uncurried type.
+    if (!doesMemberRefApplyCurriedSelf(choice.getBaseType(),
+                                       choice.getDecl())) {
       bindTypeOrIUO(openedType);
       return;
     }
@@ -3492,6 +3532,48 @@ Type Solution::simplifyType(Type type) const {
   }
 
   return resolvedType;
+}
+
+Type Solution::simplifyTypeForCodeCompletion(Type Ty) const {
+  auto &CS = getConstraintSystem();
+
+  // First, instantiate all type variables that we know, but don't replace
+  // placeholders by unresolved types.
+  Ty = CS.simplifyTypeImpl(Ty, [this](TypeVariableType *typeVar) -> Type {
+    return getFixedType(typeVar);
+  });
+
+  // Next, replace all placeholders by type variables. We know that all type
+  // variables now in the type originate from placeholders.
+  Ty = Ty.transform([](Type type) -> Type {
+    if (auto *placeholder = type->getAs<PlaceholderType>()) {
+      if (auto *typeVar =
+              placeholder->getOriginator().dyn_cast<TypeVariableType *>()) {
+        return typeVar;
+      }
+    }
+
+    return type;
+  });
+
+  // Replace all type variables (which must come from placeholders) by their
+  // generic parameters. Because we call into simplifyTypeImpl
+  Ty = CS.simplifyTypeImpl(Ty, [](TypeVariableType *typeVar) -> Type {
+    if (auto *GP = typeVar->getImpl().getGenericParameter()) {
+      // Code completion depends on generic parameter type being
+      // represented in terms of `ArchetypeType` since it's easy
+      // to extract protocol requirements from it.
+      if (auto *GPD = GP->getDecl()) {
+        return GPD->getInnermostDeclContext()->mapTypeIntoContext(GP);
+      }
+    }
+    return typeVar;
+  });
+
+  // Remove any remaining type variables and placeholders
+  Ty = simplifyType(Ty);
+
+  return Ty->getRValueType();
 }
 
 size_t Solution::getTotalMemory() const {
@@ -4557,7 +4639,7 @@ bool ConstraintSystem::diagnoseAmbiguity(ArrayRef<Solution> solutions) {
     auto &overload = diff.overloads[i];
     auto *locator = overload.locator;
 
-    Expr *anchor = nullptr;
+    ASTNode anchor;
 
     // Simplification of member locator would produce a base expression,
     // this is what we want for diagnostics but not for comparisons here
@@ -4567,25 +4649,33 @@ bool ConstraintSystem::diagnoseAmbiguity(ArrayRef<Solution> solutions) {
     // than simplification of `count` would produce `[x]` which is incorrect.
     if (locator->isLastElement<LocatorPathElt::Member>() ||
         locator->isLastElement<LocatorPathElt::ConstructorMember>()) {
-      anchor = getAsExpr(locator->getAnchor());
+      anchor = locator->getAnchor();
     } else {
-      anchor = getAsExpr(simplifyLocatorToAnchor(overload.locator));
+      anchor = simplifyLocatorToAnchor(overload.locator);
     }
 
-    // If we can't resolve the locator to an anchor expression with no path,
+    // If we can't resolve the locator to an anchor with no path,
     // we can't diagnose this well.
     if (!anchor)
       continue;
 
-    auto it = indexMap.find(anchor);
-    if (it == indexMap.end())
-      continue;
-    unsigned index = it->second;
+    // Index and Depth is only applicable to expressions.
+    unsigned index = 0;
+    unsigned depth = 0;
 
-    auto optDepth = getExprDepth(anchor);
-    if (!optDepth)
-      continue;
-    unsigned depth = *optDepth;
+    if (auto *expr = getAsExpr(anchor)) {
+      auto it = indexMap.find(expr);
+      if (it == indexMap.end())
+        continue;
+
+      index = it->second;
+
+      auto optDepth = getExprDepth(expr);
+      if (!optDepth)
+        continue;
+
+      depth = *optDepth;
+    }
 
     // If we don't have a name to hang on to, it'll be hard to diagnose this
     // overload.
@@ -6431,6 +6521,51 @@ bool ConstraintSystem::isReadOnlyKeyPathComponent(
     if (maybeUnavail.hasValue()) {
       return true;
     }
+  }
+
+  return false;
+}
+
+bool ConstraintSystem::isArgumentGenericFunction(Type argType, Expr *argExpr) {
+  // Only makes sense if the argument type involves type variables somehow.
+  if (!argType->hasTypeVariable())
+    return false;
+
+  // Have we bound an overload for the argument already?
+  if (argExpr) {
+    auto locator = getConstraintLocator(argExpr);
+    auto knownOverloadBinding = ResolvedOverloads.find(locator);
+    if (knownOverloadBinding != ResolvedOverloads.end()) {
+      // If the overload choice is a generic function, then we have a generic
+      // function reference.
+      auto choice = knownOverloadBinding->second;
+      if (auto func = dyn_cast_or_null<AbstractFunctionDecl>(
+              choice.choice.getDeclOrNull())) {
+        if (func->isGeneric())
+          return true;
+      }
+
+      return false;
+    }
+  }
+
+  // We might have a type variable referring to an overload set.
+  auto argTypeVar = argType->getAs<TypeVariableType>();
+  if (!argTypeVar)
+    return false;
+
+  auto disjunction = getUnboundBindOverloadDisjunction(argTypeVar);
+  if (!disjunction)
+    return false;
+
+  for (auto constraint : disjunction->getNestedConstraints()) {
+    auto *decl = constraint->getOverloadChoice().getDeclOrNull();
+    if (!decl)
+      continue;
+
+    if (auto func = dyn_cast<AbstractFunctionDecl>(decl))
+      if (func->isGeneric())
+        return true;
   }
 
   return false;

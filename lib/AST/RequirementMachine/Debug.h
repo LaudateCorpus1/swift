@@ -69,6 +69,12 @@ enum class DebugFlags : unsigned {
   /// Print debug output from propagating explicit requirement
   /// IDs from redundant rules.
   PropagateRequirementIDs = (1<<15),
+
+  /// Print a trace of requirement machines constructed and how long each took.
+  Timers = (1<<16),
+
+  /// Print conflicting rules.
+  ConflictingRules = (1<<17),
 };
 
 using DebugOptions = OptionSet<DebugFlags>;

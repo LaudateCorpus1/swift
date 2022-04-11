@@ -726,6 +726,24 @@ void SILPassManager::runModulePass(unsigned TransIdx) {
   }
 }
 
+void SILPassManager::verifyAnalyses() const {
+  if (Mod->getOptions().VerifyNone)
+    return;
+
+  for (auto *A : Analyses) {
+    A->verify();
+  }
+}
+
+void SILPassManager::verifyAnalyses(SILFunction *F) const {
+  if (Mod->getOptions().VerifyNone)
+    return;
+    
+  for (auto *A : Analyses) {
+    A->verify(F);
+  }
+}
+
 void SILPassManager::executePassPipelinePlan(const SILPassPipelinePlan &Plan) {
   for (const SILPassPipeline &Pipeline : Plan.getPipelines()) {
     setStageName(Pipeline.Name);
@@ -1371,19 +1389,6 @@ BridgedFunction BasicBlockSet_getFunction(BridgedBasicBlockSet set) {
 
 void AllocRefInstBase_setIsStackAllocatable(BridgedInstruction arb) {
   castToInst<AllocRefInstBase>(arb)->setStackAllocatable();
-}
-
-OptionalBridgedFunction PassContext_getDestructor(BridgedPassContext context,
-                                                  BridgedType type) {
-  auto *cd = castToSILType(type).getClassOrBoundGenericClass();
-  assert(cd && "no class type allocated with alloc_ref");
-
-  auto *pm = castToPassInvocation(context)->getPassManager();
-  // Find the destructor of the type.
-  auto *destructor = cd->getDestructor();
-  SILDeclRef deallocRef(destructor, SILDeclRef::Kind::Deallocator);
-
-  return {pm->getModule()->lookUpFunction(deallocRef)};
 }
 
 BridgedSubstitutionMap

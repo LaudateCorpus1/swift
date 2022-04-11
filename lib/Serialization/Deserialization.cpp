@@ -1891,7 +1891,7 @@ giveUpFastPath:
       XRefExtensionPathPieceLayout::readRecord(scratch, ownerID, rawGenericSig);
       M = getModule(ownerID);
       if (!M) {
-        return llvm::make_error<XRefError>("module is not loaded",
+        return llvm::make_error<XRefError>("module with extension is not loaded",
                                            pathTrace, getIdentifier(ownerID));
       }
       pathTrace.addExtension(M);
@@ -2777,13 +2777,11 @@ public:
     TypeID defaultDefinitionID;
     bool isImplicit;
     ArrayRef<uint64_t> rawOverriddenIDs;
-    bool isPrimary;
 
     decls_block::AssociatedTypeDeclLayout::readRecord(scratch, nameID,
                                                       contextID,
                                                       defaultDefinitionID,
                                                       isImplicit,
-                                                      isPrimary,
                                                       rawOverriddenIDs);
 
     auto DC = MF.getDeclContext(contextID);
@@ -2817,9 +2815,6 @@ public:
       }
     }
     assocType->setOverriddenDecls(overriddenAssocTypes);
-
-    if (isPrimary)
-      assocType->setPrimary();
 
     return assocType;
   }
@@ -3522,7 +3517,50 @@ public:
                                        StringRef blobData) {
     return deserializeAnyFunc(scratch, blobData, /*isAccessor*/true);
   }
-      
+
+  void deserializeConditionalSubstitutions(
+      SmallVectorImpl<OpaqueTypeDecl::ConditionallyAvailableSubstitutions *>
+          &limitedAvailability) {
+    SmallVector<uint64_t, 4> scratch;
+    StringRef blobData;
+
+    while (true) {
+      llvm::BitstreamEntry entry =
+          MF.fatalIfUnexpected(MF.DeclTypeCursor.advance(AF_DontPopBlockAtEnd));
+      if (entry.Kind != llvm::BitstreamEntry::Record)
+        break;
+
+      scratch.clear();
+      unsigned recordID = MF.fatalIfUnexpected(
+          MF.DeclTypeCursor.readRecord(entry.ID, scratch, &blobData));
+      if (recordID != decls_block::CONDITIONAL_SUBSTITUTION)
+        break;
+
+      ArrayRef<uint64_t> rawConditions;
+      SubstitutionMapID substitutionMapRef;
+
+      decls_block::ConditionalSubstitutionLayout::readRecord(
+          scratch, substitutionMapRef, rawConditions);
+
+      SmallVector<VersionRange, 4> conditions;
+      llvm::transform(rawConditions, std::back_inserter(conditions),
+                      [&](uint64_t id) {
+                        llvm::VersionTuple lowerEndpoint;
+                        if (lowerEndpoint.tryParse(MF.getIdentifier(id).str()))
+                          MF.fatal();
+                        return VersionRange::allGTE(lowerEndpoint);
+                      });
+
+      auto subMapOrError = MF.getSubstitutionMapChecked(substitutionMapRef);
+      if (!subMapOrError)
+        MF.fatal();
+
+      limitedAvailability.push_back(
+          OpaqueTypeDecl::ConditionallyAvailableSubstitutions::get(
+              ctx, conditions, subMapOrError.get()));
+    }
+  }
+
   Expected<Decl *> deserializeOpaqueType(ArrayRef<uint64_t> scratch,
                                          StringRef blobData) {
     DeclID namingDeclID;
@@ -3567,11 +3605,30 @@ public:
     auto genericSig = MF.getGenericSignature(genericSigID);
     if (genericSig)
       opaqueDecl->setGenericSignature(genericSig);
+    else
+      opaqueDecl->setGenericSignature(GenericSignature());
     if (underlyingTypeSubsID) {
       auto subMapOrError = MF.getSubstitutionMapChecked(underlyingTypeSubsID);
       if (!subMapOrError)
         return subMapOrError.takeError();
-      opaqueDecl->setUnderlyingTypeSubstitutions(subMapOrError.get());
+
+      // Check whether there are any conditionally available substitutions.
+      // If there are, it means that "unique" we just read is a universally
+      // available substitution.
+      SmallVector<OpaqueTypeDecl::ConditionallyAvailableSubstitutions *>
+          limitedAvailability;
+
+      deserializeConditionalSubstitutions(limitedAvailability);
+
+      if (limitedAvailability.empty()) {
+        opaqueDecl->setUniqueUnderlyingTypeSubstitutions(subMapOrError.get());
+      } else {
+        limitedAvailability.push_back(
+            OpaqueTypeDecl::ConditionallyAvailableSubstitutions::get(
+                ctx, VersionRange::empty(), subMapOrError.get()));
+
+        opaqueDecl->setConditionallyAvailableSubstitutions(limitedAvailability);
+      }
     }
     return opaqueDecl;
   }
@@ -3664,8 +3721,10 @@ public:
     if (declOrOffset.isComplete())
       return declOrOffset;
 
-    auto proto = MF.createDecl<ProtocolDecl>(DC, SourceLoc(), SourceLoc(), name,
-                                             None, /*TrailingWhere=*/nullptr);
+    auto proto = MF.createDecl<ProtocolDecl>(
+        DC, SourceLoc(), SourceLoc(), name,
+        ArrayRef<PrimaryAssociatedTypeName>(), None,
+        /*TrailingWhere=*/nullptr);
     declOrOffset = proto;
 
     ctx.evaluator.cacheOutput(ProtocolRequiresClassRequest{proto},
@@ -4361,6 +4420,7 @@ DeclDeserializer::readAvailable_DECL_ATTR(SmallVectorImpl<uint64_t> &scratch,
   bool isImplicit;
   bool isUnavailable;
   bool isDeprecated;
+  bool isNoAsync;
   bool isPackageDescriptionVersionSpecific;
   bool isSPI;
   DEF_VER_TUPLE_PIECES(Introduced);
@@ -4371,7 +4431,7 @@ DeclDeserializer::readAvailable_DECL_ATTR(SmallVectorImpl<uint64_t> &scratch,
 
   // Decode the record, pulling the version tuple information.
   serialization::decls_block::AvailableDeclAttrLayout::readRecord(
-      scratch, isImplicit, isUnavailable, isDeprecated,
+      scratch, isImplicit, isUnavailable, isDeprecated, isNoAsync,
       isPackageDescriptionVersionSpecific, isSPI, LIST_VER_TUPLE_PIECES(Introduced),
       LIST_VER_TUPLE_PIECES(Deprecated), LIST_VER_TUPLE_PIECES(Obsoleted),
       platform, renameDeclID, messageSize, renameSize);
@@ -4394,6 +4454,8 @@ DeclDeserializer::readAvailable_DECL_ATTR(SmallVectorImpl<uint64_t> &scratch,
     platformAgnostic = PlatformAgnosticAvailabilityKind::Unavailable;
   else if (isDeprecated)
     platformAgnostic = PlatformAgnosticAvailabilityKind::Deprecated;
+  else if (isNoAsync)
+    platformAgnostic = PlatformAgnosticAvailabilityKind::NoAsync;
   else if (((PlatformKind)platform) == PlatformKind::none &&
            (!Introduced.empty() || !Deprecated.empty() || !Obsoleted.empty()))
     platformAgnostic =

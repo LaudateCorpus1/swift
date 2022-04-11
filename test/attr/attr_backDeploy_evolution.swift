@@ -30,10 +30,7 @@
 //
 
 // REQUIRES: executable_test
-// REQUIRES: VENDOR=apple
-
-// rdar://90525337
-// UNSUPPORTED: swift_test_mode_optimize
+// REQUIRES: OS=macosx
 
 // ---- (0) Prepare SDK
 // RUN: %empty-directory(%t)
@@ -45,21 +42,21 @@
 // RUN: %target-build-swift-dylib(%t/SDK_ABI/Frameworks/BackDeployHelper.framework/BackDeployHelper) \
 // RUN:   -emit-module-path %t/SDK_ABI/Frameworks/BackDeployHelper.framework/Modules/BackDeployHelper.swiftmodule/%module-target-triple.swiftmodule \
 // RUN:   -module-name BackDeployHelper -emit-module %S/Inputs/BackDeployHelper.swift \
-// RUN:   -Xfrontend -target -Xfrontend %target-next-stable-abi-triple \
+// RUN:   -target %target-cpu-apple-macosx10.15 \
 // RUN:   -Xfrontend -define-availability \
-// RUN:     -Xfrontend 'BackDeploy 1.0:macOS 10.14.3, iOS 12.1, tvOS 12.1, watchOS 5.1' \
+// RUN:     -Xfrontend 'BackDeploy 1.0:macOS 10.14.3' \
 // RUN:   -Xfrontend -define-availability \
-// RUN:     -Xfrontend 'BackDeploy 2.0:macOS 10.15, iOS 13, tvOS 13, watchOS 6' \
+// RUN:     -Xfrontend 'BackDeploy 2.0:macOS 10.15' \
 // RUN:   -Xlinker -install_name -Xlinker @rpath/BackDeployHelper.framework/BackDeployHelper \
 // RUN:   -enable-library-evolution
 
 // ---- (2) Build executable
 // RUN: %target-build-swift -emit-executable %s -g -o %t/test_ABI \
-// RUN:   -Xfrontend -target -Xfrontend %target-pre-stable-abi-triple \
+// RUN:   -target %target-cpu-apple-macosx10.14.3 \
 // RUN:   -Xfrontend -define-availability \
-// RUN:     -Xfrontend 'BackDeploy 1.0:macOS 10.14.3, iOS 12.1, tvOS 12.1, watchOS 5.1' \
+// RUN:     -Xfrontend 'BackDeploy 1.0:macOS 10.14.3' \
 // RUN:   -Xfrontend -define-availability \
-// RUN:     -Xfrontend 'BackDeploy 2.0:macOS 10.15, iOS 13, tvOS 13, watchOS 6' \
+// RUN:     -Xfrontend 'BackDeploy 2.0:macOS 10.15' \
 // RUN:   -F %t/SDK_ABI/Frameworks/ -framework BackDeployHelper \
 // RUN:   %target-rpath(@executable_path/SDK_ABI/Frameworks)
 
@@ -72,21 +69,21 @@
 // RUN: %target-build-swift-dylib(%t/SDK_BD/Frameworks/BackDeployHelper.framework/BackDeployHelper) \
 // RUN:   -emit-module-path %t/SDK_BD/Frameworks/BackDeployHelper.framework/Modules/BackDeployHelper.swiftmodule/%module-target-triple.swiftmodule \
 // RUN:   -module-name BackDeployHelper -emit-module %S/Inputs/BackDeployHelper.swift \
-// RUN:   -Xfrontend -target -Xfrontend %target-next-stable-abi-triple \
+// RUN:   -target %target-cpu-apple-macosx10.15 \
 // RUN:   -Xfrontend -define-availability \
-// RUN:     -Xfrontend 'BackDeploy 1.0:macOS 10.14.3, iOS 12.1, tvOS 12.1, watchOS 5.1' \
+// RUN:     -Xfrontend 'BackDeploy 1.0:macOS 10.14.3' \
 // RUN:   -Xfrontend -define-availability \
-// RUN:     -Xfrontend 'BackDeploy 2.0:macOS 999.0, iOS 999.0, watchOS 999.0, tvOS 999.0' \
+// RUN:     -Xfrontend 'BackDeploy 2.0:macOS 999.0' \
 // RUN:   -Xlinker -install_name -Xlinker @rpath/BackDeployHelper.framework/BackDeployHelper \
 // RUN:   -enable-library-evolution
 
 // ---- (5) Build executable
 // RUN: %target-build-swift -emit-executable %s -g -o %t/test_BD \
-// RUN:   -Xfrontend -target -Xfrontend %target-next-stable-abi-triple \
+// RUN:   -target %target-cpu-apple-macosx10.14.3 \
 // RUN:   -Xfrontend -define-availability \
-// RUN:     -Xfrontend 'BackDeploy 1.0:macOS 10.14.3, iOS 12.1, tvOS 12.1, watchOS 5.1' \
+// RUN:     -Xfrontend 'BackDeploy 1.0:macOS 10.14.3' \
 // RUN:   -Xfrontend -define-availability \
-// RUN:     -Xfrontend 'BackDeploy 2.0:macOS 999.0, iOS 999.0, watchOS 999.0, tvOS 999.0' \
+// RUN:     -Xfrontend 'BackDeploy 2.0:macOS 999.0' \
 // RUN:   -F %t/SDK_BD/Frameworks/ -framework BackDeployHelper \
 // RUN:   %target-rpath(@executable_path/SDK_BD/Frameworks)
 
@@ -99,11 +96,11 @@
 // RUN: %target-build-swift-dylib(%t/SDK_BD/Frameworks/BackDeployHelper.framework/BackDeployHelper) \
 // RUN:   -emit-module-path %t/SDK_BD/Frameworks/BackDeployHelper.framework/Modules/BackDeployHelper.swiftmodule/%module-target-triple.swiftmodule \
 // RUN:   -module-name BackDeployHelper -emit-module %S/Inputs/BackDeployHelper.swift \
-// RUN:   -Xfrontend -target -Xfrontend %target-next-stable-abi-triple \
+// RUN:   -target %target-cpu-apple-macosx10.15 \
 // RUN:   -Xfrontend -define-availability \
-// RUN:     -Xfrontend 'BackDeploy 1.0:macOS 10.14.3, iOS 12.1, tvOS 12.1, watchOS 5.1' \
+// RUN:     -Xfrontend 'BackDeploy 1.0:macOS 10.14.3' \
 // RUN:   -Xfrontend -define-availability \
-// RUN:     -Xfrontend 'BackDeploy 2.0:macOS 999.0, iOS 999.0, watchOS 999.0, tvOS 999.0' \
+// RUN:     -Xfrontend 'BackDeploy 2.0:macOS 999.0' \
 // RUN:   -Xlinker -install_name -Xlinker @rpath/BackDeployHelper.framework/BackDeployHelper \
 // RUN:   -enable-library-evolution -DSTRIP_V2_APIS
 
@@ -119,75 +116,67 @@ testPrint(handle: #dsohandle, "check")
 testPrint(handle: libraryHandle(), "check")
 
 if isV2OrLater() {
-  assert(!v2APIsAreStripped())
+  precondition(!v2APIsAreStripped())
 }
 
 // CHECK-ABI: library: trivial
 // CHECK-BD: client: trivial
 trivial()
 
-assert(try! pleaseThrow(false))
+precondition(try! pleaseThrow(false))
 do {
   _ = try pleaseThrow(true)
   fatalError("Should have thrown")
 } catch {
-  assert(error as? BadError == BadError.bad)
+  precondition(error as? BadError == BadError.bad)
 }
 
 do {
-  let zero = MutableInt.zero
-  assert(zero.value == 0)
+  let empty = IntArray.empty
+  precondition(empty.values == [])
 
-  var int = MutableInt(5)
+  var array = IntArray([5])
 
-  // CHECK-ABI: library: 5
-  // CHECK-BD: client: 5
-  int.print()
+  // CHECK-ABI: library: [5]
+  // CHECK-BD: client: [5]
+  array.print()
 
-  assert(int.increment(by: 2) == 7)
-  assert(genericIncrement(&int, by: 3) == 10)
-  assert(int.decrement(by: 1) == 9)
+  array.append(42)
+  genericAppend(&array, 3)
+  let countable = array.toCountable()
+  precondition(existentialCount(countable) == 3)
+  array[1] += 1
+  precondition(array[1] == 43)
 
-  var incrementable: any Incrementable = int.toIncrementable()
-
-  // CHECK-ABI: library: 10
-  // CHECK-BD: client: 10
-  existentialIncrementByOne(&incrementable)
-
-  let int2 = MutableInt(0x7BB7914B)
-  for (i, expectedByte) in [0x4B, 0x91, 0xB7, 0x7B].enumerated() {
-    assert(int2[byteAt: i] == expectedByte)
-  }
+  // CHECK-ABI: library: [5, 43, 3]
+  // CHECK-BD: client: [5, 43, 3]
+  array.print()
 }
 
 do {
-  let zero = ReferenceInt.zero
-  assert(zero.value == 0)
+  let empty = ReferenceIntArray.empty
+  precondition(empty.values == [])
 
-  var int = ReferenceInt(42)
+  var array = ReferenceIntArray([7])
 
-  // CHECK-ABI: library: 42
-  // CHECK-BD: client: 42
-  int.print()
+  // CHECK-ABI: library: [7]
+  // CHECK-BD: client: [7]
+  array.print()
 
   do {
-    let copy = int.copy()
-    assert(int !== copy)
-    assert(copy.value == 42)
+    let copy = array.copy()
+    precondition(array !== copy)
+    precondition(copy.values == [7])
   }
 
-  assert(int.increment(by: 2) == 44)
-  assert(genericIncrement(&int, by: 3) == 47)
-  assert(int.decrement(by: 46) == 1)
+  array.append(39)
+  genericAppend(&array, 1)
+  let countable = array.toCountable()
+  precondition(existentialCount(countable) == 3)
+  array[1] += 1
+  precondition(array[1] == 40)
 
-  var incrementable: any Incrementable = int.toIncrementable()
-
-  // CHECK-ABI: library: 2
-  // CHECK-BD: client: 2
-  existentialIncrementByOne(&incrementable)
-
-  let int2 = MutableInt(0x08AFAB76)
-  for (i, expectedByte) in [0x76, 0xAB, 0xAF, 0x08].enumerated() {
-    assert(int2[byteAt: i] == expectedByte)
-  }
+  // CHECK-ABI: library: [7, 40, 1]
+  // CHECK-BD: client: [7, 40, 1]
+  array.print()
 }

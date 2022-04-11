@@ -1381,8 +1381,7 @@ struct RequirementPrintLocation {
 /// function does: asking "where should this requirement be printed?" and then
 /// callers check if the location is the ATD.
 static RequirementPrintLocation
-bestRequirementPrintLocation(ProtocolDecl *proto, const Requirement &req,
-                             PrintOptions opts, bool inheritanceClause) {
+bestRequirementPrintLocation(ProtocolDecl *proto, const Requirement &req) {
   auto protoSelf = proto->getProtocolSelfType();
   // Returns the most relevant decl within proto connected to outerType (or null
   // if one doesn't exist), and whether the type is an "direct use",
@@ -1414,16 +1413,6 @@ bestRequirementPrintLocation(ProtocolDecl *proto, const Requirement &req,
     // If we didn't find anything, relevantDecl and foundType will be null, as
     // desired.
     auto directUse = foundType && outerType->isEqual(foundType);
-
-    // Prefer to attach requirements to associated type declarations,
-    // unless the associated type is a primary associated type and
-    // we're printing primary associated types using the new syntax.
-    if (!directUse &&
-        relevantDecl &&
-        opts.PrintPrimaryAssociatedTypes &&
-        isa<AssociatedTypeDecl>(relevantDecl) &&
-        cast<AssociatedTypeDecl>(relevantDecl)->isPrimary())
-      relevantDecl = proto;
 
     return std::make_pair(relevantDecl, directUse);
   };
@@ -1495,8 +1484,7 @@ void PrintAST::printInheritedFromRequirementSignature(ProtocolDecl *proto,
           return false;
         }
 
-        auto location = bestRequirementPrintLocation(proto, req, Options,
-                                                     /*inheritanceClause=*/true);
+        auto location = bestRequirementPrintLocation(proto, req);
         return location.AttachedTo == attachingTo && !location.InWhereClause;
       });
 }
@@ -1511,8 +1499,7 @@ void PrintAST::printWhereClauseFromRequirementSignature(ProtocolDecl *proto,
                             proto->getRequirementSignature().getRequirements()),
       flags,
       [&](const Requirement &req) {
-        auto location = bestRequirementPrintLocation(proto, req, Options,
-                                                     /*inheritanceClause=*/false);
+        auto location = bestRequirementPrintLocation(proto, req);
         return location.AttachedTo == attachingTo && location.InWhereClause;
       });
 }
@@ -2601,12 +2588,12 @@ void PrintAST::printSynthesizedExtensionImpl(Type ExtendedType,
     //   protocol Foo {}
     //   extension Foo where <requirments from ExtDecl> { ... }
     //   struct Bar {}
-    //   extension Bar: Foo where <requirments from TransformContext> { ... }
+    //   extension Bar: Foo where <requirements from TransformContext> { ... }
     //
     // should produce a synthesized extension of Bar with both sets of
-    // requirments:
+    // requirements:
     //
-    //   extension Bar where <requirments from ExtDecl+TransformContext { ... }
+    //   extension Bar where <requirements from ExtDecl+TransformContext> { ... }
     //
     if (!printCombinedRequirementsIfNeeded())
       printDeclGenericRequirements(ExtDecl);
@@ -3015,6 +3002,18 @@ suppressingFeatureUnavailableFromAsync(PrintOptions &options,
   options.ExcludeAttrList.resize(originalExcludeAttrCount);
 }
 
+static bool usesFeatureNoAsyncAvailability(Decl *decl) {
+   return decl->getAttrs().getNoAsync(decl->getASTContext()) != nullptr;
+}
+
+static void
+suppressingFeatureNoAsyncAvailability(PrintOptions &options,
+                                      llvm::function_ref<void()> action) {
+  llvm::SaveAndRestore<PrintOptions> orignalOptions(options);
+  options.SuppressNoAsyncAvailabilityAttr = true;
+  action();
+}
+
 /// Suppress the printing of a particular feature.
 static void suppressingFeature(PrintOptions &options, Feature feature,
                                llvm::function_ref<void()> action) {
@@ -3209,7 +3208,7 @@ static void printWithSuppressibleFeatureChecks(ASTPrinter &printer,
 ///   #endif
 ///   #endif
 /// ```
-bool swift::printWithCompatibilityFeatureChecks(ASTPrinter &printer,
+void swift::printWithCompatibilityFeatureChecks(ASTPrinter &printer,
                                                 PrintOptions &options,
                                                 Decl *decl,
                                  llvm::function_ref<void()> printBody) {
@@ -3217,13 +3216,13 @@ bool swift::printWithCompatibilityFeatureChecks(ASTPrinter &printer,
   // it should go around the whole decl.
   if (isa<AccessorDecl>(decl)) {
     printBody();
-    return false;
+    return;
   }
 
   FeatureSet features = getUniqueFeaturesUsed(decl);
   if (features.empty()) {
     printBody();
-    return false;
+    return;
   }
 
   // Enter a `#if` for the required features, if any.
@@ -3253,8 +3252,6 @@ bool swift::printWithCompatibilityFeatureChecks(ASTPrinter &printer,
     printer.printNewline();
     printer << "#endif";
   }
-
-  return true;
 }
 
 void PrintAST::visitExtensionDecl(ExtensionDecl *decl) {
@@ -3545,14 +3542,6 @@ void PrintAST::printPrimaryAssociatedTypes(ProtocolDecl *decl) {
                                       assocType);
         Printer.printName(assocType->getName(),
                           PrintNameContext::GenericParameter);
-
-        printInheritedFromRequirementSignature(decl, assocType);
-
-        if (assocType->hasDefaultDefinitionType()) {
-          Printer << " = ";
-          assocType->getDefaultDefinitionType().print(Printer, Options);
-        }
-
         Printer.printStructurePost(PrintStructureKind::GenericParameter,
                                    assocType);
       },
@@ -5078,14 +5067,6 @@ bool Decl::shouldPrintInContext(const PrintOptions &PO) const {
 
   if (isa<IfConfigDecl>(this)) {
     return PO.PrintIfConfig;
-  }
-
-  if (auto *ATD = dyn_cast<AssociatedTypeDecl>(this)) {
-    // If PO.PrintPrimaryAssociatedTypes is on, primary associated
-    // types are printed as part of the protocol declaration itself,
-    // so skip them here.
-    if (ATD->isPrimary() && PO.PrintPrimaryAssociatedTypes)
-      return false;
   }
 
   // Print everything else.

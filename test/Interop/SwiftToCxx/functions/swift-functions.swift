@@ -1,5 +1,5 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-swift-frontend %s -typecheck -module-name Functions -emit-cxx-header-path %t/functions.h
+// RUN: %target-swift-frontend %s -typecheck -module-name Functions -clang-header-expose-public-decls -emit-clang-header-path %t/functions.h
 // RUN: %FileCheck %s < %t/functions.h
 
 // RUN: %check-interop-cxx-header-in-clang(%t/functions.h)
@@ -45,6 +45,6 @@ public func passTwoIntReturnIntNoArgLabelParamName(_ x2: CInt, _ y2: CInt) -> CI
 
 public func passVoidReturnVoid() { print("passVoidReturnVoid") }
 
-// CHECK: inline void passVoidReturnVoid(void) noexcept {
+// CHECK: inline void passVoidReturnVoid() noexcept {
 // CHECK: return _impl::$s9Functions014passVoidReturnC0yyF();
 // CHECK: }

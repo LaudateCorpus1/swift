@@ -18,6 +18,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include <vector>
 
+#include "Diagnostics.h"
 #include "PropertyMap.h"
 #include "RewriteContext.h"
 #include "RewriteSystem.h"
@@ -99,7 +100,9 @@ class RequirementMachine final {
 
   std::pair<CompletionResult, unsigned>
   initWithProtocolWrittenRequirements(
-      ArrayRef<const ProtocolDecl *> protos);
+      ArrayRef<const ProtocolDecl *> component,
+      const llvm::DenseMap<const ProtocolDecl *,
+                           SmallVector<StructuralRequirement, 4>> protos);
 
   std::pair<CompletionResult, unsigned>
   initWithWrittenRequirements(
@@ -110,6 +113,11 @@ class RequirementMachine final {
 
   std::pair<CompletionResult, unsigned>
   computeCompletion(RewriteSystem::ValidityPolicy policy);
+
+  void freeze();
+
+  void computeRequirementDiagnostics(SmallVectorImpl<RequirementError> &errors,
+                                     SourceLoc signatureLoc);
 
   MutableTerm getLongestValidPrefix(const MutableTerm &term) const;
 
@@ -140,9 +148,11 @@ public:
   GenericSignature::RequiredProtocols getRequiredProtocols(Type depType) const;
   Type getSuperclassBound(Type depType,
                           TypeArrayView<GenericTypeParamType> genericParams) const;
-  bool isConcreteType(Type depType) const;
+  bool isConcreteType(Type depType,
+                      const ProtocolDecl *proto=nullptr) const;
   Type getConcreteType(Type depType,
-                       TypeArrayView<GenericTypeParamType> genericParams) const;
+                       TypeArrayView<GenericTypeParamType> genericParams,
+                       const ProtocolDecl *proto=nullptr) const;
   bool areSameTypeParameterInContext(Type depType1, Type depType2) const;
   bool isCanonicalTypeInContext(Type type) const;
   Type getCanonicalTypeInContext(Type type,
@@ -155,8 +165,8 @@ public:
   llvm::DenseMap<const ProtocolDecl *, RequirementSignature>
   computeMinimalProtocolRequirements();
 
-  std::vector<Requirement>
-  computeMinimalGenericSignatureRequirements(bool reconstituteSugar);
+  GenericSignature
+  computeMinimalGenericSignature(bool reconstituteSugar);
 
   ArrayRef<Rule> getLocalRules() const;
 

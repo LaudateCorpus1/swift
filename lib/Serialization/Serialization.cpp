@@ -203,7 +203,8 @@ namespace {
     int32_t getNameDataForBase(const NominalTypeDecl *nominal,
                                StringRef *dataToWrite = nullptr) {
       if (nominal->getDeclContext()->isModuleScopeContext())
-        return -Serializer.addContainingModuleRef(nominal->getDeclContext());
+        return -Serializer.addContainingModuleRef(nominal->getDeclContext(),
+                                                  /*ignoreExport=*/false);
 
       auto &mangledName = MangledNameCache[nominal];
       if (mangledName.empty())
@@ -727,7 +728,8 @@ IdentifierID Serializer::addFilename(StringRef filename) {
   return addUniquedString(filename).second;
 }
 
-IdentifierID Serializer::addContainingModuleRef(const DeclContext *DC) {
+IdentifierID Serializer::addContainingModuleRef(const DeclContext *DC,
+                                                bool ignoreExport) {
   assert(!isa<ModuleDecl>(DC) &&
          "References should be to things within modules");
   const FileUnit *file = cast<FileUnit>(DC->getModuleScopeContext());
@@ -746,8 +748,19 @@ IdentifierID Serializer::addContainingModuleRef(const DeclContext *DC) {
 
   auto exportedModuleName = file->getExportedModuleName();
   assert(!exportedModuleName.empty());
-  auto exportedModuleID = M->getASTContext().getIdentifier(exportedModuleName);
-  return addDeclBaseNameRef(exportedModuleID);
+  auto moduleID = M->getASTContext().getIdentifier(exportedModuleName);
+  if (ignoreExport) {
+    auto realModuleName = M->getRealName().str();
+    assert(!realModuleName.empty());
+    if (realModuleName != exportedModuleName) {
+      // Still register the exported name as it can be referenced
+      // from the lookup tables.
+      addDeclBaseNameRef(moduleID);
+
+      moduleID = M->getASTContext().getIdentifier(realModuleName);
+    }
+  }
+  return addDeclBaseNameRef(moduleID);
 }
 
 IdentifierID Serializer::addModuleRef(const ModuleDecl *module) {
@@ -1632,7 +1645,8 @@ Serializer::writeASTBlockEntity(ProtocolConformance *conformance) {
         abbrCode,
         addDeclRef(normal->getProtocol()),
         addDeclRef(normal->getType()->getAnyNominal()),
-        addContainingModuleRef(normal->getDeclContext()));
+        addContainingModuleRef(normal->getDeclContext(),
+                               /*ignoreExport=*/true));
     }
     break;
   }
@@ -1831,7 +1845,8 @@ void Serializer::writeCrossReference(const DeclContext *DC, uint32_t pathLen) {
   case DeclContextKind::FileUnit:
     abbrCode = DeclTypeAbbrCodes[XRefLayout::Code];
     XRefLayout::emitRecord(Out, ScratchRecord, abbrCode,
-                           addContainingModuleRef(DC), pathLen);
+                           addContainingModuleRef(DC, /*ignoreExport=*/true),
+                           pathLen);
     break;
 
   case DeclContextKind::GenericTypeDecl: {
@@ -1883,7 +1898,8 @@ void Serializer::writeCrossReference(const DeclContext *DC, uint32_t pathLen) {
       genericSig = ext->getGenericSignature().getCanonicalSignature();
     }
     XRefExtensionPathPieceLayout::emitRecord(
-        Out, ScratchRecord, abbrCode, addContainingModuleRef(DC),
+        Out, ScratchRecord, abbrCode,
+        addContainingModuleRef(DC, /*ignoreExport=*/true),
         addGenericSignatureRef(genericSig));
     break;
   }
@@ -2580,6 +2596,7 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
           theAttr->isImplicit(),
           theAttr->isUnconditionallyUnavailable(),
           theAttr->isUnconditionallyDeprecated(),
+          theAttr->isNoAsync(),
           theAttr->isPackageDescriptionVersionSpecific(),
           theAttr->IsSPI,
           LIST_VER_TUPLE_PIECES(Introduced),
@@ -3470,7 +3487,6 @@ public:
       contextID.getOpaqueValue(),
       S.addTypeRef(assocType->getDefaultDefinitionType()),
       assocType->isImplicit(),
-      assocType->isPrimary(),
       overriddenAssocTypeIDs);
   }
 
@@ -3881,16 +3897,44 @@ public:
     auto genericSigID = S.addGenericSignatureRef(opaqueDecl->getGenericSignature());
 
     SubstitutionMapID underlyingSubsID = 0;
-    if (auto underlying = opaqueDecl->getUnderlyingTypeSubstitutions())
+    if (auto underlying = opaqueDecl->getUniqueUnderlyingTypeSubstitutions()) {
       underlyingSubsID = S.addSubstitutionMapRef(*underlying);
+    } else if (opaqueDecl->hasConditionallyAvailableSubstitutions()) {
+      // Universally available type doesn't have any availability conditions
+      // so it could be serialized into "unique" slot to safe space.
+      auto universal =
+          opaqueDecl->getConditionallyAvailableSubstitutions().back();
+      underlyingSubsID = S.addSubstitutionMapRef(universal->getSubstitutions());
+    }
     uint8_t rawAccessLevel =
-      getRawStableAccessLevel(opaqueDecl->getFormalAccess());
+        getRawStableAccessLevel(opaqueDecl->getFormalAccess());
     unsigned abbrCode = S.DeclTypeAbbrCodes[OpaqueTypeLayout::Code];
     OpaqueTypeLayout::emitRecord(S.Out, S.ScratchRecord, abbrCode,
                                  contextID.getOpaqueValue(), namingDeclID,
                                  interfaceSigID, interfaceTypeID, genericSigID,
                                  underlyingSubsID, rawAccessLevel);
     writeGenericParams(opaqueDecl->getGenericParams());
+
+    // Serialize all of the conditionally available substitutions expect the
+    // last one - universal, it's serialized into "unique" slot.
+    if (opaqueDecl->hasConditionallyAvailableSubstitutions()) {
+      unsigned abbrCode =
+          S.DeclTypeAbbrCodes[ConditionalSubstitutionLayout::Code];
+      for (const auto *subs :
+           opaqueDecl->getConditionallyAvailableSubstitutions().drop_back()) {
+        SmallVector<IdentifierID, 4> conditions;
+
+        for (const auto &condition : subs->getAvailability()) {
+          auto lowerEndpoint = condition.getLowerEndpoint();
+          conditions.push_back(
+              S.addUniquedStringRef(lowerEndpoint.getAsString()));
+        }
+
+        ConditionalSubstitutionLayout::emitRecord(
+            S.Out, S.ScratchRecord, abbrCode,
+            S.addSubstitutionMapRef(subs->getSubstitutions()), conditions);
+      }
+    }
   }
 
   void visitAccessorDecl(const AccessorDecl *fn) {
@@ -5057,6 +5101,8 @@ void Serializer::writeAllDeclsAndTypes() {
   registerDeclTypeAbbr<FilenameForPrivateLayout>();
   registerDeclTypeAbbr<MembersLayout>();
   registerDeclTypeAbbr<XRefLayout>();
+
+  registerDeclTypeAbbr<ConditionalSubstitutionLayout>();
 
 #define DECL_ATTR(X, NAME, ...) \
   registerDeclTypeAbbr<NAME##DeclAttrLayout>();

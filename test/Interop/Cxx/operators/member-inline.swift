@@ -1,7 +1,7 @@
-// RUN: %target-run-simple-swift(-I %S/Inputs -Xfrontend -enable-cxx-interop)
+// RUN: %target-run-simple-swift(-I %S/Inputs -Xfrontend -enable-experimental-cxx-interop)
 
 // REQUIRES: executable_test
-// XFAIL: OS=linux-android
+// XFAIL: *
 
 import MemberInline
 import StdlibUnittest

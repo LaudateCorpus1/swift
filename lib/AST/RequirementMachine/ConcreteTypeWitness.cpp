@@ -14,6 +14,10 @@
 // type requirements on nested types of type parameters which are subject to
 // both a protocol conformance and a concrete type (or superclass) requirement.
 //
+// This process runs during property map construction. It may introduce new
+// rewrite rules, together with rewrite loops relating the new rules to existing
+// rules via relations.
+//
 //===----------------------------------------------------------------------===//
 
 #include "swift/AST/Decl.h"
@@ -140,7 +144,8 @@ void PropertyMap::concretizeNestedTypesFromConcreteParent(
     auto *module = proto->getParentModule();
 
     auto conformance = module->lookupConformance(concreteType,
-                                                 const_cast<ProtocolDecl *>(proto));
+                                                 const_cast<ProtocolDecl *>(proto),
+                                                 /*allowMissing=*/true);
     if (conformance.isInvalid()) {
       // For superclass rules, it is totally fine to have a signature like:
       //
@@ -564,7 +569,7 @@ void PropertyMap::inferConditionalRequirements(
       llvm::dbgs() << "\n";
     }
 
-    desugarRequirement(req, desugaredRequirements, errors);
+    desugarRequirement(req, SourceLoc(), desugaredRequirements, errors);
   }
 
   // Now, convert desugared conditional requirements to rules.

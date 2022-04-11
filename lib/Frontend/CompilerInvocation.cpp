@@ -448,8 +448,8 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   Opts.EnableExperimentalNamedOpaqueTypes |=
       Args.hasArg(OPT_enable_experimental_named_opaque_types);
 
-  Opts.EnableParameterizedProtocolTypes |=
-      Args.hasArg(OPT_enable_parameterized_protocol_types);
+  Opts.EnableParameterizedExistentialTypes |=
+      Args.hasArg(OPT_enable_parameterized_existential_types);
 
   Opts.EnableOpenedExistentialTypes =
     Args.hasFlag(OPT_enable_experimental_opened_existential_types,
@@ -459,19 +459,11 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   Opts.EnableExperimentalVariadicGenerics |=
     Args.hasArg(OPT_enable_experimental_variadic_generics);
 
-  // SwiftOnoneSupport produces different symbols when opening existentials,
-  // so disable it.
-  if (FrontendOpts.ModuleName == SWIFT_ONONE_SUPPORT)
-    Opts.EnableOpenedExistentialTypes = false;
-
-  Opts.EnableExperimentalDistributed |=
-    Args.hasArg(OPT_enable_experimental_distributed);
+  Opts.EnableExperimentalAssociatedTypeInference |=
+      Args.hasArg(OPT_enable_experimental_associated_type_inference);
 
   Opts.EnableExperimentalMoveOnly |=
     Args.hasArg(OPT_enable_experimental_move_only);
-
-  Opts.EnableExperimentalPairwiseBuildBlock |=
-    Args.hasArg(OPT_enable_experimental_pairwise_build_block);
 
   Opts.EnableInferPublicSendable |=
     Args.hasFlag(OPT_enable_infer_public_concurrent_value,
@@ -490,15 +482,14 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   Opts.DisableImplicitConcurrencyModuleImport |=
     Args.hasArg(OPT_disable_implicit_concurrency_module_import);
 
-  /// experimental distributed also implicitly enables experimental concurrency
-  Opts.EnableExperimentalDistributed |=
-    Args.hasArg(OPT_enable_experimental_distributed);
-  Opts.EnableExperimentalConcurrency |=
-    Args.hasArg(OPT_enable_experimental_distributed);
+  Opts.DisableImplicitStringProcessingModuleImport |=
+    Args.hasArg(OPT_disable_implicit_string_processing_module_import);
 
   if (Args.hasArg(OPT_enable_experimental_async_top_level))
     Diags.diagnose(SourceLoc(), diag::warn_flag_deprecated,
                    "-enable-experimental-async-top-level");
+
+  Opts.EnableAsyncMainResolution = Args.hasArg(OPT_async_main);
 
   Opts.DiagnoseInvalidEphemeralnessAsError |=
       Args.hasArg(OPT_enable_invalid_ephemeralness_as_error);
@@ -766,11 +757,10 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
     Opts.ClangTarget = llvm::Triple(A->getValue());
   }
 
-  Opts.EnableCXXInterop |= Args.hasArg(OPT_enable_cxx_interop);
+  Opts.EnableCXXInterop |= Args.hasArg(OPT_enable_experimental_cxx_interop);
   Opts.EnableObjCInterop =
       Args.hasFlag(OPT_enable_objc_interop, OPT_disable_objc_interop,
                    Target.isOSDarwin());
-  Opts.EnableSILOpaqueValues |= Args.hasArg(OPT_enable_sil_opaque_values);
 
   Opts.VerifyAllSubstitutionMaps |= Args.hasArg(OPT_verify_all_substitution_maps);
 
@@ -805,17 +795,18 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   // First, set up default minimum inlining target versions.
   auto getDefaultMinimumInliningTargetVersion =
       [&](const llvm::Triple &triple) -> llvm::VersionTuple {
-#if SWIFT_DEFAULT_TARGET_MIN_INLINING_VERSION_TO_MIN
-    // In ABI-stable modules, default to the version when Swift first became
-    // available.
-    if (FrontendOpts.EnableLibraryEvolution)
+    // FIXME: Re-enable with rdar://91387029
+#if SWIFT_DEFAULT_API_TARGET_MIN_INLINING_VERSION_TO_MIN
+    // In API modules, default to the version when Swift first became available.
+    if (Opts.LibraryLevel == LibraryLevel::API)
       if (auto minTriple = minimumAvailableOSVersionForTriple(triple))
-        return minTriple;
+        return *minTriple;
 #endif
 
-    // In ABI-unstable modules, we will never have to interoperate with
-    // older versions of the module, so we should default to the minimum
-    // deployment target.
+    // In other modules, assume that availability is used less consistently
+    // and that library clients will generally raise deployment targets as the
+    // library evolves so the min inlining version should be the deployment
+    // target by default.
     unsigned major, minor, patch;
     if (triple.isMacOSX())
       triple.getMacOSXVersion(major, minor, patch);
@@ -998,11 +989,28 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
     }
   }
 
+  if (const Arg *A = Args.getLastArg(OPT_requirement_machine_max_split_concrete_equiv_class_attempts)) {
+    unsigned limit;
+    if (StringRef(A->getValue()).getAsInteger(10, limit)) {
+      Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
+                     A->getAsString(Args), A->getValue());
+      HadError = true;
+    } else {
+      Opts.RequirementMachineMaxSplitConcreteEquivClassAttempts = limit;
+    }
+  }
+
   if (Args.hasArg(OPT_disable_requirement_machine_concrete_contraction))
     Opts.EnableRequirementMachineConcreteContraction = false;
 
-  if (Args.hasArg(OPT_enable_requirement_machine_loop_normalization))
-    Opts.EnableRequirementMachineLoopNormalization = true;
+  if (Args.hasArg(OPT_disable_requirement_machine_loop_normalization))
+    Opts.EnableRequirementMachineLoopNormalization = false;
+
+  if (Args.hasArg(OPT_disable_requirement_machine_reuse))
+    Opts.EnableRequirementMachineReuse = false;
+
+  if (Args.hasArg(OPT_enable_regex_literals))
+    Opts.EnableForwardSlashRegexLiterals = true;
 
   if (Args.hasArg(OPT_enable_requirement_machine_opaque_archetypes))
     Opts.EnableRequirementMachineOpaqueArchetypes = true;
@@ -1099,9 +1107,6 @@ static bool ParseTypeCheckerArgs(TypeCheckerOptions &Opts, ArgList &Args,
   Opts.EnableMultiStatementClosureInference |=
       Args.hasArg(OPT_experimental_multi_statement_closures);
 
-  Opts.EnableTypeInferenceFromDefaultArguments |=
-      Args.hasArg(OPT_experimental_type_inference_from_defaults);
-
   Opts.PrintFullConvention |=
       Args.hasArg(OPT_experimental_print_full_convention);
 
@@ -1194,7 +1199,9 @@ static bool ParseClangImporterArgs(ClangImporterOptions &Opts,
 
   Opts.DisableOverlayModules |= Args.hasArg(OPT_emit_imported_modules);
 
-  Opts.EnableClangSPI |= Args.hasArg(OPT_enable_clang_spi);
+  if (Args.hasArg(OPT_disable_clang_spi)) {
+    Opts.EnableClangSPI = false;
+  }
 
   Opts.ExtraArgsOnly |= Args.hasArg(OPT_extra_clang_options_only);
 
@@ -1546,6 +1553,15 @@ static bool ParseSILArgs(SILOptions &Opts, ArgList &Args,
   // -Ounchecked might also set removal of runtime asserts (cond_fail).
   Opts.RemoveRuntimeAsserts |= Args.hasArg(OPT_RemoveRuntimeAsserts);
 
+  Optional<DestroyHoistingOption> specifiedDestroyHoistingOption;
+  if (Arg *A = Args.getLastArg(OPT_enable_destroy_hoisting)) {
+    specifiedDestroyHoistingOption = 
+        llvm::StringSwitch<Optional<DestroyHoistingOption>>(A->getValue())
+          .Case("true", DestroyHoistingOption::On)
+          .Case("false", DestroyHoistingOption::Off)
+          .Default(None);
+  }
+
   Optional<CopyPropagationOption> specifiedCopyPropagationOption;
   if (Arg *A = Args.getLastArg(OPT_copy_propagation_state_EQ)) {
     specifiedCopyPropagationOption =
@@ -1647,13 +1663,17 @@ static bool ParseSILArgs(SILOptions &Opts, ArgList &Args,
 
   // Unless overridden below, enabling copy propagation means enabling lexical
   // lifetimes.
-  if (Opts.CopyPropagation == CopyPropagationOption::On)
+  if (Opts.CopyPropagation == CopyPropagationOption::On) {
     Opts.LexicalLifetimes = LexicalLifetimesOption::On;
+    Opts.DestroyHoisting = DestroyHoistingOption::On;
+  }
 
   // Unless overridden below, disable copy propagation means disabling lexical
   // lifetimes.
-  if (Opts.CopyPropagation == CopyPropagationOption::Off)
+  if (Opts.CopyPropagation == CopyPropagationOption::Off) {
     Opts.LexicalLifetimes = LexicalLifetimesOption::DiagnosticMarkersOnly;
+    Opts.DestroyHoisting = DestroyHoistingOption::Off;
+  }
 
   // If move-only is enabled, always enable lexical lifetime as well.  Move-only
   // depends on lexical lifetimes.
@@ -1674,10 +1694,13 @@ static bool ParseSILArgs(SILOptions &Opts, ArgList &Args,
       Opts.LexicalLifetimes = LexicalLifetimesOption::Off;
     }
   }
+  if (specifiedDestroyHoistingOption)
+    Opts.DestroyHoisting = *specifiedDestroyHoistingOption;
 
   Opts.EnableARCOptimizations &= !Args.hasArg(OPT_disable_arc_opts);
   Opts.EnableOSSAModules |= Args.hasArg(OPT_enable_ossa_modules);
   Opts.EnableOSSAOptimizations &= !Args.hasArg(OPT_disable_ossa_opts);
+  Opts.EnableSILOpaqueValues |= Args.hasArg(OPT_enable_sil_opaque_values);
   Opts.EnableSpeculativeDevirtualization |= Args.hasArg(OPT_enable_spec_devirt);
   Opts.EnableActorDataRaceChecks |= Args.hasFlag(
       OPT_enable_actor_data_race_checks,
@@ -2151,6 +2174,14 @@ static bool ParseIRGenArgs(IRGenOptions &Opts, ArgList &Args,
   // AsyncFunctionPointer data block.  Force the use of indirect
   // AsyncFunctionPointer access.
   Opts.IndirectAsyncFunctionPointer = Triple.isOSBinFormatCOFF();
+
+  // On some Harvard architectures that allow sliding code and data address space
+  // offsets independently, it's impossible to make direct relative reference to
+  // code from data because the relative offset between them is not representable.
+  // Use absolute function references instead of relative ones on such targets.
+  // TODO(katei): This is a short-term solution until the WebAssembly target stabilizes
+  // PIC and 64-bit specifications and toolchain support.
+  Opts.CompactAbsoluteFunctionPointer = Triple.isOSBinFormatWasm();
 
   if (Args.hasArg(OPT_disable_legacy_type_info)) {
     Opts.DisableLegacyTypeInfo = true;

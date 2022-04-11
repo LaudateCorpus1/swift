@@ -13,6 +13,9 @@
 // rdar://90373022
 // UNSUPPORTED: OS=watchos
 
+// FIXME(distributed): seems to fail also on simulator on x86_64?
+// REQUIRES: rdar90373022
+
 import Distributed
 
 distributed actor Worker {
@@ -32,7 +35,7 @@ distributed actor Worker {
   static func main() async throws {
     let system = LocalTestingDistributedActorSystem()
 
-    let actor = Worker(system: system)
+    let actor = Worker(actorSystem: system)
     try await actor.hi() // local calls should still just work
     // CHECK: hi!
   }

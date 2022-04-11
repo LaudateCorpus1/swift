@@ -591,15 +591,26 @@ void swift::simple_display(raw_ostream &out, GenericSignature sig) {
     out << "NULL";
 }
 
+bool Requirement::hasError() const {
+  if (getFirstType()->hasError())
+    return true;
+
+  if (getKind() != RequirementKind::Layout &&
+      getSecondType()->hasError())
+    return true;
+
+  return false;
+}
+
 bool Requirement::isCanonical() const {
-  if (getFirstType() && !getFirstType()->isCanonical())
+  if (!getFirstType()->isCanonical())
     return false;
 
   switch (getKind()) {
   case RequirementKind::Conformance:
   case RequirementKind::SameType:
   case RequirementKind::Superclass:
-    if (getSecondType() && !getSecondType()->isCanonical())
+    if (!getSecondType()->isCanonical())
       return false;
     break;
 
@@ -612,17 +623,13 @@ bool Requirement::isCanonical() const {
 
 /// Get the canonical form of this requirement.
 Requirement Requirement::getCanonical() const {
-  Type firstType = getFirstType();
-  if (firstType)
-    firstType = firstType->getCanonicalType();
+  Type firstType = getFirstType()->getCanonicalType();
 
   switch (getKind()) {
   case RequirementKind::Conformance:
   case RequirementKind::SameType:
   case RequirementKind::Superclass: {
-    Type secondType = getSecondType();
-    if (secondType)
-      secondType = secondType->getCanonicalType();
+    Type secondType = getSecondType()->getCanonicalType();
     return Requirement(getKind(), firstType, secondType);
   }
 
@@ -1067,7 +1074,9 @@ void swift::validateGenericSignature(ASTContext &context,
         GenericSignatureWithError());
 
     // If there were any errors, the signature was invalid.
-    if (newSigWithError.getInt()) {
+    auto errorFlags = newSigWithError.getInt();
+    if (errorFlags.contains(GenericSignatureErrorFlags::HasInvalidRequirements) ||
+        errorFlags.contains(GenericSignatureErrorFlags::CompletionFailed)) {
       context.Diags.diagnose(SourceLoc(), diag::generic_signature_not_valid,
                              sig->getAsString());
     }

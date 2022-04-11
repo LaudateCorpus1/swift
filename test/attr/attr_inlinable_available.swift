@@ -16,16 +16,29 @@
 // RUN: %target-typecheck-verify-swift -swift-version 5 -enable-library-evolution -target %target-next-stable-abi-triple -target-min-inlining-version min
 
 
+// FIXME: Re-enable with rdar://91387029
+// Check that `-library-level api` implies `-target-min-inlining-version min`
+// RUN/: %target-typecheck-verify-swift -swift-version 5 -enable-library-evolution -target %target-next-stable-abi-triple -library-level api
+
+
 // Check that these rules are only applied when requested and that at least some
 // diagnostics are not present without it.
-// RUN: not %target-typecheck-verify-swift -swift-version 5 -target %target-next-stable-abi-triple 2>&1 | %FileCheck --check-prefix NON_ABI %s
-// NON_ABI: error: expected error not produced
-// NON_ABI: {'BetweenTargets' is only available in}
+// RUN: not %target-typecheck-verify-swift -swift-version 5 -target %target-next-stable-abi-triple 2>&1 | %FileCheck --check-prefix NON_MIN %s
+
+
+// Check that -target-min-inlining-version overrides -library-level, allowing
+// library owners to disable this behavior for API libraries if needed.
+// RUN: not %target-typecheck-verify-swift -swift-version 5 -target %target-next-stable-abi-triple -target-min-inlining-version target -library-level api 2>&1 | %FileCheck --check-prefix NON_MIN %s
 
 
 // Check that we respect -target-min-inlining-version by cranking it up high
 // enough to suppress any possible errors.
 // RUN: %target-swift-frontend -typecheck -disable-objc-attr-requires-foundation-module %s -swift-version 5 -enable-library-evolution -target %target-next-stable-abi-triple -target-min-inlining-version 42.0
+
+
+// NON_MIN: error: expected error not produced
+// NON_MIN: {'BetweenTargets' is only available in}
+
 
 /// Declaration with no availability annotation. Should be inferred as minimum
 /// inlining target.
@@ -214,7 +227,6 @@ public func deployedUseAfterDeploymentTarget(
 
 //
 // Uses in inlinable functions are based on the minimum inlining target
-// (i.e. the first ABI-stable version, in this case)
 //
 
 @inlinable public func inlinedUseNoAvailable( // expected-note 8 {{add @available attribute}}
@@ -428,7 +440,7 @@ internal func fn() {
 // @_backDeploy acts like @inlinable.
 
 @available(macOS 10.10, iOS 8.0, tvOS 9.0, watchOS 2.0, *)
-@_backDeploy(macOS 999.0, iOS 999.0, tvOS 999.0, watchOS 999.0)
+@_backDeploy(before: macOS 999.0, iOS 999.0, tvOS 999.0, watchOS 999.0)
 public func backDeployedToInliningTarget(
   _: NoAvailable,
   _: BeforeInliningTarget,

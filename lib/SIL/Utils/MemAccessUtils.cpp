@@ -759,7 +759,6 @@ bool swift::isIdentityAndOwnershipPreservingRefCast(
   case SILInstructionKind::BridgeObjectToRefInst:
     return true;
   case SILInstructionKind::UnconditionalCheckedCastInst:
-  case SILInstructionKind::UnconditionalCheckedCastValueInst:
     return SILDynamicCastInst(svi).isRCIdentityPreserving();
   // Ignore markers
   case SILInstructionKind::MarkUninitializedInst:
@@ -913,7 +912,13 @@ SILValue swift::findOwnershipReferenceAggregate(SILValue ref) {
         || isa<OwnershipForwardingConversionInst>(root)
         || isa<OwnershipForwardingSelectEnumInstBase>(root)
         || isa<OwnershipForwardingMultipleValueInstruction>(root)) {
-      root = root->getDefiningInstruction()->getOperand(0);
+      SILInstruction *inst = root->getDefiningInstruction();
+
+      // The `enum` instruction can have no operand.
+      if (inst->getNumOperands() == 0)
+        return root;
+
+      root = inst->getOperand(0);
       continue;
     }
     if (auto *arg = dyn_cast<SILArgument>(root)) {
@@ -955,17 +960,10 @@ AccessStorage::AccessStorage(SILValue base, Kind kind)
   }
   if (getKind() == AccessBase::Global) {
     global = getReferencedGlobal(cast<SingleValueInstruction>(base));
-    // Require a decl for all formally accessed globals defined in this
-    // module. AccessEnforcementWMO requires this. Swift globals defined in
-    // another module either use an addressor, which has Unidentified
-    // storage. Imported non-Swift globals are accessed via global_addr but have
-    // no declaration.
-    assert(global->getDecl() || isa<GlobalAddrInst>(base));
-
     // It's unclear whether a global will ever be missing it's varDecl, but
     // technically we only preserve it for debug info. So if we don't have a
-    // decl, check the flag on SILGlobalVariable, which is guaranteed valid,
-    setLetAccess(getGlobal()->isLet());
+    // decl, check the flag on SILGlobalVariable, which is guaranteed valid.
+    setLetAccess(global->isLet());
     return;
   }
   value = base;
@@ -1001,7 +999,7 @@ const ValueDecl *AccessStorage::getDecl() const {
     return nullptr;
   case Class: {
     // The property index is relative to the VarDecl in ref_element_addr, and
-    // can only be reliably determined when the base is avaiable. Without the
+    // can only be reliably determined when the base is available. Without the
     // base, we can only make a best effort to extract it from the object type,
     // which might not even be a class in the case of bridge objects.
     if (ClassDecl *classDecl =
@@ -2627,7 +2625,6 @@ void swift::visitAccessedAddress(SILInstruction *I,
   case SILInstructionKind::BeginUnpairedAccessInst:
   case SILInstructionKind::BindMemoryInst:
   case SILInstructionKind::RebindMemoryInst:
-  case SILInstructionKind::CheckedCastValueBranchInst:
   case SILInstructionKind::CondFailInst:
   case SILInstructionKind::CopyBlockInst:
   case SILInstructionKind::CopyBlockWithoutEscapingInst:
@@ -2659,7 +2656,6 @@ void swift::visitAccessedAddress(SILInstruction *I,
   case SILInstructionKind::UncheckedOwnershipConversionInst:
   case SILInstructionKind::UncheckedRefCastAddrInst:
   case SILInstructionKind::UnconditionalCheckedCastAddrInst:
-  case SILInstructionKind::UnconditionalCheckedCastValueInst:
   case SILInstructionKind::ValueMetatypeInst:
   // TODO: Is this correct?
   case SILInstructionKind::GetAsyncContinuationInst:

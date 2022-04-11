@@ -378,9 +378,6 @@ ERROR(expected_rbrace_actor,none,
       "expected '}' in actor", ())
 
 // Protocol
-ERROR(generic_arguments_protocol,PointsToFirstBadToken,
-      "protocols do not allow generic parameters; use associated types instead",
-      ())
 ERROR(expected_lbrace_protocol,PointsToFirstBadToken,
       "expected '{' in protocol type", ())
 ERROR(expected_rbrace_protocol,none,
@@ -1086,12 +1083,14 @@ ERROR(conditional_var_initializer_required,none,
 ERROR(wrong_condition_case_location,none,
       "pattern matching binding is spelled with 'case %0', not '%0 case'",
       (StringRef))
+ERROR(conditional_var_valid_identifiers_only,none,
+      "unwrap condition requires a valid identifier", ())
 
 // If Statement
 ERROR(expected_condition_if,PointsToFirstBadToken,
       "expected expression, var, or let in 'if' condition", ())
 ERROR(missing_condition_after_if,none,
-      "missing condition in an 'if' statement", ())
+      "missing condition in 'if' statement", ())
 ERROR(expected_lbrace_after_if,PointsToFirstBadToken,
       "expected '{' after 'if' condition", ())
 ERROR(expected_lbrace_or_if_after_else,PointsToFirstBadToken,
@@ -1107,7 +1106,7 @@ NOTE(suggest_removing_else,none,
 ERROR(expected_condition_guard,PointsToFirstBadToken,
       "expected expression, var, let or case in 'guard' condition", ())
 ERROR(missing_condition_after_guard,none,
-      "missing condition in an 'guard' statement", ())
+      "missing condition in 'guard' statement", ())
 ERROR(expected_else_after_guard,PointsToFirstBadToken,
       "expected 'else' after 'guard' condition", ())
 ERROR(expected_lbrace_after_guard,PointsToFirstBadToken,
@@ -1117,7 +1116,7 @@ ERROR(expected_lbrace_after_guard,PointsToFirstBadToken,
 ERROR(expected_condition_while,PointsToFirstBadToken,
       "expected expression, var, or let in 'while' condition", ())
 ERROR(missing_condition_after_while,none,
-      "missing condition in a 'while' statement", ())
+      "missing condition in 'while' statement", ())
 ERROR(expected_lbrace_after_while,PointsToFirstBadToken,
       "expected '{' after 'while' condition", ())
 
@@ -1497,9 +1496,8 @@ ERROR(attr_unsupported_on_target, none,
 // availability
 ERROR(attr_availability_platform,none,
       "expected platform name or '*' for '%0' attribute", (StringRef))
-ERROR(attr_availability_unavailable_deprecated,none,
-      "'%0' attribute cannot be both unconditionally 'unavailable' and "
-      "'deprecated'", (StringRef))
+ERROR(attr_availability_multiple_kinds ,none,
+      "'%0' attribute cannot be both '%1' and '%2'", (StringRef, StringRef, StringRef))
 
 WARNING(attr_availability_invalid_duplicate,none,
         "'%0' argument has already been specified", (StringRef))
@@ -1572,6 +1570,10 @@ ERROR(originally_defined_in_need_nonempty_module_name,none,
       "original module name cannot be empty in @_originallyDefinedIn", ())
 
 // backDeploy
+ERROR(attr_back_deploy_expected_before_label,none,
+      "expected 'before:' in '@_backDeploy' attribute", ())
+ERROR(attr_back_deploy_expected_colon_after_before,none,
+      "expected ':' after 'before' in '@_backDeploy' attribute", ())
 ERROR(attr_back_deploy_missing_rparen,none,
       "expected ')' in '@_backDeploy' argument list", ())
 

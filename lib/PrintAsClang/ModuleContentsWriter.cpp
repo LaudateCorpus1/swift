@@ -12,9 +12,10 @@
 
 #include "ModuleContentsWriter.h"
 
-#include "CxxSynthesis.h"
+#include "ClangSyntaxPrinter.h"
 #include "DeclAndTypePrinter.h"
 #include "OutputLanguageMode.h"
+#include "PrimitiveTypeMapping.h"
 
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/Module.h"
@@ -123,14 +124,18 @@ class ModuleWriter {
   llvm::DenseMap<const TypeDecl *, std::pair<EmissionState, bool>> seenTypes;
   std::vector<const Decl *> declsToWrite;
   DelayedMemberSet delayedMembers;
+  PrimitiveTypeMapping typeMapping;
   DeclAndTypePrinter printer;
+  OutputLanguageMode outputLangMode;
 
 public:
   ModuleWriter(raw_ostream &os, raw_ostream &prologueOS,
                llvm::SmallPtrSetImpl<ImportModuleTy> &imports, ModuleDecl &mod,
                AccessLevel access, OutputLanguageMode outputLang)
       : os(os), imports(imports), M(mod),
-        printer(M, os, prologueOS, delayedMembers, access, outputLang) {}
+        printer(M, os, prologueOS, delayedMembers, typeMapping, access,
+                outputLang),
+        outputLangMode(outputLang) {}
 
   /// Returns true if we added the decl's module to the import set, false if
   /// the decl is a local decl.
@@ -576,7 +581,11 @@ public:
       const Decl *D = declsToWrite.back();
       bool success = true;
 
-      if (isa<ValueDecl>(D)) {
+      if (outputLangMode == OutputLanguageMode::Cxx) {
+        if (auto FD = dyn_cast<FuncDecl>(D))
+          success = writeFunc(FD);
+        // FIXME: Warn on unsupported exported decl.
+      } else if (isa<ValueDecl>(D)) {
         if (auto CD = dyn_cast<ClassDecl>(D))
           success = writeClass(CD);
         else if (auto PD = dyn_cast<ProtocolDecl>(D))
@@ -633,26 +642,34 @@ swift::printModuleContentsAsObjC(raw_ostream &os,
 void swift::printModuleContentsAsCxx(
     raw_ostream &os, llvm::SmallPtrSetImpl<ImportModuleTy> &imports,
     ModuleDecl &M) {
-  using cxx_synthesis::CxxPrinter;
+  std::string moduleContentsBuf;
+  llvm::raw_string_ostream moduleOS{moduleContentsBuf};
+  std::string modulePrologueBuf;
+  llvm::raw_string_ostream prologueOS{modulePrologueBuf};
+
+  ModuleWriter(moduleOS, prologueOS, imports, M, getRequiredAccess(M),
+               OutputLanguageMode::Cxx)
+      .write();
+
+  // FIXME: refactor.
+  if (!prologueOS.str().empty()) {
+    os << "#endif\n";
+    os << "#ifdef __cplusplus\n";
+    os << "namespace ";
+    M.ValueDecl::getName().print(os);
+    os << " {\n";
+    os << "namespace " << cxx_synthesis::getCxxImplNamespaceName() << " {\n";
+    os << "#endif\n\n";
+
+    os << prologueOS.str();
+
+    os << "\n#ifdef __cplusplus\n";
+    os << "}\n";
+    os << "}\n";
+  }
+
   // Construct a C++ namespace for the module.
-  CxxPrinter(os).printNamespace(
+  ClangSyntaxPrinter(os).printNamespace(
       [&](raw_ostream &os) { M.ValueDecl::getName().print(os); },
-      [&](raw_ostream &os) {
-        std::string moduleContentsBuf;
-        llvm::raw_string_ostream moduleOS{moduleContentsBuf};
-        std::string modulePrologueBuf;
-        llvm::raw_string_ostream prologueOS{modulePrologueBuf};
-
-        ModuleWriter(moduleOS, prologueOS, imports, M, getRequiredAccess(M),
-                     OutputLanguageMode::Cxx)
-            .write();
-
-        // The module's prologue contains implementation details,
-        // like extern "C" symbols for the referenced Swift functions.
-        CxxPrinter(os).printNamespace(
-            cxx_synthesis::getCxxImplNamespaceName(),
-            [&](raw_ostream &os) { os << prologueOS.str(); });
-
-        os << moduleOS.str();
-      });
+      [&](raw_ostream &os) { os << moduleOS.str(); });
 }
