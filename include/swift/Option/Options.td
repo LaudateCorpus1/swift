@@ -676,9 +676,9 @@ def disable_actor_data_race_checks :
   Flags<[FrontendOption, DoesNotAffectIncrementalBuild]>,
   HelpText<"Disable runtime checks for actor data races">;
 
-def enable_regex_literals : Flag<["-"], "enable-regex-literals">,
+def enable_bare_slash_regex : Flag<["-"], "enable-bare-slash-regex">,
   Flags<[FrontendOption, ModuleInterfaceOptionIgnorable]>,
-  HelpText<"Enable the use of regular-expression literals">;
+  HelpText<"Enable the use of forward slash regular-expression literal syntax">;
 
 def warn_implicit_overrides :
   Flag<["-"], "warn-implicit-overrides">,
@@ -695,9 +695,17 @@ def warn_swift3_objc_inference : Flag<["-"], "warn-swift3-objc-inference">,
   Flags<[FrontendOption, DoesNotAffectIncrementalBuild, HelpHidden]>;
 
 def warn_concurrency : Flag<["-"], "warn-concurrency">,
-  Flags<[FrontendOption, DoesNotAffectIncrementalBuild, ModuleInterfaceOptionIgnorable]>,
+  Flags<[FrontendOption, DoesNotAffectIncrementalBuild]>,
   HelpText<"Warn about code that is unsafe according to the Swift Concurrency "
            "model and will become ill-formed in a future language version">;
+
+def strict_concurrency : Joined<["-"], "strict-concurrency=">,
+  Flags<[FrontendOption, DoesNotAffectIncrementalBuild]>,
+  HelpText<"Specify the how strict concurrency checking will be. The value may "
+           "be 'explicit' (most 'Sendable' checking is disabled), "
+           "'targeted' ('Sendable' checking is enabled in code that uses the "
+           "concurrency model, or 'complete' ('Sendable' and other checking is "
+           "enabled for all code in the module)">;
 
 def Rpass_EQ : Joined<["-"], "Rpass=">,
   Flags<[FrontendOption]>,

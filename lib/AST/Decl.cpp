@@ -1745,6 +1745,18 @@ bool PatternBindingDecl::isAsyncLet() const {
   if (auto var = getAnchoringVarDecl(0))
     return var->isAsyncLet();
 
+  // Check for "async let _: <Type> = <expression>" pattern.
+  auto *pattern = getPatternList()[0].getPattern();
+  if (auto *typedPattern = dyn_cast<TypedPattern>(pattern)) {
+    auto *anyPattern = dyn_cast<AnyPattern>(typedPattern->getSubPattern());
+    return anyPattern && anyPattern->isAsyncLet();
+  }
+
+  // Check for "async let _ = <expression>" pattern.
+  if (auto *anyPattern = dyn_cast<AnyPattern>(pattern)) {
+    return anyPattern->isAsyncLet();
+  }
+
   return false;
 }
 
@@ -3396,7 +3408,7 @@ bool ValueDecl::shouldHideFromEditor() const {
     bool bypassSwiftPrivate = false;
     if (auto *AFD = dyn_cast<AbstractFunctionDecl>(this)) {
       if (AFD->getForeignAsyncConvention().hasValue()) {
-        // For imported 'async' declartions, visibility can be controlled by
+        // For imported 'async' declarations, visibility can be controlled by
         // 'swift_async(...)' attribute.
         if (auto *asyncAttr = ClangD->getAttr<clang::SwiftAsyncAttr>()) {
           bypassSwiftPrivate = true;
@@ -4008,7 +4020,7 @@ findGenericParameterReferences(CanGenericSignature genericSig,
   }
 
   // If the signature of an opaque result type has a same-type constraint
-  // that refereces Self, it's invariant.
+  // that references Self, it's invariant.
   if (auto opaque = type->getAs<OpaqueTypeArchetypeType>()) {
     auto info = GenericParameterReferenceInfo();
     auto opaqueSig = opaque->getDecl()->getOpaqueInterfaceGenericSignature();
@@ -4747,8 +4759,8 @@ bool NominalTypeDecl::hasDefaultInitializer() const {
 bool NominalTypeDecl::isTypeErasedGenericClass() const {
   // ObjC classes are type erased.
   // TODO: Unless they have magic methods...
-  if (auto clas = dyn_cast<ClassDecl>(this))
-    return clas->isTypeErasedGenericClass();
+  if (auto clazz = dyn_cast<ClassDecl>(this))
+    return clazz->isTypeErasedGenericClass();
   return false;
 }
 
@@ -5585,8 +5597,8 @@ ProtocolDecl::setLazyRequirementSignature(LazyMemberLoader *lazyLoader,
 }
 
 void
-ProtocolDecl::setLazyAssociatedTypeMembers(LazyMemberLoader *lazyLoader,
-                                           uint64_t associatedTypesData) {
+ProtocolDecl::setLazyAssociatedTypeMembers(
+    LazyMemberLoader *lazyLoader, uint64_t associatedTypesData) {
   assert(!Bits.ProtocolDecl.HasAssociatedTypes);
   assert(!Bits.ProtocolDecl.HasLazyAssociatedTypes);
 
@@ -5594,6 +5606,17 @@ ProtocolDecl::setLazyAssociatedTypeMembers(LazyMemberLoader *lazyLoader,
       getASTContext().getOrCreateLazyContextData(this, lazyLoader));
   contextData->associatedTypesData = associatedTypesData;
   Bits.ProtocolDecl.HasLazyAssociatedTypes = true;
+}
+
+void
+ProtocolDecl::setLazyPrimaryAssociatedTypeMembers(
+    LazyMemberLoader *lazyLoader, uint64_t associatedTypesData) {
+  assert(!Bits.ProtocolDecl.HasLazyPrimaryAssociatedTypes);
+
+  auto contextData = static_cast<LazyProtocolData *>(
+      getASTContext().getOrCreateLazyContextData(this, lazyLoader));
+  contextData->primaryAssociatedTypesData = associatedTypesData;
+  Bits.ProtocolDecl.HasLazyPrimaryAssociatedTypes = true;
 }
 
 void ProtocolDecl::computeKnownProtocolKind() const {
@@ -6336,7 +6359,7 @@ bool VarDecl::isActorSelf() const {
   while (!dc->isTypeContext() && !dc->isModuleScopeContext())
     dc = dc->getParent();
 
-  // Check if this `self` parameter belogs to an actor declaration or
+  // Check if this `self` parameter belongs to an actor declaration or
   // extension.
   auto nominal = dc->getSelfNominalTypeDecl();
   return nominal && nominal->isActor();
@@ -6355,7 +6378,7 @@ static bool isBackingStorageForDeclaredProperty(const VarDecl *var) {
   return false;
 }
 
-/// Whether the given variable is a delcared property that has separate backing storage.
+/// Whether the given variable is a declared property that has separate backing storage.
 static bool isDeclaredPropertyWithBackingStorage(const VarDecl *var) {
   if (var->getAttrs().hasAttribute<LazyAttr>())
     return true;
@@ -9177,7 +9200,9 @@ ActorIsolation swift::getActorIsolationOfContext(DeclContext *dc) {
   }
 
   if (auto *tld = dyn_cast<TopLevelCodeDecl>(dc)) {
-    if (dc->isAsyncContext() || dc->getASTContext().LangOpts.WarnConcurrency) {
+    if (dc->isAsyncContext() ||
+        dc->getASTContext().LangOpts.StrictConcurrencyLevel
+            >= StrictConcurrency::Complete) {
       if (Type mainActor = dc->getASTContext().getMainActorType())
         return ActorIsolation::forGlobalActor(
             mainActor,

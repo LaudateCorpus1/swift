@@ -58,6 +58,20 @@ namespace swift {
     Complete,
   };
 
+  /// Describes how strict concurrency checking should be.
+  enum class StrictConcurrency {
+    /// Enforce Sendable constraints where it has been explicitly adopted and
+    /// perform actor-isolation checking wherever code has adopted concurrency.
+    Minimal,
+    /// Enforce Sendable constraints and perform actor-isolation checking
+    /// wherever code has adopted concurrency, including code that has
+    /// explicitly adopted Sendable.
+    Targeted,
+    /// Enforce Sendable constraints and actor-isolation checking throughout
+    /// the entire module.
+    Complete,
+  };
+
   /// Access or distribution level of a library.
   enum class LibraryLevel : uint8_t {
     /// Application Programming Interface that is publicly distributed so
@@ -267,6 +281,9 @@ namespace swift {
     /// disabled because it is not complete.
     bool EnableCXXInterop = false;
 
+    /// Imports getters and setters as computed properties.
+    bool CxxInteropGettersSettersAsProperties = false;
+
     /// On Darwin platforms, use the pre-stable ABI's mark bit for Swift
     /// classes instead of the stable ABI's bit. This is needed when
     /// targeting OSes prior to macOS 10.14.4 and iOS 12.2, where
@@ -310,11 +327,8 @@ namespace swift {
     /// optimized custom allocator, so that memory debugging tools can be used.
     bool UseMalloc = false;
 
-    /// Provide additional warnings about code that is unsafe in the
-    /// eventual Swift concurrency model, and will eventually become errors
-    /// in a future Swift language version, but are too noisy for existing
-    /// language modes.
-    bool WarnConcurrency = false;
+    /// Specifies how strict concurrency checking will be.
+    StrictConcurrency StrictConcurrencyLevel = StrictConcurrency::Targeted;
 
     /// Enable experimental #assert feature.
     bool EnableExperimentalStaticAssert = false;
@@ -564,8 +578,9 @@ namespace swift {
     /// Enables dumping type witness systems from associated type inference.
     bool DumpTypeWitnessSystems = false;
 
-    /// Enables `/.../` syntax regular-expression literals
-    bool EnableForwardSlashRegexLiterals = false;
+    /// Enables `/.../` syntax regular-expression literals. This requires
+    /// experimental string processing. Note this does not affect `#/.../#`.
+    bool EnableBareSlashRegexLiterals = false;
 
     /// Sets the target we are building for and updates platform conditions
     /// to match.
@@ -747,10 +762,6 @@ namespace swift {
     /// Enable experimental support for one-way constraints for the
     /// parameters of closures.
     bool EnableOneWayClosureParameters = false;
-
-    /// Enable experimental support for type inference through multi-statement
-    /// closures.
-    bool EnableMultiStatementClosureInference = true;
 
     /// See \ref FrontendOptions.PrintFullConvention
     bool PrintFullConvention = false;

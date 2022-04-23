@@ -771,7 +771,7 @@ _cacheCanonicalSpecializedMetadata(const TypeContextDescriptor *description) {
       assert(result.second.Value == canonicalMetadata);
     }
   } else {
-    auto canonicalMetadatas = description->getCanonicicalMetadataPrespecializations();
+    auto canonicalMetadatas = description->getCanonicalMetadataPrespecializations();
     for (auto &canonicalMetadataPtr : canonicalMetadatas) {
       Metadata *canonicalMetadata = canonicalMetadataPtr.get();
       const void *const *arguments =
@@ -2385,7 +2385,7 @@ static ValueWitnessTable *getMutableVWTableForInit(StructMetadata *self,
   // Otherwise, allocate permanent memory for it and copy the existing table.
   void *memory = allocateMetadata(sizeof(ValueWitnessTable),
                                   alignof(ValueWitnessTable));
-  auto newTable = new (memory) ValueWitnessTable(*oldTable);
+  auto newTable = ::new (memory) ValueWitnessTable(*oldTable);
 
   // If we ever need to check layout-completeness asynchronously from
   // initialization, we'll need this to be a store-release (and rely on
@@ -4183,10 +4183,14 @@ public:
 
   struct Key {
     const NonUniqueExtendedExistentialTypeShape *Candidate;
+    llvm::StringRef TypeString;
+
+    Key(const NonUniqueExtendedExistentialTypeShape *candidate)
+      : Candidate(candidate),
+        TypeString(candidate->getExistentialTypeStringForUniquing()) {}
 
     friend llvm::hash_code hash_value(const Key &key) {
-      auto &candidate = *key.Candidate;
-      return hash_value(candidate.Hash);
+      return hash_value(key.TypeString);
     }
   };
 
@@ -4201,13 +4205,12 @@ public:
     auto self = Data;
     auto other = key.Candidate;
     if (self == other) return true;
-    return other->Hash == self->Hash;
+    return self->getExistentialTypeStringForUniquing() == key.TypeString;
   }
 
   friend llvm::hash_code hash_value(
                         const ExtendedExistentialTypeShapeCacheEntry &value) {
-    Key key = {value.Data};
-    return hash_value(key);
+    return hash_value(Key(value.Data));
   }
 
   static size_t getExtraAllocationSize(Key key) {
@@ -4251,7 +4254,7 @@ swift::swift_getExtendedExistentialTypeShape(
 
   // Find the unique entry.
   auto uniqueEntry = ExtendedExistentialTypeShapes.getOrInsert(
-      ExtendedExistentialTypeShapeCacheEntry::Key{ nonUnique });
+      ExtendedExistentialTypeShapeCacheEntry::Key(nonUnique));
 
   const ExtendedExistentialTypeShape *unique =
     &uniqueEntry.first->Data->LocalCopy;
@@ -4650,7 +4653,7 @@ static const WitnessTable *_getForeignWitnessTable(
   ForeignWitnessTables.getOrInsert(
       key, [&](ForeignWitnessTableCacheEntry *entryPtr, bool created) {
         if (created)
-          new (entryPtr)
+          ::new (entryPtr)
               ForeignWitnessTableCacheEntry(key, witnessTableCandidate);
         result = entryPtr->data;
         return true;

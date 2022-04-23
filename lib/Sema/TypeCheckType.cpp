@@ -3618,7 +3618,7 @@ TypeResolver::resolveIsolatedTypeRepr(IsolatedTypeRepr *repr,
 NeverNullType
 TypeResolver::resolveCompileTimeConstTypeRepr(CompileTimeConstTypeRepr *repr,
                                               TypeResolutionOptions options) {
-  // TODO: more diagnotics
+  // TODO: more diagnostics
   return resolveType(repr->getBase(), options);
 }
 
@@ -4008,6 +4008,30 @@ NeverNullType TypeResolver::resolveMetatypeType(MetatypeTypeRepr *repr,
 NeverNullType
 TypeResolver::buildMetatypeType(MetatypeTypeRepr *repr, Type instanceType,
                                 Optional<MetatypeRepresentation> storedRepr) {
+  // If the instance type is an existential metatype, figure out if
+  // the syntax is of the form '(any <protocol metatype>).Type'. In
+  // this case, type resolution should produce the static metatype
+  // of that existential metatype, versus another existential metatype
+  // via the old '<protocol metatype>.Type' syntax.
+  if (instanceType->is<ExistentialMetatypeType>()) {
+    // First, look for the paren type.
+    auto *tuple = dyn_cast<TupleTypeRepr>(repr->getBase());
+    if (tuple && tuple->isParenType()) {
+      // Then, look through parens for the 'any' keyword.
+      auto *element = tuple->getWithoutParens();
+      if (auto *existential = dyn_cast<ExistentialTypeRepr>(element)) {
+        // Finally, look for a constraint ending with '.Type'. Assume the
+        // base is a protocol, otherwise resolveExistentialType would
+        // have emitted an error message and returned the concrete type
+        // instead of an existential metatype.
+        auto *constraint = existential->getConstraint()->getWithoutParens();
+        if (isa<MetatypeTypeRepr>(constraint)) {
+          return MetatypeType::get(instanceType, storedRepr);
+        }
+      }
+    }
+  }
+
   if (instanceType->isAnyExistentialType() &&
       !instanceType->is<ExistentialType>()) {
     // TODO: diagnose invalid representations?
@@ -4282,7 +4306,6 @@ public:
                            proto->getDeclaredInterfaceType(),
                            proto->getExistentialType(),
                            /*isAlias=*/false)
-            .limitBehavior(DiagnosticBehavior::Warning)
             .fixItReplace(replaceRepr->getSourceRange(), fix);
       }
     } else if (auto *alias = dyn_cast_or_null<TypeAliasDecl>(comp->getBoundDecl())) {
@@ -4292,8 +4315,7 @@ public:
       // existential type.
       if (type->isConstraintType()) {
         auto layout = type->getExistentialLayout();
-        for (auto *proto : layout.getProtocols()) {
-          auto *protoDecl = proto->getDecl();
+        for (auto *protoDecl : layout.getProtocols()) {
           if (!protoDecl->existentialRequiresAny())
             continue;
 
@@ -4302,7 +4324,6 @@ public:
                              alias->getDeclaredInterfaceType(),
                              ExistentialType::get(alias->getDeclaredInterfaceType()),
                              /*isAlias=*/true)
-              .limitBehavior(DiagnosticBehavior::Warning)
               .fixItReplace(replaceRepr->getSourceRange(), fix);
         }
       }

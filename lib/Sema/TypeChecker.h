@@ -556,7 +556,7 @@ checkGenericArguments(ModuleDecl *module, ArrayRef<Requirement> requirements,
 /// }
 /// \endcode
 ///
-/// \param module The module to use for conformace lookup.
+/// \param module The module to use for conformance lookup.
 /// \param contextSig The generic signature that should be used to map
 /// \p parentTy into context. We pass a generic signature to secure on-demand
 /// computation of the associated generic enviroment.
@@ -623,7 +623,7 @@ void filterSolutionsForCodeCompletion(
 /// solutions. Such solutions can have any number of holes in them.
 ///
 /// \returns `true` if target was applicable and it was possible to infer
-/// types for code completion, `false` othrewise.
+/// types for code completion, `false` otherwise.
 bool typeCheckForCodeCompletion(
     constraints::SolutionApplicationTarget &target, bool needsPrecheck,
     llvm::function_ref<void(const constraints::Solution &)> callback);
@@ -666,18 +666,15 @@ bool typeCheckCondition(Expr *&expr, DeclContext *dc);
 ///
 /// \param fromType       The source type of the cast.
 /// \param toType         The destination type of the cast.
+/// \param contextKind    The cast context in which this is being typechecked.
 /// \param dc             The context of the cast.
-/// \param diagLoc        The location at which to report diagnostics.
-/// \param fromExpr       The expression describing the input operand.
-/// \param diagToRange    The source range of the destination type.
 ///
 /// \returns a CheckedCastKind indicating the semantics of the cast. If the
 /// cast is invalid, Unresolved is returned. If the cast represents an implicit
 /// conversion, Coercion is returned.
 CheckedCastKind typeCheckCheckedCast(Type fromType, Type toType,
-                                     CheckedCastContextKind ctxKind,
-                                     DeclContext *dc, SourceLoc diagLoc,
-                                     Expr *fromExpr, SourceRange diagToRange);
+                                     CheckedCastContextKind contextKind,
+                                     DeclContext *dc);
 
 /// Find the Objective-C class that bridges between a value of the given
 /// dynamic type and the given value type.
@@ -791,7 +788,8 @@ Expr *addImplicitLoadExpr(
 /// an empty optional.
 ProtocolConformanceRef containsProtocol(Type T, ProtocolDecl *Proto,
                                         ModuleDecl *M,
-                                        bool skipConditionalRequirements=false);
+                                        bool skipConditionalRequirements=false,
+                                        bool allowMissing=false);
 
 /// Determine whether the given type conforms to the given protocol.
 ///
@@ -1002,7 +1000,8 @@ bool diagnoseDeclRefExportability(SourceLoc loc,
 bool diagnoseConformanceExportability(SourceLoc loc,
                                       const RootProtocolConformance *rootConf,
                                       const ExtensionDecl *ext,
-                                      const ExportContext &where);
+                                      const ExportContext &where,
+                                      bool useConformanceAvailabilityErrorsOpt = false);
 
 /// \name Availability checking
 ///
@@ -1114,7 +1113,7 @@ const AvailableAttr *getDeprecated(const Decl *D);
 void diagnoseIfDeprecated(SourceRange SourceRange, const ExportContext &Where,
                           const ValueDecl *DeprecatedDecl, const Expr *Call);
 
-/// Emits a diagnostic for a reference to a conformnace that is deprecated.
+/// Emits a diagnostic for a reference to a conformance that is deprecated.
 bool diagnoseIfDeprecated(SourceLoc loc,
                           const RootProtocolConformance *rootConf,
                           const ExtensionDecl *ext,

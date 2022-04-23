@@ -1716,7 +1716,7 @@ void Parser::parseAllAvailabilityMacroArguments() {
   // The sub-parser is not actually parsing the source file but the LangOpts
   // AvailabilityMacros. No point creating a libSyntax tree for it. In fact, the
   // creation of a libSyntax tree would always fail because the
-  // AvailibilityMacro is not valid Swift source code.
+  // AvailabilityMacro is not valid Swift source code.
   LangOpts.BuildSyntaxTree = false;
 
   for (StringRef macro: LangOpts.AvailabilityMacros) {
@@ -2921,7 +2921,7 @@ bool Parser::parseNewDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc,
     StringRef message;
     if (consumeIf(tok::l_paren)) {
       if (!Tok.is(tok::identifier)) {
-        llvm_unreachable("Flag must start with an indentifier");
+        llvm_unreachable("Flag must start with an identifier");
       }
 
       StringRef flag = Tok.getText();
@@ -6343,7 +6343,7 @@ static bool parseAccessorIntroducer(Parser &P,
 /// \endverbatim
 ///
 /// While only 'get' accessors currently support such specifiers,
-/// this routine will also diagnose unspported effects specifiers on
+/// this routine will also diagnose unsupported effects specifiers on
 /// other accessors.
 ///
 /// \param accessors the accessors we've parsed already.
@@ -6958,6 +6958,11 @@ Parser::parseDeclVar(ParseDeclOptions Flags,
       // In our recursive parse, remember that we're in a var/let pattern.
       llvm::SaveAndRestore<decltype(InVarOrLetPattern)>
       T(InVarOrLetPattern, isLet ? IVOLP_InLet : IVOLP_InVar);
+
+      // Track whether we are parsing an 'async let' pattern.
+      const auto hasAsyncAttr = Attributes.hasAttribute<AsyncAttr>();
+      llvm::SaveAndRestore<bool> AsyncAttr(InPatternWithAsyncAttribute,
+                                           hasAsyncAttr);
 
       auto patternRes = parseTypedPattern();
       if (patternRes.hasCodeCompletion())
@@ -7643,7 +7648,11 @@ Parser::parseDeclEnumCase(ParseDeclOptions Flags,
         llvm::SaveAndRestore<decltype(InVarOrLetPattern)>
         T(InVarOrLetPattern, Parser::IVOLP_InMatchingPattern);
         parseMatchingPattern(/*isExprBasic*/false);
-        
+
+        // Reset async attribute in parser context.
+        llvm::SaveAndRestore<bool> AsyncAttr(InPatternWithAsyncAttribute,
+                                             false);
+
         if (consumeIf(tok::colon)) {
           backtrack.cancelBacktrack();
           diagnose(CaseLoc, diag::case_outside_of_switch, "case");
@@ -8527,6 +8536,13 @@ Parser::parseDeclOperator(ParseDeclOptions Flags, DeclAttributes &Attributes) {
     if (!Tok.getText().empty() && (Tok.getRawText().front() == '?' ||
                                    Tok.getRawText().front() == '!'))
       diagnose(Tok, diag::postfix_operator_name_cannot_start_with_unwrap);
+
+  // Prefix operators may not contain the `/` character when `/.../` regex
+  // literals are enabled.
+  if (Context.LangOpts.EnableBareSlashRegexLiterals) {
+    if (Attributes.hasAttribute<PrefixAttr>() && Tok.getText().contains("/"))
+      diagnose(Tok, diag::prefix_slash_not_allowed);
+  }
 
   // A common error is to try to define an operator with something in the
   // unicode plane considered to be an operator, or to try to define an

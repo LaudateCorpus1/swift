@@ -767,6 +767,11 @@ static llvm::cl::opt<bool>
                      llvm::cl::cat(Category), llvm::cl::init(false));
 
 static llvm::cl::opt<bool>
+    CxxInteropGettersSettersAsProperties("cxx-interop-getters-setters-as-properties",
+        llvm::cl::desc("Imports getters and setters as computed properties."),
+        llvm::cl::cat(Category), llvm::cl::init(false));
+
+static llvm::cl::opt<bool>
 CanonicalizeType("canonicalize-type", llvm::cl::Hidden,
                    llvm::cl::cat(Category), llvm::cl::init(false));
 
@@ -813,6 +818,11 @@ EnableExperimentalDistributed("enable-experimental-distributed",
 static llvm::cl::opt<bool> EnableExperimentalStringProcessing(
     "enable-experimental-string-processing",
     llvm::cl::desc("Enable experimental string processing"),
+    llvm::cl::init(false));
+
+static llvm::cl::opt<bool> EnableBareSlashRegexLiterals(
+    "enable-bare-slash-regex",
+    llvm::cl::desc("Enable the ability to write '/.../' regex literals"),
     llvm::cl::init(false));
 
 static llvm::cl::list<std::string>
@@ -4272,11 +4282,15 @@ int main(int argc, char *argv[]) {
   if (options::EnableCxxInterop) {
     InitInvok.getLangOptions().EnableCXXInterop = true;
   }
+  if (options::CxxInteropGettersSettersAsProperties) {
+    InitInvok.getLangOptions().CxxInteropGettersSettersAsProperties = true;
+  }
   if (options::EnableExperimentalConcurrency) {
     InitInvok.getLangOptions().EnableExperimentalConcurrency = true;
   }
   if (options::WarnConcurrency) {
-    InitInvok.getLangOptions().WarnConcurrency = true;
+    InitInvok.getLangOptions().StrictConcurrencyLevel =
+        StrictConcurrency::Complete;
   }
   if (options::DisableImplicitConcurrencyImport) {
     InitInvok.getLangOptions().DisableImplicitConcurrencyModuleImport = true;
@@ -4288,7 +4302,11 @@ int main(int argc, char *argv[]) {
     InitInvok.getLangOptions().EnableExperimentalNamedOpaqueTypes = true;
   }
   if (options::EnableExperimentalStringProcessing) {
-    InitInvok.getLangOptions().EnableExperimentalStringProcessing= true;
+    InitInvok.getLangOptions().EnableExperimentalStringProcessing = true;
+  }
+  if (options::EnableBareSlashRegexLiterals) {
+    InitInvok.getLangOptions().EnableBareSlashRegexLiterals = true;
+    InitInvok.getLangOptions().EnableExperimentalStringProcessing = true;
   }
 
   if (!options::Triple.empty())

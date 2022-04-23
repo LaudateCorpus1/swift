@@ -279,7 +279,7 @@ static CanType getHashableExistentialType(ModuleDecl *M) {
 //
 //          let c = b as! C // releases __SwiftValue
 //
-// After unwrapping Optional, the type may fall into one one of
+// After unwrapping Optional, the type may fall into one of
 // the following categories that are relevant for cast ownership:
 //
 // Class-bound types (hasReferenceSemantics() && !isPotentiallyAnyObject())
@@ -295,7 +295,7 @@ static CanType getHashableExistentialType(ModuleDecl *M) {
 // Potentially bridged values:
 // - includes struct, enum, non-class archetype, non-class existential,
 //   and non-objc-metatype
-// - these types are potentially trivial after subsitution. If so, then they
+// - these types are potentially trivial after substitution. If so, then they
 //   convert to a reference when casting to AnyObject or certain classes
 //
 // Any and AnyObject existentials:
@@ -320,8 +320,18 @@ bool swift::doesCastPreserveOwnershipForTypes(SILModule &module,
   if (!canIRGenUseScalarCheckedCastInstructions(module, sourceType, targetType))
     return false;
 
-  return !sourceType->isPotentiallyAnyObject()
-    && !targetType->isPotentiallyAnyObject();
+  // (B2) unwrapping
+  if (sourceType->isPotentiallyAnyObject())
+    return false;
+
+  // (B1) wrapping
+  if (targetType->isPotentiallyAnyObject()) {
+    // A class type cannot be wrapped in __SwiftValue, so casting
+    // from a class to AnyObject preserves ownership.
+    return
+      sourceType->mayHaveSuperclass() || sourceType->isClassExistentialType();
+  }
+  return true;
 }
 
 bool SILDynamicCastInst::isRCIdentityPreserving() const {

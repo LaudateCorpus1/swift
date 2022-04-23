@@ -747,7 +747,7 @@ Type ConstraintSystem::openUnboundGenericType(GenericTypeDecl *decl,
 
 static void checkNestedTypeConstraints(ConstraintSystem &cs, Type type,
                                        ConstraintLocatorBuilder locator) {
-  // If this is a type defined inside of constrainted extension, let's add all
+  // If this is a type defined inside of constrained extension, let's add all
   // of the generic requirements to the constraint system to make sure that it's
   // something we can use.
   GenericTypeDecl *decl = nullptr;
@@ -820,7 +820,7 @@ static void checkNestedTypeConstraints(ConstraintSystem &cs, Type type,
     }
   }
 
-  // And now make sure sure the parent is okay, for things like X<T>.Y.Z.
+  // And now make sure the parent is okay, for things like X<T>.Y.Z.
   checkNestedTypeConstraints(cs, parentTy, locator);
 }
 
@@ -1155,7 +1155,7 @@ doesStorageProduceLValue(AbstractStorageDecl *storage, Type baseType,
   }
 
   // Unsettable storage decls always produce rvalues.
-  if (!storage->isSettable(useDC, base))
+  if (!storage->isSettableInSwift(useDC, base))
     return false;
 
   if (!storage->isSetterAccessibleFrom(useDC))
@@ -3101,7 +3101,7 @@ void ConstraintSystem::bindOverloadType(
                                             : FunctionRefKind::Unapplied,
                              /*outerAlternatives=*/{}, keyPathLoc);
 
-    // In case of subscript things are more compicated comparing to "dot"
+    // In case of subscript things are more complicated comparing to "dot"
     // syntax, because we have to get "applicable function" constraint
     // associated with index expression and re-bind it to match "member type"
     // looked up by dynamically.
@@ -3558,17 +3558,78 @@ Type Solution::simplifyTypeForCodeCompletion(Type Ty) const {
 
   // Replace all type variables (which must come from placeholders) by their
   // generic parameters. Because we call into simplifyTypeImpl
-  Ty = CS.simplifyTypeImpl(Ty, [](TypeVariableType *typeVar) -> Type {
-    if (auto *GP = typeVar->getImpl().getGenericParameter()) {
-      // Code completion depends on generic parameter type being
-      // represented in terms of `ArchetypeType` since it's easy
-      // to extract protocol requirements from it.
-      if (auto *GPD = GP->getDecl()) {
-        return GPD->getInnermostDeclContext()->mapTypeIntoContext(GP);
+  Ty = CS.simplifyTypeImpl(Ty, [&CS](TypeVariableType *typeVar) -> Type {
+    // Code completion depends on generic parameter type being represented in
+    // terms of `ArchetypeType` since it's easy to extract protocol requirements
+    // from it.
+    auto getTypeVarAsArchetype = [](TypeVariableType *typeVar) -> Type {
+      if (auto *GP = typeVar->getImpl().getGenericParameter()) {
+        if (auto *GPD = GP->getDecl()) {
+          return GPD->getInnermostDeclContext()->mapTypeIntoContext(GP);
+        }
+      }
+      return Type();
+    };
+
+    if (auto archetype = getTypeVarAsArchetype(typeVar)) {
+      return archetype;
+    }
+
+    // When applying the logic below to get contextual types inside result
+    // builders, the code completion type variable is connected by a one-way
+    // constraint to a type variable in the buildBlock call, but that is not the
+    // type variable that represents the argument type. We need to find the type
+    // variable representing the argument to retrieve protocol requirements from
+    // it. Look for a ArgumentConversion constraint that allows us to retrieve
+    // the argument type var.
+    for (auto argConstraint :
+         CS.getConstraintGraph()[typeVar].getConstraints()) {
+      if (argConstraint->getKind() == ConstraintKind::ArgumentConversion &&
+          argConstraint->getFirstType()->getRValueType()->isEqual(typeVar)) {
+        if (auto argTV =
+                argConstraint->getSecondType()->getAs<TypeVariableType>()) {
+          if (auto archetype = getTypeVarAsArchetype(argTV)) {
+            return archetype;
+          }
+        }
       }
     }
+
     return typeVar;
   });
+
+  // Logic to determine the contextual type inside buildBlock result builders:
+  //
+  // When completing inside a result builder, the result builder
+  //   @ViewBuilder var body: some View {
+  //     Text("Foo")
+  //     #^COMPLETE^#
+  //   }
+  // gets rewritten to
+  //   @ViewBuilder var body: some View {
+  //     let $__builder2: Text
+  //     let $__builder0 = Text("Foo")
+  //     let $__builder1 = #^COMPLETE^#
+  //     $__builder2 = ViewBuilder.buildBlock($__builder0, $__builder1)
+  //     return $__builder2
+  //   }
+  // Inside the constraint system
+  //     let $__builder1 = #^COMPLETE^#
+  // gets type checked without context, so we can't know the contextual type for
+  // the code completion token. But we know that $__builder1 (and thus the type
+  // of #^COMPLETE^#) is used as the second argument to ViewBuilder.buildBlock,
+  // so we can extract the contextual type from that call. To do this, figure
+  // out the type variable that is used for $__builder1 in the buildBlock call.
+  // This type variable is connected to the type variable of $__builder1's
+  // definition by a one-way constraint.
+  if (auto TV = Ty->getAs<TypeVariableType>()) {
+    for (auto constraint : CS.getConstraintGraph()[TV].getConstraints()) {
+      if (constraint->getKind() == ConstraintKind::OneWayEqual &&
+          constraint->getSecondType()->isEqual(TV)) {
+        return simplifyTypeForCodeCompletion(constraint->getFirstType());
+      }
+    }
+  }
 
   // Remove any remaining type variables and placeholders
   Ty = simplifyType(Ty);
@@ -4040,7 +4101,7 @@ static bool diagnoseAmbiguityWithContextualType(
   };
 
   auto resultType = getResultType(aggregateFix.front());
-  // If right-hand side of the conversion (result of the the AST node)
+  // If right-hand side of the conversion (result of the AST node)
   // is the same across all of the solutions let's diagnose it as if
   // it it as a single failure.
   if (llvm::all_of(
@@ -5001,7 +5062,7 @@ void constraints::simplifyLocator(ASTNode &anchor,
 
     case ConstraintLocator::ArgumentAttribute: {
       // At this point we should have already found argument expression
-      // this attribute belogs to, so we can leave this element in place
+      // this attribute belongs to, so we can leave this element in place
       // because it points out exact location useful for diagnostics.
       break;
     }
@@ -5164,7 +5225,7 @@ bool constraints::hasAppliedSelf(const OverloadChoice &choice,
          doesMemberRefApplyCurriedSelf(baseType, decl);
 }
 
-/// Check whether given type conforms to `RawPepresentable` protocol
+/// Check whether given type conforms to `RawRepresentable` protocol
 /// and return the witness type.
 Type constraints::isRawRepresentable(ConstraintSystem &cs, Type type) {
   auto *DC = cs.DC;
@@ -6500,12 +6561,12 @@ bool ConstraintSystem::isReadOnlyKeyPathComponent(
     // WritableKeyPaths to be formed in the same conditions we did
     // in previous releases even if we should not be able to set
     // the value in this context.
-    if (!storage->isSettable(DC)) {
+    if (!storage->isSettableInSwift(DC)) {
       // A non-settable component makes the key path read-only, unless
       // a reference-writable component shows up later.
       return true;
     }
-  } else if (!storage->isSettable(nullptr) ||
+  } else if (!storage->isSettableInSwift(nullptr) ||
              !storage->isSetterAccessibleFrom(DC)) {
     // A non-settable component makes the key path read-only, unless
     // a reference-writable component shows up later.
@@ -6578,9 +6639,7 @@ bool ConstraintSystem::participatesInInference(ClosureExpr *closure) const {
   if (Options.contains(ConstraintSystemFlags::LeaveClosureBodyUnchecked))
     return false;
 
-  auto &ctx = closure->getASTContext();
-  if (closure->hasEmptyBody() ||
-      !ctx.TypeCheckerOpts.EnableMultiStatementClosureInference)
+  if (closure->hasEmptyBody())
     return false;
 
   // If body is nested in a parent that has a function builder applied,

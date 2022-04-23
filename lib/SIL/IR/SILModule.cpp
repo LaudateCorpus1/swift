@@ -138,6 +138,7 @@ SILModule::~SILModule() {
   for (SILFunction &F : *this) {
     F.dropAllReferences();
     F.dropDynamicallyReplacedFunction();
+    F.dropReferencedAdHocRequirementWitnessFunction();
     F.clearSpecializeAttrs();
   }
 
@@ -177,7 +178,7 @@ void SILModule::checkForLeaks() const {
                        
   if (numAllocated != instsInModule) {
     llvm::errs() << "Leaking instructions!\n";
-    llvm::errs() << "Alloated instructions: " << numAllocated << '\n';
+    llvm::errs() << "Allocated instructions: " << numAllocated << '\n';
     llvm::errs() << "Instructions in module: " << instsInModule << '\n';
     llvm_unreachable("leaking instructions");
   }
@@ -467,6 +468,7 @@ void SILModule::eraseFunction(SILFunction *F) {
   // (References are not needed anymore.)
   F->clear();
   F->dropDynamicallyReplacedFunction();
+  F->dropReferencedAdHocRequirementWitnessFunction();
   // Drop references for any _specialize(target:) functions.
   F->clearSpecializeAttrs();
 }

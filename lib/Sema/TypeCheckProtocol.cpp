@@ -141,7 +141,7 @@ getTypesToCompare(ValueDecl *reqt, Type reqtType, bool reqtTypeIsIUO,
                   Type witnessType, bool witnessTypeIsIUO,
                   VarianceKind variance) {
   // If the witness type is noescape but the requirement type is not,
-  // adjust the witness type to be escaping; likewisse for sendability. This
+  // adjust the witness type to be escaping; likewise for sendability. This
   // permits a limited form of covariance.
   auto applyAdjustment = [&](TypeAdjustment adjustment) {
     // Sometimes the witness has a function type, but the requirement has
@@ -2038,10 +2038,10 @@ checkIndividualConformance(NormalProtocolConformance *conformance,
 
   if (Proto->isObjC()) {
     // Foreign classes cannot conform to objc protocols.
-    if (auto clas = canT->getClassOrBoundGenericClass()) {
+    if (auto clazz = canT->getClassOrBoundGenericClass()) {
       Optional<decltype(diag::cf_class_cannot_conform_to_objc_protocol)>
       diagKind;
-      switch (clas->getForeignClassKind()) {
+      switch (clazz->getForeignClassKind()) {
         case ClassDecl::ForeignKind::Normal:
           break;
         case ClassDecl::ForeignKind::CFType:
@@ -2097,8 +2097,8 @@ checkIndividualConformance(NormalProtocolConformance *conformance,
     // conditional conformances involving them. Check the full stack of nested
     // types for any obj-c ones.
     while (nestedType) {
-      if (auto clas = nestedType->getClassOrBoundGenericClass()) {
-        if (clas->isTypeErasedGenericClass()) {
+      if (auto clazz = nestedType->getClassOrBoundGenericClass()) {
+        if (clazz->isTypeErasedGenericClass()) {
           C.Diags.diagnose(ComplainLoc,
                            diag::objc_generics_cannot_conditionally_conform, T,
                            ProtoType);
@@ -2578,7 +2578,7 @@ diagnoseMatch(ModuleDecl *module, NormalProtocolConformance *conformance,
 
   case MatchKind::TypeConflict: {
     if (!isa<TypeDecl>(req) && !isa<EnumElementDecl>(match.Witness)) {
-      computeFixitsForOverridenDeclaration(match.Witness, req, [&](bool){
+      computeFixitsForOverriddenDeclaration(match.Witness, req, [&](bool){
         return diags.diagnose(match.Witness,
                               diag::protocol_witness_type_conflict,
                               getTypeForDisplay(module, match.Witness),
@@ -2956,7 +2956,7 @@ bool ConformanceChecker::checkActorIsolation(
 
   auto refResult = ActorReferenceResult::forReference(
       getConcreteWitness(), witness->getLoc(), DC, None, None,
-      requirementIsolation);
+      None, requirementIsolation);
   bool sameConcurrencyDomain = false;
   switch (refResult) {
   case ActorReferenceResult::SameConcurrencyDomain:
@@ -5408,6 +5408,16 @@ void swift::diagnoseConformanceFailure(Type T,
     if (!nominal)
       return;
 
+    if (isa<ClassDecl>(nominal) &&
+        !nominal->isDistributedActor()) {
+      if (nominal->isActor()) {
+        diags.diagnose(ComplainLoc,
+                       diag::actor_cannot_inherit_distributed_actor_protocol,
+                       nominal->getName());
+      } // else, already diagnosed elsewhere
+      return;
+    }
+
     // If it is missing the ActorSystem type, suggest adding it:
     auto systemTy = getDistributedActorSystemType(/*actor=*/nominal);
     if (!systemTy || systemTy->hasError()) {
@@ -5528,7 +5538,8 @@ void ConformanceChecker::emitDelayedDiags() {
 
 ProtocolConformanceRef
 TypeChecker::containsProtocol(Type T, ProtocolDecl *Proto, ModuleDecl *M,
-                              bool skipConditionalRequirements) {
+                              bool skipConditionalRequirements,
+                              bool allowMissing) {
   // Existential types don't need to conform, i.e., they only need to
   // contain the protocol.
   if (T->isExistentialType()) {
@@ -5550,17 +5561,16 @@ TypeChecker::containsProtocol(Type T, ProtocolDecl *Proto, ModuleDecl *M,
     if (auto superclass = layout.getSuperclass()) {
       auto result =
           (skipConditionalRequirements
-           ? M->lookupConformance(superclass, Proto)
-           : TypeChecker::conformsToProtocol(superclass, Proto, M));
+           ? M->lookupConformance(superclass, Proto, allowMissing)
+           : TypeChecker::conformsToProtocol(
+               superclass, Proto, M, allowMissing));
       if (result) {
         return result;
       }
     }
 
     // Next, check if the existential contains the protocol in question.
-    for (auto P : layout.getProtocols()) {
-      auto *PD = P->getDecl();
-
+    for (auto *PD : layout.getProtocols()) {
       // If we found the protocol we're looking for, return an abstract
       // conformance to it.
       if (PD == Proto)
@@ -5571,13 +5581,22 @@ TypeChecker::containsProtocol(Type T, ProtocolDecl *Proto, ModuleDecl *M,
         return ProtocolConformanceRef(Proto);
     }
 
+    // FIXME: Unify with shouldCreateMissingConformances
+    if (allowMissing &&
+        Proto->isSpecificProtocol(KnownProtocolKind::Sendable)) {
+      return ProtocolConformanceRef(
+          M->getASTContext().getBuiltinConformance(
+            T, Proto, GenericSignature(), { },
+            BuiltinConformanceKind::Missing));
+    }
+
     return ProtocolConformanceRef::forInvalid();
   }
 
   // For non-existential types, this is equivalent to checking conformance.
   return (skipConditionalRequirements
-          ? M->lookupConformance(T, Proto)
-          : TypeChecker::conformsToProtocol(T, Proto, M));
+          ? M->lookupConformance(T, Proto, allowMissing)
+          : TypeChecker::conformsToProtocol(T, Proto, M, allowMissing));
 }
 
 ProtocolConformanceRef
@@ -6324,17 +6343,20 @@ void TypeChecker::checkConformancesInContext(IterableDeclContext *idc) {
         if (!classDecl->isDistributedActor()) {
           if (classDecl->isActor()) {
             dc->getSelfNominalTypeDecl()
-            ->diagnose(diag::distributed_actor_protocol_illegal_inheritance,
+            ->diagnose(diag::actor_cannot_inherit_distributed_actor_protocol,
                        dc->getSelfNominalTypeDecl()->getName())
                        .fixItInsert(classDecl->getStartLoc(), "distributed ");
           } else {
             dc->getSelfNominalTypeDecl()
-            ->diagnose(diag::actor_protocol_illegal_inheritance,
+            ->diagnose(diag::distributed_actor_protocol_illegal_inheritance,
                        dc->getSelfNominalTypeDecl()->getName())
                        .fixItReplace(nominal->getStartLoc(), "distributed actor");
           }
         }
       }
+    } else if (proto->isSpecificProtocol(
+                   KnownProtocolKind::DistributedActorSystem)) {
+      checkDistributedActorSystem(nominal);
     } else if (proto->isSpecificProtocol(KnownProtocolKind::Actor)) {
       if (auto classDecl = dyn_cast<ClassDecl>(nominal)) {
         if (!classDecl->isExplicitActor()) {
@@ -6843,6 +6865,7 @@ ValueDecl *TypeChecker::deriveProtocolRequirement(DeclContext *DC,
 
   case KnownDerivableProtocolKind::DistributedActor:
     return derived.deriveDistributedActor(Requirement);
+
   case KnownDerivableProtocolKind::DistributedActorSystem:
     return derived.deriveDistributedActorSystem(Requirement);
 

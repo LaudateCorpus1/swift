@@ -27,10 +27,11 @@ public protocol DistributedActorSystem: Sendable {
   associatedtype ResultHandler: DistributedTargetInvocationResultHandler
 
   /// The serialization requirement that will be applied to all distributed targets used with this system.
+  // TODO: constrain SerializationRequirement in typesystem to only be ok with protocol or class here
   associatedtype SerializationRequirement
     where SerializationRequirement == InvocationEncoder.SerializationRequirement,
-    SerializationRequirement == InvocationDecoder.SerializationRequirement,
-    SerializationRequirement == ResultHandler.SerializationRequirement
+          SerializationRequirement == InvocationDecoder.SerializationRequirement,
+          SerializationRequirement == ResultHandler.SerializationRequirement
 
   // ==== ---------------------------------------------------------------------
   // - MARK: Resolving actors by identity
@@ -95,11 +96,11 @@ public protocol DistributedActorSystem: Sendable {
     Act.ID == ActorID
 
   /// Called during when a distributed actor is deinitialized, or fails to initialize completely (e.g. by throwing
-  /// out of an `init` that did not completely initialize all of the the actors stored properties yet).
+  /// out of an `init` that did not completely initialize all of the actors stored properties yet).
   ///
   /// This method is guaranteed to be called at-most-once for a given id (assuming IDs are unique,
   /// and not re-cycled by the system), i.e. if it is called during a failure to initialize completely,
-  /// the call from the actor's deinitalizer will not happen (as under these circumstances, `deinit` will be run).
+  /// the call from the actor's deinitializer will not happen (as under these circumstances, `deinit` will be run).
   ///
   /// If `resignID` gets called with some unknown ID, it should crash immediately as it signifies some
   /// very unexpected use of the system.

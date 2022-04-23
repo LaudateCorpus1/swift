@@ -134,6 +134,25 @@ void IRGenModule::setTrueConstGlobal(llvm::GlobalVariable *var) {
   }
 }
 
+static GenericParamDescriptor
+getGenericParamDescriptor(GenericTypeParamType *param, bool canonical) {
+  return GenericParamDescriptor(GenericParamKind::Type,
+                                /*key argument*/ canonical,
+                                /*extra argument*/ false);
+}
+
+static bool canUseImplicitGenericParamDescriptors(CanGenericSignature sig) {
+  bool allImplicit = true;
+  unsigned count = 0;
+  sig->forEachParam([&](GenericTypeParamType *param, bool canonical) {
+    auto descriptor = getGenericParamDescriptor(param, canonical);
+    if (descriptor != GenericParamDescriptor::implicit())
+      allImplicit = false;
+    count++;
+  });
+  return allImplicit && count <= MaxNumImplicitGenericParamDescriptors;
+}
+
 /*****************************************************************************/
 /** Metadata completion ******************************************************/
 /*****************************************************************************/
@@ -391,7 +410,66 @@ void IRGenModule::addVTableTypeMetadata(
                      std::make_pair(minOffset, maxOffset + relptrSize));
 }
 
+static void addPaddingAfterGenericParamDescriptors(IRGenModule &IGM,
+                                            ConstantStructBuilder &b,
+                                            unsigned numDescriptors) {
+  unsigned padding = (unsigned) -numDescriptors & 3;
+  for (unsigned i = 0; i < padding; ++i)
+    b.addInt(IGM.Int8Ty, 0);
+}
+
 namespace {
+  struct GenericSignatureHeaderBuilder {
+    using PlaceholderPosition =
+      ConstantAggregateBuilderBase::PlaceholderPosition;
+    PlaceholderPosition NumParamsPP;
+    PlaceholderPosition NumRequirementsPP;
+    PlaceholderPosition NumKeyArgumentsPP;
+    PlaceholderPosition NumExtraArgumentsPP;
+    unsigned NumParams = 0;
+    unsigned NumRequirements = 0;
+    unsigned NumKeyArguments = 0;
+    unsigned NumExtraArguments = 0;
+
+    GenericSignatureHeaderBuilder(IRGenModule &IGM,
+                                  ConstantStructBuilder &builder)
+      : NumParamsPP(builder.addPlaceholderWithSize(IGM.Int16Ty)),
+        NumRequirementsPP(builder.addPlaceholderWithSize(IGM.Int16Ty)),
+        NumKeyArgumentsPP(builder.addPlaceholderWithSize(IGM.Int16Ty)),
+        NumExtraArgumentsPP(builder.addPlaceholderWithSize(IGM.Int16Ty)) {}
+
+    void adjustAfterParameter(GenericParamDescriptor param) {
+      ++NumParams;
+      if (param.hasKeyArgument())
+        ++NumKeyArguments;
+      if (param.hasExtraArgument())
+        ++NumExtraArguments;
+    }
+
+    void adjustAfterRequirements(const GenericRequirementsMetadata &info) {
+      NumRequirements = info.NumRequirements;
+      NumKeyArguments += info.NumGenericKeyArguments;
+      NumExtraArguments += info.NumGenericExtraArguments;
+    }
+
+    void finish(IRGenModule &IGM, ConstantStructBuilder &b) {
+      assert(NumParams <= UINT16_MAX && "way too generic");
+      b.fillPlaceholderWithInt(NumParamsPP, IGM.Int16Ty, NumParams);
+
+      assert(NumRequirements <= UINT16_MAX && "way too generic");
+      b.fillPlaceholderWithInt(NumRequirementsPP, IGM.Int16Ty,
+                               NumRequirements);
+
+      assert(NumKeyArguments <= UINT16_MAX && "way too generic");
+      b.fillPlaceholderWithInt(NumKeyArgumentsPP, IGM.Int16Ty,
+                               NumKeyArguments);
+
+      assert(NumExtraArguments <= UINT16_MAX && "way too generic");
+      b.fillPlaceholderWithInt(NumExtraArgumentsPP, IGM.Int16Ty,
+                               NumExtraArguments);
+    }
+  };
+
   template<class Impl>
   class ContextDescriptorBuilderBase {
   protected:
@@ -401,13 +479,7 @@ namespace {
     ConstantInitBuilder InitBuilder;
   protected:
     ConstantStructBuilder B;
-    Optional<ConstantAggregateBuilderBase::PlaceholderPosition>
-      GenericParamCount,
-      GenericRequirementCount,
-      GenericKeyArgumentCount,
-      GenericExtraArgumentCount;
-    unsigned NumGenericKeyArguments = 0;
-    unsigned NumGenericExtraArguments = 0;
+    Optional<GenericSignatureHeaderBuilder> SignatureHeader;
 
     ContextDescriptorBuilderBase(IRGenModule &IGM)
       : IGM(IGM), InitBuilder(IGM), B(InitBuilder.beginStruct()) {
@@ -452,10 +524,7 @@ namespace {
     void addGenericParametersHeader() {
       // Drop placeholders for the counts. We'll fill these in when we emit
       // the related sections.
-      GenericParamCount = B.addPlaceholderWithSize(IGM.Int16Ty);
-      GenericRequirementCount = B.addPlaceholderWithSize(IGM.Int16Ty);
-      GenericKeyArgumentCount = B.addPlaceholderWithSize(IGM.Int16Ty);
-      GenericExtraArgumentCount = B.addPlaceholderWithSize(IGM.Int16Ty);
+      SignatureHeader.emplace(IGM, B);
     }
     
     void addGenericParameters() {
@@ -466,33 +535,18 @@ namespace {
       canSig->forEachParam([&](GenericTypeParamType *param, bool canonical) {
         // Currently, there are only type parameters. The parameter is a key
         // argument if it's canonical in its generic context.
-        asImpl().addGenericParameter(GenericParamKind::Type,
-                                     /*key argument*/ canonical,
-                                     /*extra argument*/ false);
+        asImpl().addGenericParameter(
+          getGenericParamDescriptor(param, canonical));
       });
 
       // Pad the structure up to four bytes for the following requirements.
-      unsigned padding = (unsigned) -canSig.getGenericParams().size() & 3;
-      for (unsigned i = 0; i < padding; ++i)
-        B.addInt(IGM.Int8Ty, 0);
-      
-      // Fill in the parameter count.
-      assert(canSig.getGenericParams().size() <= UINT16_MAX
-             && "way too generic");
-      B.fillPlaceholderWithInt(*GenericParamCount, IGM.Int16Ty,
-                               canSig.getGenericParams().size());
+      addPaddingAfterGenericParamDescriptors(IGM, B,
+                                             SignatureHeader->NumParams);
     }
     
-    void addGenericParameter(GenericParamKind kind,
-                             bool isKeyArgument, bool isExtraArgument) {
-      if (isKeyArgument)
-        ++NumGenericKeyArguments;
-      if (isExtraArgument)
-        ++NumGenericExtraArguments;
-      
-      B.addInt(IGM.Int8Ty,
-               GenericParamDescriptor(kind, isKeyArgument, isExtraArgument)
-                 .getIntValue());
+    void addGenericParameter(GenericParamDescriptor param) {
+      B.addInt(IGM.Int8Ty, param.getIntValue());
+      SignatureHeader->adjustAfterParameter(param);
     }
     
     void addGenericRequirements() {
@@ -500,24 +554,11 @@ namespace {
         irgen::addGenericRequirements(IGM, B,
                             asImpl().getGenericSignature(),
                             asImpl().getGenericSignature().getRequirements());
-
-      // Fill in the final requirement count.
-      assert(metadata.NumRequirements <= UINT16_MAX
-             && "way too generic");
-      B.fillPlaceholderWithInt(*GenericRequirementCount, IGM.Int16Ty,
-                               metadata.NumRequirements);
-      NumGenericKeyArguments += metadata.NumGenericKeyArguments;
-      NumGenericExtraArguments += metadata.NumGenericExtraArguments;
+      SignatureHeader->adjustAfterRequirements(metadata);
     }
 
     void finishGenericParameters() {
-      assert(NumGenericKeyArguments <= UINT16_MAX
-             && NumGenericExtraArguments <= UINT16_MAX
-             && "way too generic");
-      B.fillPlaceholderWithInt(*GenericKeyArgumentCount, IGM.Int16Ty,
-                               NumGenericKeyArguments);
-      B.fillPlaceholderWithInt(*GenericExtraArgumentCount, IGM.Int16Ty,
-                               NumGenericExtraArguments);
+      SignatureHeader->finish(IGM, B);
     }
 
     uint8_t getVersion() {
@@ -2515,6 +2556,15 @@ void irgen::emitLazyTypeContextDescriptor(IRGenModule &IGM,
 void irgen::emitLazyTypeMetadata(IRGenModule &IGM, NominalTypeDecl *type) {
   eraseExistingTypeContextDescriptor(IGM, type);
 
+  // Special case, UFOs are opaque pointers for now.
+  if (auto cd = dyn_cast<ClassDecl>(type)) {
+    if (cd->isForeignReferenceType()) {
+      auto sd = cast<StructDecl>(type->getASTContext().getOpaquePointerDecl());
+      emitStructMetadata(IGM, sd);
+      return;
+    }
+  }
+
   if (requiresForeignTypeMetadata(type)) {
     emitForeignTypeMetadata(IGM, type);
   } else if (auto sd = dyn_cast<StructDecl>(type)) {
@@ -4167,7 +4217,7 @@ namespace {
   //        Without this template typealias, the following errors are produced
   //        when compiling on Linux and Windows, respectively:
   //
-  //        template argument for template template parameter must be a class
+  //        template argument for template parameter must be a class
   //        template or type alias template
   //
   //        invalid template argument for template parameter
@@ -4358,7 +4408,7 @@ void irgen::emitClassMetadata(IRGenModule &IGM, ClassDecl *classDecl,
 
   // If the class does not require dynamic initialization, or if it only
   // requires dynamic initialization on a newer Objective-C runtime, add it
-  // to the Objctive-C class list.
+  // to the Objective-C class list.
   if (IGM.ObjCInterop) {
     switch (strategy) {
     case ClassMetadataStrategy::Resilient:
@@ -4867,7 +4917,7 @@ namespace {
   //        Without this template typealias, the following errors are produced
   //        when compiling on Linux and Windows, respectively:
   //
-  //        template argument for template template parameter must be a class
+  //        template argument for template parameter must be a class
   //        template or type alias template
   //
   //        invalid template argument for template parameter
@@ -5073,7 +5123,7 @@ namespace {
   //        Without this template typealias, the following errors are produced
   //        when compiling on Linux and Windows, respectively:
   //
-  //        template argument for template template parameter must be a class
+  //        template argument for template parameter must be a class
   //        template or type alias template
   //
   //        invalid template argument for template parameter
@@ -5547,10 +5597,10 @@ bool irgen::requiresForeignTypeMetadata(CanType type) {
 }
 
 bool irgen::requiresForeignTypeMetadata(NominalTypeDecl *decl) {
-  if (auto *clas = dyn_cast<ClassDecl>(decl)) {
-    assert(!clas->isForeignReferenceType());
+  if (auto *clazz = dyn_cast<ClassDecl>(decl)) {
+    assert(!clazz->isForeignReferenceType());
     
-    switch (clas->getForeignClassKind()) {
+    switch (clazz->getForeignClassKind()) {
     case ClassDecl::ForeignKind::Normal:
     case ClassDecl::ForeignKind::RuntimeOnly:
       return false;
@@ -5731,6 +5781,16 @@ void IRGenModule::emitProtocolDecl(ProtocolDecl *protocol) {
 // Generic requirements.
 //===----------------------------------------------------------------------===//
 
+static void addRelativeAddressOfTypeRef(IRGenModule &IGM,
+                                        ConstantStructBuilder &B,
+                                        Type type,
+                                        GenericSignature sig,
+                                        MangledTypeRefRole role =
+                                          MangledTypeRefRole::Metadata) {
+  auto typeName = IGM.getTypeRef(type, sig, role).first;
+  B.addRelativeAddress(typeName);
+}
+
 /// Add a generic requirement to the given constant struct builder.
 static void addGenericRequirement(IRGenModule &IGM, ConstantStructBuilder &B,
                                   GenericRequirementsMetadata &metadata,
@@ -5744,9 +5804,7 @@ static void addGenericRequirement(IRGenModule &IGM, ConstantStructBuilder &B,
     ++metadata.NumGenericExtraArguments;
 
   B.addInt(IGM.Int32Ty, flags.getIntValue());
-  auto typeName =
-      IGM.getTypeRef(paramType, nullptr, MangledTypeRefRole::Metadata).first;
-  B.addRelativeAddress(typeName);
+  addRelativeAddressOfTypeRef(IGM, B, paramType, nullptr);
   addReference();
 }
 
@@ -5933,4 +5991,174 @@ llvm::GlobalValue *irgen::emitAsyncFunctionPointer(IRGenModule &IGM,
   builder.addInt32(size.getValue());
   return cast<llvm::GlobalValue>(IGM.defineAsyncFunctionPointer(
       entity, builder.finishAndCreateFuture()));
+}
+
+static FormalLinkage getExistentialShapeLinkage(CanGenericSignature genSig,
+                                                CanExistentialType type) {
+  auto typeLinkage = getTypeLinkage_correct(type);
+  if (typeLinkage == FormalLinkage::Private)
+    return FormalLinkage::Private;
+
+  auto signatureLinkage = getGenericSignatureLinkage(genSig);
+  if (signatureLinkage == FormalLinkage::Private)
+    return FormalLinkage::Private;
+
+  if (typeLinkage == FormalLinkage::HiddenUnique ||
+      signatureLinkage == FormalLinkage::HiddenUnique)
+    return FormalLinkage::HiddenUnique;
+
+  return FormalLinkage::PublicNonUnique;
+}
+
+std::pair<llvm::Constant *, /*unique*/ bool>
+irgen::emitExtendedExistentialTypeShape(IRGenModule &IGM,
+                                 const ExistentialTypeGeneralization &info,
+                                        unsigned metatypeDepth) {
+  CanGenericSignature genSig;
+  if (info.Generalization)
+    genSig = info.Generalization.getGenericSignature()
+                                .getCanonicalSignature();
+  CanExistentialType existentialType =
+    cast<ExistentialType>(info.Shape->getCanonicalType());
+
+  CanType shapeType = existentialType;
+  for (unsigned i = 0; i != metatypeDepth; ++i)
+    shapeType = CanExistentialMetatypeType::get(shapeType);
+
+  auto linkage = getExistentialShapeLinkage(genSig, existentialType);
+  assert(linkage != FormalLinkage::PublicUnique);
+  bool isUnique = (linkage != FormalLinkage::PublicNonUnique);
+  bool isShared = (linkage != FormalLinkage::Private);
+
+  auto entity =
+    LinkEntity::forExtendedExistentialTypeShape(genSig, shapeType,
+                                                isUnique, isShared);
+
+  auto shape = IGM.getOrCreateLazyGlobalVariable(entity,
+                                       [&](ConstantInitBuilder &builder) {
+    auto b = builder.beginStruct();
+
+    // The NonUniqueExtendedExistentialTypeShape prefix.
+    if (!isUnique) {
+      // Create a cache variable, initialized to null.
+      auto cache = new llvm::GlobalVariable(IGM.Module, IGM.Int8PtrTy,
+                              /*constant*/ false,
+                              llvm::GlobalVariable::PrivateLinkage,
+                              llvm::ConstantPointerNull::get(IGM.Int8PtrTy));
+      cache->setAlignment((llvm::MaybeAlign) IGM.getPointerAlignment());
+
+      // Relative address to the cache variable.
+      b.addRelativeAddress(cache);
+    }
+
+    CanGenericSignature reqSig =
+      IGM.Context.getOpenedArchetypeSignature(existentialType, genSig);
+
+    CanType typeExpression;
+    if (metatypeDepth > 0) {
+      typeExpression = CanType(reqSig.getGenericParams()[0]);
+      for (unsigned i = 0; i != metatypeDepth; ++i)
+        typeExpression = CanMetatypeType::get(typeExpression);
+    }
+
+    using SpecialKind = ExtendedExistentialTypeShapeFlags::SpecialKind;
+    SpecialKind specialKind = [&] {
+      if (metatypeDepth > 0)
+        return SpecialKind::Metatype;
+      if (existentialType->requiresClass())
+        return SpecialKind::Class;
+      return SpecialKind::None;
+    }();
+
+    auto flags = ExtendedExistentialTypeShapeFlags()
+      .withSpecialKind(specialKind)
+      .withHasTypeExpression((bool) typeExpression)
+      .withGeneralizationSignature((bool) genSig)
+      .withSuggestedValueWitnesses(false)
+      .withImplicitReqSigParams(canUseImplicitGenericParamDescriptors(reqSig))
+      .withImplicitGenSigParams(
+         genSig && canUseImplicitGenericParamDescriptors(genSig));
+
+    // ExtendedExistentialTypeShapeFlags Flags;
+    b.addInt32(flags.getIntValue());
+
+    // RelativePointer<const char> ExistentialType;
+    // This must always be a flat string if we're emitting a
+    // non-unique shape.  We don't need it to be a flat string if
+    // we're emitting a unique shape, but we do need it to not
+    // recurse back into this code to produce a shape, and the
+    // easiest way to achieve that is to always ask for a flat
+    // unique string.
+    addRelativeAddressOfTypeRef(IGM, b, shapeType, genSig,
+                                MangledTypeRefRole::FlatUnique);
+
+    auto addSignatureHeader = [&](CanGenericSignature sig) {
+      return GenericSignatureHeaderBuilder(IGM, b);
+    };
+
+    // GenericContextDescriptorHeader ReqSigHeader;
+    auto reqHeader = addSignatureHeader(reqSig);
+
+    // GenericContextDescriptorHeader GenSigHeader; // optional
+    Optional<GenericSignatureHeaderBuilder> genHeader;
+    if (genSig)
+      genHeader.emplace(addSignatureHeader(genSig));
+
+    // RelativePointer<const char> TypeExpression; // optional
+    if (flags.hasTypeExpression()) {
+      addRelativeAddressOfTypeRef(IGM, b, typeExpression, /*sig*/nullptr);
+    }
+
+    // RelativePointer<const ValueWitnessTable> SuggestedValueWitnesses; // optional
+    if (flags.hasSuggestedValueWitnesses()) {
+      auto vwtable = emitValueWitnessTable(IGM, existentialType,
+                                           /*pattern*/ false,
+                                           /*relative*/ true);
+      b.addRelativeAddress(vwtable);
+    }
+
+    // GenericParamDescriptor GenericParams[*];
+    unsigned totalParamDescriptors = 0;
+    auto addParamDescriptors = [&](CanGenericSignature sig,
+                                   GenericSignatureHeaderBuilder &header,
+                                   bool implicit) {
+      sig->forEachParam([&](GenericTypeParamType *param, bool canonical) {
+        auto descriptor = getGenericParamDescriptor(param, canonical);
+        assert(!implicit || descriptor == GenericParamDescriptor::implicit());
+        if (!implicit) {
+          b.addInt(IGM.Int8Ty, descriptor.getIntValue());
+          totalParamDescriptors++;
+        }
+        header.adjustAfterParameter(descriptor);
+      });
+    };
+    addParamDescriptors(reqSig, reqHeader, flags.hasImplicitReqSigParams());
+    if (genSig)
+      addParamDescriptors(genSig, *genHeader, flags.hasImplicitGenSigParams());
+
+    addPaddingAfterGenericParamDescriptors(IGM, b, totalParamDescriptors);
+
+    auto addRequirementDescriptors = [&](CanGenericSignature sig,
+                                      GenericSignatureHeaderBuilder &header) {
+      auto info = addGenericRequirements(IGM, b, sig, sig.getRequirements());
+      header.adjustAfterRequirements(info);
+      header.finish(IGM, b);
+    };
+
+    // GenericRequirementDescriptor GenericRequirements[*];
+    addRequirementDescriptors(reqSig, reqHeader);
+    if (genSig) {
+      addRequirementDescriptors(genSig, *genHeader);
+    }
+
+    return b.finishAndCreateFuture();
+  }, [&](llvm::GlobalVariable *var) {
+    var->setConstant(true);
+    IGM.setTrueConstGlobal(var);
+  });
+
+  return {
+    llvm::ConstantExpr::getBitCast(shape, IGM.Int8PtrTy),
+    isUnique
+  };
 }

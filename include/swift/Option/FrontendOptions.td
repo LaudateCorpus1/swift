@@ -422,10 +422,6 @@ def disable_implicit_concurrency_module_import : Flag<["-"],
   "disable-implicit-concurrency-module-import">,
   HelpText<"Disable the implicit import of the _Concurrency module.">;
 
-def disable_implicit_distributed_module_import : Flag<["-"],
-  "disable-implicit-distributed-module-import">,
-  HelpText<"Disable the implicit import of the Distributed module.">;
-
 def disable_implicit_string_processing_module_import : Flag<["-"],
   "disable-implicit-string-processing-module-import">,
   HelpText<"Disable the implicit import of the _StringProcessing module.">;
@@ -562,6 +558,9 @@ def disable_deserialization_recovery :
 def enable_experimental_string_processing :
   Flag<["-"], "enable-experimental-string-processing">,
   HelpText<"Enable experimental string processing">;
+def disable_experimental_string_processing :
+  Flag<["-"], "disable-experimental-string-processing">,
+  HelpText<"Disable experimental string processing">;
 
 def enable_experimental_variadic_generics :
   Flag<["-"], "enable-experimental-variadic-generics">,
@@ -828,6 +827,16 @@ def enable_experimental_cxx_interop :
   HelpText<"Enable C++ interop code generation and config directives">,
   Flags<[FrontendOption, HelpHidden]>;
 
+def enable_cxx_interop :
+  Flag<["-"], "enable-cxx-interop">,
+  HelpText<"Alias for -enable-experimental-cxx-interop">,
+  Flags<[FrontendOption, HelpHidden]>;
+
+def cxx_interop_getters_setters_as_properties :
+  Flag<["-"], "cxx-interop-getters-setters-as-properties">,
+  HelpText<"Import getters and setters as computed properties in Swift">,
+  Flags<[FrontendOption, HelpHidden]>;
+
 def use_malloc : Flag<["-"], "use-malloc">,
   HelpText<"Allocate internal data structures using malloc "
            "(for memory debugging)">;
@@ -891,14 +900,6 @@ def experimental_print_full_convention :
 def experimental_one_way_closure_params :
   Flag<["-"], "experimental-one-way-closure-params">,
   HelpText<"Enable experimental support for one-way closure parameters">;
-
-def experimental_multi_statement_closures :
-  Flag<["-"], "experimental-multi-statement-closures">,
-  HelpText<"Enable experimental support for type inference in multi-statement closures">;
-
-def experimental_type_inference_from_defaults :
-  Flag<["-"], "enable-experimental-type-inference-from-defaults">,
-  HelpText<"Enable experimental support for generic parameter inference from default values">;
 
 def prebuilt_module_cache_path :
   Separate<["-"], "prebuilt-module-cache-path">,

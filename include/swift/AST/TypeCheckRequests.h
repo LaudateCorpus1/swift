@@ -1083,6 +1083,33 @@ public:
   bool isCached() const { return true; }
 };
 
+/// Check a distributed function declaration and cache if it was valid or not.
+///
+/// This is used because we not only type-check to emit errors, but also use
+/// the information to potentially avoid emitting the distributed thunk for
+/// methods which are invalid (e.g. their parameters dont conform to
+/// SerializationRequirement), as otherwise we'd be causing errors in synthesized
+/// code which looks very confusing to end-users.
+///
+class CheckDistributedFunctionRequest :
+    public SimpleRequest<CheckDistributedFunctionRequest,
+                         bool(AbstractFunctionDecl *),
+                         RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  /// \returns \c true if there was a problem with the function declaration,
+  /// \c false otherwise.
+  bool evaluate(Evaluator &evaluator, AbstractFunctionDecl *) const;
+
+public:
+  // Caching
+  bool isCached() const { return true; }
+};
+
 /// Obtain the 'remoteCall' function of a 'DistributedActorSystem'.
 class GetDistributedActorSystemRemoteCallFunctionRequest :
     public SimpleRequest<GetDistributedActorSystemRemoteCallFunctionRequest,
@@ -3185,7 +3212,7 @@ void simple_display(llvm::raw_ostream &out, ConformanceLookupKind kind);
 
 /// Lookup and expand all conformances in the given context.
 ///
-/// This request specifically accomodates algorithms for retrieving all
+/// This request specifically accommodates algorithms for retrieving all
 /// conformances in the primary, even those that are unstated in source but
 /// are implied by other conformances, inherited from other types, or synthesized
 /// by the compiler. A simple case of this is the following:
