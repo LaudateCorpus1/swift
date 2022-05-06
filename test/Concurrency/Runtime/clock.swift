@@ -4,6 +4,11 @@
 // REQUIRES: executable_test
 // REQUIRES: concurrency_runtime
 
+// Test requires _swift_task_enterThreadLocalContext which is not available 
+// in the back deployment runtime.
+// UNSUPPORTED: back_deployment_runtime
+// UNSUPPORTED: back_deploy_concurrency
+
 import _Concurrency
 import StdlibUnittest
 
@@ -17,8 +22,26 @@ var tests = TestSuite("Time")
         try! await clock.sleep(until: .now + .milliseconds(100))
       }
       // give a reasonable range of expected elapsed time
-      expectTrue(elapsed > .milliseconds(90))
-      expectTrue(elapsed < .milliseconds(200))
+      expectGT(elapsed, .milliseconds(90))
+      expectLT(elapsed, .milliseconds(200))
+    }
+
+    tests.test("ContinuousClock sleep with tolerance") {
+      let clock = ContinuousClock()
+      let elapsed = await clock.measure {
+        try! await clock.sleep(until: .now + .milliseconds(100), tolerance: .milliseconds(100))
+      }
+      // give a reasonable range of expected elapsed time
+      expectGT(elapsed, .milliseconds(90))
+      expectLT(elapsed, .milliseconds(300))
+    }
+
+    tests.test("ContinuousClock sleep longer") {
+      let elapsed = await ContinuousClock().measure {
+        try! await Task.sleep(until: .now + .seconds(1), clock: .continuous)
+      }
+      expectGT(elapsed, .seconds(1) - .milliseconds(90))
+      expectLT(elapsed, .seconds(1) + .milliseconds(200))
     }
 
     tests.test("SuspendingClock sleep") {
@@ -27,8 +50,26 @@ var tests = TestSuite("Time")
         try! await clock.sleep(until: .now + .milliseconds(100))
       }
       // give a reasonable range of expected elapsed time
-      expectTrue(elapsed > .milliseconds(90))
-      expectTrue(elapsed < .milliseconds(200))
+      expectGT(elapsed, .milliseconds(90))
+      expectLT(elapsed, .milliseconds(200))
+    }
+
+    tests.test("SuspendingClock sleep with tolerance") {
+      let clock = SuspendingClock()
+      let elapsed = await clock.measure {
+        try! await clock.sleep(until: .now + .milliseconds(100), tolerance: .milliseconds(100))
+      }
+      // give a reasonable range of expected elapsed time
+      expectGT(elapsed, .milliseconds(90))
+      expectLT(elapsed, .milliseconds(300))
+    }
+
+    tests.test("SuspendingClock sleep longer") {
+      let elapsed = await SuspendingClock().measure {
+        try! await Task.sleep(until: .now + .seconds(1), clock: .suspending)
+      }
+      expectGT(elapsed, .seconds(1) - .milliseconds(90))
+      expectLT(elapsed, .seconds(1) + .milliseconds(200))
     }
 
     tests.test("duration addition") {

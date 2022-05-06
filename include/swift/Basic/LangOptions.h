@@ -223,9 +223,6 @@ namespace swift {
     /// Emit a remark after loading a module.
     bool EnableModuleLoadingRemarks = false;
 
-    /// Resolve main function as though it were called from an async context
-    bool EnableAsyncMainResolution = false;
-
     ///
     /// Support for alternate usage modes
     ///
@@ -487,7 +484,7 @@ namespace swift {
     bool HermeticSealAtLink = false;
 
     /// Allow deserializing implementation only dependencies. This should only
-    /// be set true by lldb and other tooling, so that deserilization
+    /// be set true by lldb and other tooling, so that deserialization
     /// recovery issues won't bring down the debugger.
     /// TODO: remove this when @_implementationOnly modules are robust enough.
     bool AllowDeserializingImplementationOnly = false;
@@ -798,7 +795,7 @@ namespace swift {
     /// header, place it in this directory.
     std::string PrecompiledHeaderOutputDir;
 
-    /// The optimizaton setting.  This doesn't typically matter for
+    /// The optimization setting.  This doesn't typically matter for
     /// import, but it can affect Clang's IR generation of static functions.
     std::string Optimization;
 
@@ -840,7 +837,7 @@ namespace swift {
     /// When set, don't look for or load overlays.
     bool DisableOverlayModules = false;
 
-    /// When set, import SPI_AVAILABLE symbols with Swift SPI attribtues.
+    /// When set, import SPI_AVAILABLE symbols with Swift SPI attributes.
     bool EnableClangSPI = true;
 
     /// When set, don't enforce warnings with -Werror.

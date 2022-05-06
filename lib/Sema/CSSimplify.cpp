@@ -2189,7 +2189,7 @@ ConstraintSystem::matchTupleTypes(TupleType *tuple1, TupleType *tuple2,
   case ConstraintKind::DefaultClosureType:
   case ConstraintKind::UnresolvedMemberChainBase:
   case ConstraintKind::PropertyWrapper:
-  case ConstraintKind::ClosureBodyElement:
+  case ConstraintKind::SyntacticElement:
   case ConstraintKind::BindTupleOfFunctionParams:
     llvm_unreachable("Not a conversion");
   }
@@ -2352,7 +2352,7 @@ static bool matchFunctionRepresentations(FunctionType::ExtInfo einfo1,
   case ConstraintKind::DefaultClosureType:
   case ConstraintKind::UnresolvedMemberChainBase:
   case ConstraintKind::PropertyWrapper:
-  case ConstraintKind::ClosureBodyElement:
+  case ConstraintKind::SyntacticElement:
   case ConstraintKind::BindTupleOfFunctionParams:
     return true;
   }
@@ -2670,11 +2670,15 @@ ConstraintSystem::matchFunctionTypes(FunctionType *func1, FunctionType *func2,
   }
 
   /// Whether to downgrade to a concurrency warning.
-  auto isConcurrencyWarning = [&] {
-    if (contextRequiresStrictConcurrencyChecking(DC, GetClosureType{*this})
-        && !hasPreconcurrencyCallee(this, locator))
+  auto isConcurrencyWarning = [&](bool forSendable) {
+    // Except for Sendable warnings, don't downgrade to an error in strict
+    // contexts without a preconcurrency callee.
+    if (!forSendable &&
+        contextRequiresStrictConcurrencyChecking(DC, GetClosureType{*this}) &&
+        !hasPreconcurrencyCallee(this, locator))
       return false;
 
+    // We can only handle the downgrade for conversions.
     switch (kind) {
     case ConstraintKind::Conversion:
     case ConstraintKind::ArgumentConversion:
@@ -2694,7 +2698,7 @@ ConstraintSystem::matchFunctionTypes(FunctionType *func1, FunctionType *func2,
 
       auto *fix = AddSendableAttribute::create(
           *this, func1, func2, getConstraintLocator(locator),
-          isConcurrencyWarning());
+          isConcurrencyWarning(true));
       if (recordFix(fix))
         return getTypeMatchFailure(locator);
     }
@@ -2729,7 +2733,7 @@ ConstraintSystem::matchFunctionTypes(FunctionType *func1, FunctionType *func2,
 
       auto *fix = MarkGlobalActorFunction::create(
           *this, func1, func2, getConstraintLocator(locator),
-          isConcurrencyWarning());
+          isConcurrencyWarning(false));
 
       if (recordFix(fix))
         return getTypeMatchFailure(locator);
@@ -2796,7 +2800,7 @@ ConstraintSystem::matchFunctionTypes(FunctionType *func1, FunctionType *func2,
   case ConstraintKind::DefaultClosureType:
   case ConstraintKind::UnresolvedMemberChainBase:
   case ConstraintKind::PropertyWrapper:
-  case ConstraintKind::ClosureBodyElement:
+  case ConstraintKind::SyntacticElement:
   case ConstraintKind::BindTupleOfFunctionParams:
     llvm_unreachable("Not a relational constraint");
   }
@@ -3461,8 +3465,11 @@ ConstraintSystem::matchExistentialTypes(Type type1, Type type2,
               if (!req)
                 return getTypeMatchFailure(locator);
 
-              if (type1->isPlaceholder() ||
-                  req->getRequirementKind() == RequirementKind::Superclass)
+              // Superclass constraints are never satisfied by existentials,
+              // even those that contain the superclass a la `any C & P`.
+              if (!type1->isExistentialType() &&
+                  (type1->isPlaceholder() ||
+                  req->getRequirementKind() == RequirementKind::Superclass))
                 return getTypeMatchSuccess();
 
               auto *fix = fixRequirementFailure(*this, type1, type2, locator);
@@ -6012,7 +6019,7 @@ ConstraintSystem::matchTypes(Type type1, Type type2, ConstraintKind kind,
     case ConstraintKind::DefaultClosureType:
     case ConstraintKind::UnresolvedMemberChainBase:
     case ConstraintKind::PropertyWrapper:
-    case ConstraintKind::ClosureBodyElement:
+    case ConstraintKind::SyntacticElement:
     case ConstraintKind::BindTupleOfFunctionParams:
       llvm_unreachable("Not a relational constraint");
     }
@@ -8978,7 +8985,8 @@ static bool inferEnumMemberThroughTildeEqualsOperator(
     }
   }
 
-  cs.generateConstraints(target, FreeTypeVariableBinding::Disallow);
+  if (cs.generateConstraints(target, FreeTypeVariableBinding::Disallow))
+    return true;
 
   // Sub-expression associated with expression pattern is the enum element
   // access which needs to be connected to the provided element type.
@@ -9208,17 +9216,21 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyMemberConstraint(
               dyn_cast<EnumElementPattern>(patternLoc->getPattern())) {
         auto enumType = baseObjTy->getMetatypeInstanceType();
 
-        // If the synthesis of ~= resulted in errors (i.e. broken stdlib)
-        // that would be diagnosed inline, so let's just fall through and
-        // let this situation be diagnosed as a missing member.
-        auto hadErrors = inferEnumMemberThroughTildeEqualsOperator(
+        // Optional base type does not trigger `~=` synthesis, but it tries
+        // to find member on both `Optional` and its wrapped type.
+        if (!enumType->getOptionalObjectType()) {
+          // If the synthesis of ~= resulted in errors (i.e. broken stdlib)
+          // that would be diagnosed inline, so let's just fall through and
+          // let this situation be diagnosed as a missing member.
+          auto hadErrors = inferEnumMemberThroughTildeEqualsOperator(
             *this, enumElement, enumType, memberTy, locator);
 
-        // Let's consider current member constraint solved because it's
-        // replaced by a new set of constraints that would resolve member
-        // type.
-        if (!hadErrors)
-          return SolutionKind::Solved;
+          // Let's consider current member constraint solved because it's
+          // replaced by a new set of constraints that would resolve member
+          // type.
+          if (!hadErrors)
+            return SolutionKind::Solved;
+        }
       }
     }
   }
@@ -9914,8 +9926,9 @@ bool ConstraintSystem::resolveClosure(TypeVariableType *typeVar,
       }
 
       if (!paramDecl->getName().hasDollarPrefix()) {
-        generateWrappedPropertyTypeConstraints(paramDecl, backingType,
-                                               param.getParameterType());
+        if (generateWrappedPropertyTypeConstraints(paramDecl, backingType,
+                                                   param.getParameterType()))
+          return false;
       }
 
       auto result = applyPropertyWrapperToParameter(backingType, param.getParameterType(),
@@ -13145,7 +13158,7 @@ ConstraintSystem::addConstraintImpl(ConstraintKind kind, Type first,
   case ConstraintKind::KeyPath:
   case ConstraintKind::KeyPathApplication:
   case ConstraintKind::DefaultClosureType:
-  case ConstraintKind::ClosureBodyElement:
+  case ConstraintKind::SyntacticElement:
     llvm_unreachable("Use the correct addConstraint()");
   }
 
@@ -13675,9 +13688,9 @@ ConstraintSystem::simplifyConstraint(const Constraint &constraint) {
         constraint.getFirstType(), constraint.getSecondType(),
         /*flags=*/None, constraint.getLocator());
 
-  case ConstraintKind::ClosureBodyElement:
-    return simplifyClosureBodyElementConstraint(
-        constraint.getClosureElement(), constraint.getElementContext(),
+  case ConstraintKind::SyntacticElement:
+    return simplifySyntacticElementConstraint(
+        constraint.getSyntacticElement(), constraint.getElementContext(),
         constraint.isDiscardedElement(),
         /*flags=*/None, constraint.getLocator());
 

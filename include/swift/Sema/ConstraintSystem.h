@@ -105,6 +105,50 @@ enum class FreeTypeVariableBinding {
 
 namespace constraints {
 
+struct ResultBuilder {
+private:
+  DeclContext *DC;
+  /// An implicit variable that represents `Self` type of the result builder.
+  VarDecl *BuilderSelf;
+  Type BuilderType;
+  llvm::SmallDenseMap<DeclName, bool> SupportedOps;
+
+  Identifier BuildOptionalId;
+
+  /// Counter used to give unique names to the variables that are
+  /// created implicitly.
+  unsigned VarCounter = 0;
+
+public:
+  ResultBuilder(ConstraintSystem *CS, DeclContext *DC, Type builderType);
+
+  DeclContext *getDeclContext() const { return DC; }
+
+  Type getType() const { return BuilderType; }
+
+  NominalTypeDecl *getBuilderDecl() const {
+    return BuilderType->getAnyNominal();
+  }
+
+  Identifier getBuildOptionalId() const { return BuildOptionalId; }
+
+  bool supports(Identifier fnBaseName, ArrayRef<Identifier> argLabels = {},
+                bool checkAvailability = false);
+
+  bool supportsOptional() { return supports(getBuildOptionalId()); }
+
+  Expr *buildCall(SourceLoc loc, Identifier fnName,
+                  ArrayRef<Expr *> argExprs,
+                  ArrayRef<Identifier> argLabels) const;
+
+  /// Build an implicit variable in this context.
+  VarDecl *buildVar(SourceLoc loc);
+
+  /// Build a reference to a given variable and mark it
+  /// as located at a given source location.
+  DeclRefExpr *buildVarRef(VarDecl *var, SourceLoc loc);
+};
+
 /// Describes the algorithm to use for trailing closure matching.
 enum class TrailingClosureMatching {
   /// Match a trailing closure to the first parameter that appears to work.
@@ -193,6 +237,8 @@ public:
   ~ExpressionTimer();
 
   AnchorType getAnchor() const { return Anchor; }
+
+  SourceRange getAffectedRange() const;
 
   unsigned getWarnLimit() const {
     return Context.TypeCheckerOpts.WarnLongExpressionTypeChecking;
@@ -1491,7 +1537,7 @@ enum class ConstraintSystemFlags {
   /// Note that this flag is automatically applied to all constraint systems,
   /// when \c DebugConstraintSolver is set in \c TypeCheckerOptions. It can be
   /// automatically enabled for select constraint solving attempts by setting
-  /// \c DebugConstraintSolverAttempt. Finally, it can also be automatically 
+  /// \c DebugConstraintSolverAttempt. Finally, it can also be automatically
   /// enabled for a pre-configured set of expressions on line numbers by setting
   /// \c DebugConstraintSolverOnLines.
   DebugConstraints = 0x10,
@@ -1516,9 +1562,8 @@ enum class ConstraintSystemFlags {
   /// `__attribute__((ns_consumed))`.
   UseClangFunctionTypes = 0x80,
 
-  /// When set, nominal typedecl contexts are asynchronous contexts.
-  /// This is set while searching for the main function
-  ConsiderNominalTypeContextsAsync = 0x100,
+  /// When set, ignore async/sync mismatches
+  IgnoreAsyncSyncMismatch = 0x100,
 };
 
 /// Options that affect the constraint system as a whole.
@@ -4543,6 +4588,7 @@ public:
   /// Generate constraints for the given solution target.
   ///
   /// \returns true if an error occurred, false otherwise.
+  LLVM_NODISCARD
   bool generateConstraints(SolutionApplicationTarget &target,
                            FreeTypeVariableBinding allowFreeTypeVariables);
 
@@ -4551,11 +4597,13 @@ public:
   /// \param closure the closure expression
   ///
   /// \returns \c true if constraint generation failed, \c false otherwise
+  LLVM_NODISCARD
   bool generateConstraints(ClosureExpr *closure);
 
   /// Generate constraints for the given (unchecked) expression.
   ///
   /// \returns a possibly-sanitized expression, or null if an error occurred.
+  LLVM_NODISCARD
   Expr *generateConstraints(Expr *E, DeclContext *dc,
                             bool isInputExpression = true);
 
@@ -4563,6 +4611,7 @@ public:
   /// value of the given expression.
   ///
   /// \returns a possibly-sanitized initializer, or null if an error occurred.
+  LLVM_NODISCARD
   Type generateConstraints(Pattern *P, ConstraintLocatorBuilder locator,
                            bool bindPatternVarsOneWay,
                            PatternBindingDecl *patternBinding,
@@ -4572,6 +4621,7 @@ public:
   ///
   /// \returns true if there was an error in constraint generation, false
   /// if generation succeeded.
+  LLVM_NODISCARD
   bool generateConstraints(StmtCondition condition, DeclContext *dc);
 
   /// Generate constraints for a case statement.
@@ -4581,6 +4631,7 @@ public:
   ///
   /// \returns true if there was an error in constraint generation, false
   /// if generation succeeded.
+  LLVM_NODISCARD
   bool generateConstraints(CaseStmt *caseStmt, DeclContext *dc,
                            Type subjectType, ConstraintLocator *locator);
 
@@ -4624,6 +4675,7 @@ public:
   /// \param propertyType The type of the wrapped property.
   ///
   /// \returns true if there is an error.
+  LLVM_NODISCARD
   bool generateWrappedPropertyTypeConstraints(VarDecl *wrappedVar,
                                               Type initializerType,
                                               Type propertyType);
@@ -5076,9 +5128,9 @@ private:
                  TypeMatchOptions flags,
                  ConstraintLocatorBuilder locator);
 
-  /// Simplify a closure body element constraint by generating required
+  /// Simplify a syntactic element constraint by generating required
   /// constraints to represent the given element in constraint system.
-  SolutionKind simplifyClosureBodyElementConstraint(
+  SolutionKind simplifySyntacticElementConstraint(
       ASTNode element, ContextualTypeInfo context, bool isDiscarded,
       TypeMatchOptions flags, ConstraintLocatorBuilder locator);
 
@@ -5415,9 +5467,17 @@ public:
   
   /// Determine if we've already explored too many paths in an
   /// attempt to solve this expression.
-  bool isExpressionAlreadyTooComplex = false;
-  bool getExpressionTooComplex(size_t solutionMemory) {
-    if (isExpressionAlreadyTooComplex)
+  std::pair<bool, SourceRange> isAlreadyTooComplex = {false, SourceRange()};
+
+  /// If optional is not nil, result is guaranteed to point at a valid
+  /// location.
+  Optional<SourceRange> getTooComplexRange() const {
+    auto range = isAlreadyTooComplex.second;
+    return range.isValid() ? range : Optional<SourceRange>();
+  }
+
+  bool isTooComplex(size_t solutionMemory) {
+    if (isAlreadyTooComplex.first)
       return true;
 
     auto CancellationFlag = getASTContext().CancellationFlag;
@@ -5428,7 +5488,9 @@ public:
     MaxMemory = std::max(used, MaxMemory);
     auto threshold = getASTContext().TypeCheckerOpts.SolverMemoryThreshold;
     if (MaxMemory > threshold) {
-      return isExpressionAlreadyTooComplex= true;
+      // No particular location for OoM problems.
+      isAlreadyTooComplex.first = true;
+      return true;
     }
 
     if (Timer && Timer->isExpired()) {
@@ -5437,24 +5499,29 @@ public:
       // emitting an error.
       Timer->disableWarning();
 
-      return isExpressionAlreadyTooComplex = true;
+      isAlreadyTooComplex = {true, Timer->getAffectedRange()};
+      return true;
     }
 
     // Bail out once we've looked at a really large number of
     // choices.
     if (CountScopes > getASTContext().TypeCheckerOpts.SolverBindingThreshold) {
-      return isExpressionAlreadyTooComplex = true;
+      isAlreadyTooComplex.first = true;
+      return true;
     }
 
     return false;
   }
 
-  bool getExpressionTooComplex(SmallVectorImpl<Solution> const &solutions) {
+  bool isTooComplex(SmallVectorImpl<Solution> const &solutions) {
+    if (isAlreadyTooComplex.first)
+      return true;
+
     size_t solutionMemory = 0;
     for (auto const& s : solutions) {
       solutionMemory += s.getTotalMemory();
     }
-    return getExpressionTooComplex(solutionMemory);
+    return isTooComplex(solutionMemory);
   }
 
   // If the given constraint is an applied disjunction, get the argument function

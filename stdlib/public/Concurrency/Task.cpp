@@ -836,7 +836,11 @@ static AsyncTaskAndContext swift_task_create_commonImpl(
   // be is the final hop.  Store a signed null instead.
   initialContext->Parent = nullptr;
 
-  concurrency::trace::task_create(task, parent, group, asyncLet);
+  concurrency::trace::task_create(
+      task, parent, group, asyncLet,
+      static_cast<uint8_t>(task->Flags.getPriority()),
+      task->Flags.task_isChildTask(), task->Flags.task_isFuture(),
+      task->Flags.task_isGroupChildTask(), task->Flags.task_isAsyncLetTask());
 
   // Attach to the group, if needed.
   if (group) {
@@ -1265,23 +1269,21 @@ static void swift_task_asyncMainDrainQueueImpl() {
                        "swift_task_asyncMainDrainQueue");
 #else
 #if defined(_WIN32)
-  static void(FAR *pfndispatch_main)(void) = NULL;
-
-  if (pfndispatch_main)
-    return pfndispatch_main();
-
   HMODULE hModule = LoadLibraryW(L"dispatch.dll");
-  if (hModule == NULL)
-    swift_reportError(0, "unable to load dispatch.dll");
+  if (hModule == NULL) {
+    swift_Concurrency_fatalError(0,
+      "unable to load dispatch.dll: %lu", GetLastError());
+  }
 
-  pfndispatch_main =
-      reinterpret_cast<void (FAR *)(void)>(GetProcAddress(hModule,
-                                                          "dispatch_main"));
-  if (pfndispatch_main == NULL)
-    swift_reportError(0, "unable to locate dispatch_main in dispatch.dll");
+  auto pfndispatch_main = reinterpret_cast<void (FAR *)(void)>(
+    GetProcAddress(hModule, "dispatch_main"));
+  if (pfndispatch_main == NULL) {
+    swift_Concurrency_fatalError(0,
+      "unable to locate dispatch_main in dispatch.dll: %lu", GetLastError());
+  }
 
   pfndispatch_main();
-  exit(0);
+  swift_unreachable("Returned from dispatch_main()");
 #else
   // CFRunLoop is not available on non-Darwin targets.  Foundation has an
   // implementation, but CoreFoundation is not meant to be exposed.  We can only

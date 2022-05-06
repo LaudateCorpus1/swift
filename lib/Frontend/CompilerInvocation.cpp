@@ -497,8 +497,6 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
     Diags.diagnose(SourceLoc(), diag::warn_flag_deprecated,
                    "-enable-experimental-async-top-level");
 
-  Opts.EnableAsyncMainResolution = Args.hasArg(OPT_async_main);
-
   Opts.DiagnoseInvalidEphemeralnessAsError |=
       Args.hasArg(OPT_enable_invalid_ephemeralness_as_error);
 
@@ -801,7 +799,7 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
     Opts.ClangTarget = llvm::Triple(A->getValue());
   }
 
-  Opts.EnableCXXInterop |= Args.hasArg(OPT_enable_experimental_cxx_interop) |
+  Opts.EnableCXXInterop |= Args.hasArg(OPT_enable_experimental_cxx_interop) ||
                            Args.hasArg(OPT_enable_cxx_interop);
   Opts.EnableObjCInterop =
       Args.hasFlag(OPT_enable_objc_interop, OPT_disable_objc_interop,
@@ -1747,7 +1745,11 @@ static bool ParseSILArgs(SILOptions &Opts, ArgList &Args,
       OPT_enable_actor_data_race_checks,
       OPT_disable_actor_data_race_checks, /*default=*/false);
   Opts.DisableSILPerfOptimizations |= Args.hasArg(OPT_disable_sil_perf_optzns);
-  Opts.CrossModuleOptimization |= Args.hasArg(OPT_CrossModuleOptimization);
+  if (Args.hasArg(OPT_CrossModuleOptimization)) {
+    Opts.CMOMode = CrossModuleOptimizationMode::Aggressive;
+  } else if (Args.hasArg(OPT_EnbaleDefaultCMO)) {
+    Opts.CMOMode = CrossModuleOptimizationMode::Default;  
+  }
   Opts.EnablePerformanceAnnotations |=
       Args.hasArg(OPT_ExperimentalPerformanceAnnotations);
   Opts.VerifyAll |= Args.hasArg(OPT_sil_verify_all);

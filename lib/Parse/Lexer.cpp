@@ -14,27 +14,27 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/Parse/Confusables.h"
 #include "swift/Parse/Lexer.h"
+#include "swift/AST/BridgingUtils.h"
 #include "swift/AST/DiagnosticsParse.h"
 #include "swift/AST/Identifier.h"
 #include "swift/Basic/LangOptions.h"
 #include "swift/Basic/SourceManager.h"
+#include "swift/Parse/Confusables.h"
 #include "swift/Parse/RegexParserBridging.h"
 #include "swift/Syntax/Trivia.h"
-#include "llvm/Support/Compiler.h"
-#include "llvm/Support/MathExtras.h"
-#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/Compiler.h"
+#include "llvm/Support/MathExtras.h"
+#include "llvm/Support/MemoryBuffer.h"
 // FIXME: Figure out if this can be migrated to LLVM.
 #include "clang/Basic/CharInfo.h"
 
 #include <limits>
 
 // Regex lexing delivered via libSwift.
-#include "swift/Parse/RegexParserBridging.h"
 static RegexLiteralLexingFn regexLiteralLexingFn = nullptr;
 void Parser_registerRegexLiteralLexingFn(RegexLiteralLexingFn fn) {
   regexLiteralLexingFn = fn;
@@ -813,6 +813,13 @@ void Lexer::lexOperatorIdentifier() {
       break;
     if (Identifier::isEditorPlaceholder(StringRef(CurPtr, BufferEnd-CurPtr)) &&
         rangeContainsPlaceholderEnd(CurPtr + 2, BufferEnd)) {
+      break;
+    }
+
+    // If we are lexing a `/.../` regex literal, we don't consider `/` to be an
+    // operator character.
+    if (ForwardSlashRegexMode != LexerForwardSlashRegexMode::None &&
+        *CurPtr == '/') {
       break;
     }
   } while (advanceIfValidContinuationOfOperator(CurPtr, BufferEnd));
@@ -2039,24 +2046,17 @@ bool Lexer::tryLexRegexLiteral(const char *TokStart) {
 
   // Ask the Swift library to try and lex a regex literal.
   // - Ptr will not be advanced if this is not for a regex literal.
-  // - ErrStr will be set if there is any error to emit.
   // - CompletelyErroneous will be set if there was an error that cannot be
   //   recovered from.
   auto *Ptr = TokStart;
-  const char *ErrStr = nullptr;
-  bool CompletelyErroneous = regexLiteralLexingFn(&Ptr, BufferEnd, &ErrStr);
+  bool CompletelyErroneous = regexLiteralLexingFn(
+      &Ptr, BufferEnd, MustBeRegex,
+      getBridgedOptionalDiagnosticEngine(getTokenDiags()));
 
   // If we didn't make any lexing progress, this isn't a regex literal and we
   // should fallback to lexing as something else.
   if (Ptr == TokStart)
     return false;
-
-  if (ErrStr) {
-    if (!MustBeRegex)
-      return false;
-
-    diagnose(TokStart, diag::regex_literal_parsing_error, ErrStr);
-  }
 
   // If we're lexing `/.../`, error if we ended on the opening of a comment.
   // We prefer to lex the comment as it's more likely than not that is what
@@ -2078,7 +2078,6 @@ bool Lexer::tryLexRegexLiteral(const char *TokStart) {
 
   // If the lexing was completely erroneous, form an unknown token.
   if (CompletelyErroneous) {
-    assert(ErrStr);
     formToken(tok::unknown, TokStart);
     return true;
   }
@@ -2086,18 +2085,6 @@ bool Lexer::tryLexRegexLiteral(const char *TokStart) {
   // We either had a successful lex, or something that was recoverable.
   formToken(tok::regex_literal, TokStart);
   return true;
-}
-
-void Lexer::tryLexForwardSlashRegexLiteralFrom(State S, bool mustBeRegex) {
-  if (!LangOpts.EnableBareSlashRegexLiterals)
-    return;
-
-  // Try re-lex with forward slash enabled.
-  llvm::SaveAndRestore<LexerForwardSlashRegexMode> RegexLexingScope(
-      ForwardSlashRegexMode, mustBeRegex
-                                 ? LexerForwardSlashRegexMode::Always
-                                 : LexerForwardSlashRegexMode::Tentative);
-  restoreState(S, /*enableDiagnostics*/ true);
 }
 
 /// lexEscapedIdentifier:

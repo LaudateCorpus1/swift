@@ -1,4 +1,4 @@
-//===--- PassUtils.swift - Utilities for optimzation passes ---------------===//
+//===--- PassUtils.swift - Utilities for optimization passes ---------------===//
 //
 // This source file is part of the Swift.org open source project
 //
@@ -21,6 +21,11 @@ public typealias BridgedInstructionPassCtxt =
 struct PassContext {
 
   let _bridged: BridgedPassContext
+
+  func continueWithNextSubpassRun(for inst: Instruction? = nil) -> Bool {
+    let bridgedInst = OptionalBridgedInstruction(obj: inst?.bridged.obj)
+    return PassContext_continueWithNextSubpassRun(_bridged, bridgedInst) != 0
+  }
 
   var aliasAnalysis: AliasAnalysis {
     let bridgedAA = PassContext_getAliasAnalysis(_bridged)

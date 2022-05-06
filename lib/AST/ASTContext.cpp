@@ -3441,6 +3441,8 @@ ExistentialMetatypeType::get(Type T, Optional<MetatypeRepresentation> repr,
     T = existential->getConstraintType();
 
   auto properties = T->getRecursiveProperties();
+  if (T->is<ParameterizedProtocolType>())
+    properties |= RecursiveTypeProperties::HasParameterizedExistential;
   auto arena = getArena(properties);
 
   unsigned reprKey;
@@ -3536,7 +3538,7 @@ isAnyFunctionTypeCanonical(ArrayRef<AnyFunctionType::Param> params,
 static RecursiveTypeProperties
 getGenericFunctionRecursiveProperties(ArrayRef<AnyFunctionType::Param> params,
                                       Type result) {
-  static_assert(RecursiveTypeProperties::BitWidth == 13,
+  static_assert(RecursiveTypeProperties::BitWidth == 14,
                 "revisit this if you add new recursive type properties");
   RecursiveTypeProperties properties;
 
@@ -4139,7 +4141,7 @@ CanSILFunctionType SILFunctionType::get(
   void *mem = ctx.Allocate(bytes, alignof(SILFunctionType));
 
   RecursiveTypeProperties properties;
-  static_assert(RecursiveTypeProperties::BitWidth == 13,
+  static_assert(RecursiveTypeProperties::BitWidth == 14,
                 "revisit this if you add new recursive type properties");
   for (auto &param : params)
     properties |= param.getInterfaceType()->getRecursiveProperties();
@@ -4257,6 +4259,8 @@ Type ExistentialType::get(Type constraint, bool forceExistential) {
   assert(constraint->isConstraintType());
 
   auto properties = constraint->getRecursiveProperties();
+  if (constraint->is<ParameterizedProtocolType>())
+    properties |= RecursiveTypeProperties::HasParameterizedExistential;
   auto arena = getArena(properties);
 
   auto &entry = C.getImpl().getArena(arena).ExistentialTypes[constraint];
@@ -5374,10 +5378,17 @@ std::string ASTContext::getEntryPointFunctionName() const {
 
 SILLayout *SILLayout::get(ASTContext &C,
                           CanGenericSignature Generics,
-                          ArrayRef<SILField> Fields) {
+                          ArrayRef<SILField> Fields,
+                          bool CapturesGenericEnvironment) {
+  // The "captures generic environment" flag is meaningless if there are
+  // no generic arguments to capture.
+  if (!Generics || Generics->areAllParamsConcrete()) {
+    CapturesGenericEnvironment = false;
+  }
+  
   // Profile the layout parameters.
   llvm::FoldingSetNodeID id;
-  Profile(id, Generics, Fields);
+  Profile(id, Generics, Fields, CapturesGenericEnvironment);
   
   // Return an existing layout if there is one.
   void *insertPos;
@@ -5390,7 +5401,8 @@ SILLayout *SILLayout::get(ASTContext &C,
   void *memory = C.Allocate(totalSizeToAlloc<SILField>(Fields.size()),
                             alignof(SILLayout));
   
-  auto newLayout = ::new (memory) SILLayout(Generics, Fields);
+  auto newLayout = ::new (memory) SILLayout(Generics, Fields,
+                                            CapturesGenericEnvironment);
   Layouts.InsertNode(newLayout, insertPos);
   return newLayout;
 }
@@ -5423,7 +5435,8 @@ CanSILBoxType SILBoxType::get(CanType boxedType) {
   auto genericParam = singleGenericParamSignature.getGenericParams()[0];
   auto layout = SILLayout::get(ctx, singleGenericParamSignature,
                                SILField(CanType(genericParam),
-                                        /*mutable*/ true));
+                                        /*mutable*/ true),
+                               /*captures generic env*/ false);
 
   auto subMap =
     SubstitutionMap::get(

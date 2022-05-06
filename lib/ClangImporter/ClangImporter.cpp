@@ -2629,6 +2629,10 @@ bool importer::shouldSuppressDeclImport(const clang::Decl *decl) {
     return false;
   }
 
+  if (isa<clang::BuiltinTemplateDecl>(decl)) {
+    return true;
+  }
+
   return false;
 }
 
@@ -2721,7 +2725,7 @@ static bool isVisibleFromModule(const ClangModuleUnit *ModuleFilter,
   // Handle redeclarable Clang decls by checking each redeclaration.
   bool IsTagDecl = isa<clang::TagDecl>(D);
   if (!(IsTagDecl || isa<clang::FunctionDecl>(D) || isa<clang::VarDecl>(D) ||
-        isa<clang::TypedefNameDecl>(D))) {
+        isa<clang::TypedefNameDecl>(D) || isa<clang::NamespaceDecl>(D))) {
     return false;
   }
 
@@ -4326,9 +4330,15 @@ ClangDirectLookupRequest::evaluate(Evaluator &evaluator,
   if (auto spec = dyn_cast<clang::ClassTemplateSpecializationDecl>(clangDecl))
     return lookupInClassTemplateSpecialization(ctx, spec, desc.name);
 
-  auto *clangModule =
-      getClangOwningModule(clangDecl, clangDecl->getASTContext());
-  auto *lookupTable = ctx.getClangModuleLoader()->findLookupTable(clangModule);
+  SwiftLookupTable *lookupTable = nullptr;
+  if (isa<clang::NamespaceDecl>(clangDecl)) {
+    // DeclContext of a namespace imported into Swift is the __ObjC module.
+    lookupTable = ctx.getClangModuleLoader()->findLookupTable(nullptr);
+  } else {
+    auto *clangModule =
+        getClangOwningModule(clangDecl, clangDecl->getASTContext());
+    lookupTable = ctx.getClangModuleLoader()->findLookupTable(clangModule);
+  }
 
   auto foundDecls = lookupTable->lookup(
       SerializedSwiftName(desc.name.getBaseName()), EffectiveClangContext());
@@ -5651,19 +5661,31 @@ ClangImporter::getCXXFunctionTemplateSpecialization(SubstitutionMap subst,
 }
 
 bool ClangImporter::isCXXMethodMutating(const clang::CXXMethodDecl *method) {
-  return isa<clang::CXXConstructorDecl>(method) || !method->isConst() ||
-         // method->getParent()->hasMutableFields() ||
-         // FIXME(rdar://91961524): figure out a way to handle mutable fields
-         // without breaking classes from the C++ standard library (e.g.
-         // `std::string` which has a mutable member in old libstdc++ version
-         // used on CentOS 7)
-         (method->hasAttrs() &&
-          llvm::any_of(method->getAttrs(), [](clang::Attr *a) {
-            if (auto swiftAttr = dyn_cast<clang::SwiftAttrAttr>(a)) {
-              return swiftAttr->getAttribute() == "mutating";
-            }
-            return false;
-          }));
+  if (isa<clang::CXXConstructorDecl>(method) || !method->isConst())
+    return true;
+  if (isAnnotatedWith(method, "mutating"))
+    return true;
+  if (method->getParent()->hasMutableFields()) {
+    if (isAnnotatedWith(method, "nonmutating"))
+      return false;
+    // FIXME(rdar://91961524): figure out a way to handle mutable fields
+    // without breaking classes from the C++ standard library (e.g.
+    // `std::string` which has a mutable member in old libstdc++ version used on
+    // CentOS 7)
+    return false;
+  }
+  return false;
+}
+
+bool ClangImporter::isAnnotatedWith(const clang::CXXMethodDecl *method,
+                                    StringRef attr) {
+  return method->hasAttrs() &&
+         llvm::any_of(method->getAttrs(), [attr](clang::Attr *a) {
+           if (auto swiftAttr = dyn_cast<clang::SwiftAttrAttr>(a)) {
+             return swiftAttr->getAttribute() == attr;
+           }
+           return false;
+         });
 }
 
 SwiftLookupTable *

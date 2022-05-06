@@ -270,10 +270,6 @@ def pch_output_dir: Separate<["-"], "pch-output-dir">,
   Flags<[FrontendOption, HelpHidden, ArgumentIsPath]>,
   HelpText<"Directory to persist automatically created precompiled bridging headers">;
 
-def async_main: Flag<["-"], "async-main">,
-    Flags<[FrontendOption]>,
-    HelpText<"Resolve main function as if it were called from an asynchronous context">;
-
 // FIXME: Unhide this once it doesn't depend on an output file map.
 def incremental : Flag<["-"], "incremental">,
   Flags<[NoInteractiveOption, HelpHidden, DoesNotAffectIncrementalBuild]>,
@@ -815,6 +811,10 @@ def Ounchecked : Flag<["-"], "Ounchecked">, Group<O_Group>,
 def Oplayground : Flag<["-"], "Oplayground">, Group<O_Group>,
   Flags<[HelpHidden, FrontendOption, ModuleInterfaceOption]>,
   HelpText<"Compile with optimizations appropriate for a playground">;
+
+def EnbaleDefaultCMO : Flag<["-"], "enable-default-cmo">,
+  Flags<[HelpHidden, FrontendOption]>,
+  HelpText<"Perform conservative cross-module optimization">;
 
 def CrossModuleOptimization : Flag<["-"], "cross-module-optimization">,
   Flags<[HelpHidden, FrontendOption]>,
