@@ -8,6 +8,10 @@
 // UNSUPPORTED: use_os_stdlib
 // UNSUPPORTED: back_deployment_runtime
 
+
+// FIXME(distributed): Seems something remains incorrect here
+// REQUIRES: rdar92952551
+
 import Distributed
 
 enum MyError: Error {
@@ -87,6 +91,16 @@ distributed actor MaybeAfterAssign {
       return nil
     }
     x = 100
+  }
+}
+
+distributed actor LocalTestingDA_Int {
+  typealias ActorSystem = LocalTestingDistributedActorSystem
+  var int: Int
+  init() {
+    actorSystem = .init()
+    int = 12
+    // CRASH
   }
 }
 
@@ -261,6 +275,10 @@ func test() async {
   test.append(MaybeAfterAssign(fail: false))
   // CHECK:      assign type:MaybeAfterAssign, id:ActorAddress(address: "[[ID10:.*]]")
   // CHECK-NEXT: ready actor:main.MaybeAfterAssign, id:ActorAddress(address: "[[ID10]]")
+
+  let localDA = LocalTestingDA_Int()
+  print("localDA = \(localDA.id)")
+  // CHECK: localDA = LocalTestingActorID(id: "1")
 
   // the following tests fail to initialize the actor's identity.
   print("-- start of no-assign tests --")

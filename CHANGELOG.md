@@ -5,6 +5,178 @@ _**Note:** This is in reverse chronological order, so newer entries are added to
 
 ## Swift 5.7
 
+* [SE-0338][]:
+
+  Non-isolated async functions now always execute on the global concurrent pool,
+  so calling a non-isolated async function from actor-isolated code will leave
+  the actor. For example:
+
+  ```swift
+  class C { }
+
+  func f(_: C) async { /* always executes on the global concurrent pool */ }
+
+  actor A {
+    func g(c: C) async {
+      /* always executes on the actor */
+      print("on the actor")
+
+      await f(c)
+    }
+  }
+  ```
+
+  Prior to this change, the call from `f` to `g` might have started execution of
+  `g` on the actor, which could lead to actors being busy longer than strictly
+  necessary. Now, the non-isolated async function will always hop to the global
+  cooperative pool, not run on the actor. This can result in a behavior change
+  for programs that assumed that a non-isolated async function called from a
+  `@MainActor` context will be executed on the main actor, although such
+  programs were already technically incorrect.
+
+  Additionally, when leaving an actor to execution on the global cooperative
+  pool, `Sendable` checking will be performed, so the compiler will emit a
+  diagnostic in the call to `f` if `c` is not of `Sendable` type.
+
+* [SE-0350][]:
+
+  The standard library has a new `Regex<Output>` type.
+  
+  This type represents an _extended regular expression_, allowing more fluent
+  string processing operations. A `Regex` may be created by
+  [initialization from a string][SE-0355]:
+  ```
+  let pattern = "a[bc]+" // matches "a" followed by one or more instances
+                         // of either "b" or "c"
+  let regex = try! Regex(pattern)
+  ```
+  Or via a [regex literal][SE-0354]:
+  ```
+  let regex = #/a[bc]+/#
+  ```
+  In Swift 6, `/` will also be supported as a delimiter for `Regex` literals.
+  You can enable this mode in Swift 5.7 with the `-enable-bare-slash-regex`
+  flag. Doing so will cause some existing expressions that use `/` as an 
+  operator to no longer compile; you can add parentheses or line breaks as a
+  workaround.
+  
+  There are [new string-processing algorithms][SE-0357] that support
+  `String`, `Regex` and arbitrary `Collection` types.
+
+* [SE-0329][]:
+  New types representing time and clocks were introduced. This includes a protocol `Clock` defining clocks which allow for defining a concept of now and a way to wake up after a given instant. Additionally a new protocol `InstantProtocol` for defining instants in time was added. Furthermore a new protocol `DurationProtocol` was added to define an elapsed duration between two given `InstantProtocol` types. Most commonly the `Clock` types for general use are the `SuspendingClock` and `ContinuousClock` which represent the most fundamental clocks for the system. The `SuspendingClock` type does not progress while the machine is suspended whereas the `ContinuousClock` progresses no matter the state of the machine. 
+
+  ```swift
+    func delayedHello() async throws {
+      try await Task.sleep(until: .now + .milliseconds(123), clock: .continuous)
+      print("hello delayed world")
+    }
+  ```
+
+  `Clock` also has methods to measure the elapsed duration of the execution of work. In the case of the `SuspendingClock` and `ContinuousClock` this measures with high resolution and is suitable for benchmarks.
+
+  ```swift
+  let clock = ContinuousClock()
+  let elapsed = clock.measure {
+    someLongRunningWork()
+  }
+  ```
+
+* [SE-0309][]:
+
+  Protocols with associated types and `Self` requirements can now be used as the
+  types of values with the `any` keyword.
+
+  Protocol methods that return associated types can be called on an `any` type;
+  the result is type-erased to the associated type's upper bound, which is another
+  `any` type having the same constraints as the associated type. For example:
+
+  ```swift
+    protocol Surface {...}
+    
+    protocol Solid {
+      associatedtype SurfaceType: Surface
+      func boundary() -> SurfaceType
+    }
+    
+    let solid: any Solid = ...
+    
+    // Type of 'boundary' is 'any Surface'
+    let boundary = solid.boundary()
+  ```
+
+  Protocol methods that take an associated type or `Self` cannot be used with `any`,
+  however in conjunction with [SE-0352][], you can pass the `any` type to a function
+  taking a generic parameter constrained to the protocol. Within the generic context,
+  type relationships are explicit and all protocol methods can be used.
+
+* [SE-0346][]:
+
+  Protocols can now declare a list of one or more _primary associated types_, which enable writing same-type requirements on those associated types using angle bracket syntax:
+
+  ```swift
+    protocol Graph<Vertex, Edge> {
+      associatedtype Vertex
+      associatedtype Edge
+    }
+  ```
+
+  You can now write a protocol name followed by type arguments in angle brackets, like
+  `Graph<Int, String>`, anywhere that a protocol conformance requirement may appear:
+
+  ```swift
+    func shortestPath<V, E>(_: some Graph<V, E>, from: V, to: V) -> [E]
+
+    extension Graph<Int, String> {...}
+
+    func build() -> some Graph<Int, String> {}
+  ```
+
+  A protocol name followed by angle brackets is shorthand for a conformance requirement,
+  together with a same-type requirement for the protocol's primary associated types.
+  The first two examples above are equivalent to the following:
+
+  ```swift
+    func shortestPath<V, E, G>(_: G, from: V, to: V) -> [E]
+      where G: Graph, G.Vertex == V, G.Edge == E
+
+    extension Graph where Vertex == Int, Edge == String {...}
+  ```
+
+  The `build()` function returning `some Graph<Int, String>` can't be written using a
+  `where` clause; this is an example of a constrained opaque result type, which is new expressivity in Swift 5.7.
+
+* [SE-0353][]:
+
+  Protocols with primary associated types can now be used in existential types,
+  enabling same-type constraints on those associated types.
+
+  ```
+  let strings: any Collection<String> = [ "Hello" ]
+  ```
+
+  Note that language features requiring runtime support like dynamic casts
+  (`is`, `as?`, `as!`), as well as generic usages of parameterized existentials
+  in generic types (e.g. `Array<any Collection<Int>>`) involve additional
+  availability checks to use. Back-deploying usages in generic position can be
+  worked around with a generic type-erasing wrapper struct, which is now much
+  simpler to implement:
+
+  ```swift
+  struct AnyCollection<T> {
+    var wrapped: any Collection<T>
+  }
+
+  let arrayOfCollections: [AnyCollection<T>] = [ /**/ ]
+  ```
+
+* [SE-0358][]:
+
+  Various protocols in the standard library now declare primary associated types, for
+  example `Sequence` and `Collection` declare a single primary associated type `Element`.
+  For example, this allows writing down the types `some Collection<Int>` and
+  `any Collection<Int>`.
+
 * References to `optional` methods on a protocol metatype, as well as references to dynamically looked up methods on the `AnyObject` metatype are now supported. These references always have the type of a function that accepts a single argument and returns an optional value of function type:
 
   ```swift
@@ -330,7 +502,7 @@ _**Note:** This is in reverse chronological order, so newer entries are added to
 
 * [SE-0328][]:
 
-  Opaque types (expressed with 'some') can now be used in structural positions
+  Opaque types (expressed with `some`) can now be used in structural positions
   within a result type, including having multiple opaque types in the same
   result. For example:
 
@@ -942,7 +1114,7 @@ Swift 5.5
   }
   ```
 
-* The 'lazy' keyword now works in local contexts, making the following valid:
+* The `lazy` keyword now works in local contexts, making the following valid:
 
   ```swift
   func test(useIt: Bool) {
@@ -2901,7 +3073,7 @@ Swift 3.0
 
 * [SE-0101][]:
 
- The functions `sizeof()`, `strideof()`, and `alignof()` have been removed.
+  The functions `sizeof()`, `strideof()`, and `alignof()` have been removed.
   Memory layout properties for a type `T` are now spelled
   `MemoryLayout<T>.size`, `MemoryLayout<T>.stride`, and
   `MemoryLayout<T>.alignment`, respectively.
@@ -2943,7 +3115,7 @@ Swift 3.0
 
 * [SE-0124][]:
 
- Initializers on `Int` and `UInt` that accept an `ObjectIdentifier` must now use an explicit `bitPattern` label.
+  Initializers on `Int` and `UInt` that accept an `ObjectIdentifier` must now use an explicit `bitPattern` label.
 
   ```swift
   let x: ObjectIdentifier = ...
@@ -3199,7 +3371,7 @@ using the `.dynamicType` member to retrieve the type of an expression should mig
     didFailToRegisterForRemoteNotificationsWithError error: NSError)
   ```
 
- Now it accepts an `Error` argument:
+  Now it accepts an `Error` argument:
 
   ```swift
   optional func application(_ application: UIApplication,
@@ -3422,7 +3594,7 @@ using the `.dynamicType` member to retrieve the type of an expression should mig
   foo/* comment */! // no longer works
   ```
 
- Parse errors resulting from this change can be resolved by moving the comment outside the expression.
+  Parse errors resulting from this change can be resolved by moving the comment outside the expression.
 
 * [SE-0031][]:
 
@@ -3483,7 +3655,7 @@ using the `.dynamicType` member to retrieve the type of an expression should mig
   Attributes change from using `=` in parameters lists
   to using `:`, aligning with function call syntax.
 
-  ```
+  ```swift
   // before
   @available(*, unavailable, renamed="MyRenamedProtocol")
 
@@ -3524,13 +3696,13 @@ using the `.dynamicType` member to retrieve the type of an expression should mig
 
   Curried function syntax (with successive parenthesized groups of arguments) is removed, and now produces a compile-time error. Use chained functional return types instead.
 
-```
-// Before
-public func project(function f: FunctionType)(p0: CGPoint, p1: CGPoint)(x: CGFloat) -> CGPoint
+  ```swift
+  // Before
+  public func project(function f: FunctionType)(p0: CGPoint, p1: CGPoint)(x: CGFloat) -> CGPoint
 
-// After
-public func project(function f: FunctionType) -> (p0: CGPoint, p1: CGPoint) -> (x: CGFloat) -> CGPoint
-```
+  // After
+  public func project(function f: FunctionType) -> (p0: CGPoint, p1: CGPoint) -> (x: CGFloat) -> CGPoint
+  ```
 
 * Generic signatures can now contain superclass requirements with generic parameter types, for example:
 
@@ -4877,11 +5049,15 @@ Swift 1.2
 * The `@autoclosure` attribute is now an attribute on a parameter, not an
   attribute on the parameter's type.
 
-  Where before you might have used:
+  Where before you might have used
 
   ```swift
   func assert(predicate : @autoclosure () -> Bool) {...}
-  you now write this as:
+  ```
+
+  you now write this as
+
+  ```swift
   func assert(@autoclosure predicate : () -> Bool) {...}
   ```
 
@@ -4923,7 +5099,11 @@ Swift 1.2
       // redeclares Objective-C method
       //'setProperty:'
   }
+  ```
+
   Similar checking applies to accidental overrides in the Objective-C runtime:
+
+  ```swift
   class B : NSObject {
   func method(arg: String) { }     // note: overridden declaration
       // here has type '(String) -> ()'
@@ -4934,7 +5114,11 @@ Swift 1.2
       // selector 'method:' has incompatible
       // type '([String]) -> ()'
   }
+  ```
+
   as well as protocol conformances:
+
+  ```swift
   class MyDelegate : NSObject, NSURLSessionDelegate {
   func URLSession(session: NSURLSession, didBecomeInvalidWithError:
       Bool){ } // error: Objective-C method 'URLSession:didBecomeInvalidWithError:'
@@ -5022,13 +5206,17 @@ Swift 1.2
   that used `unsafeBitCast` as a workaround for this issue can be written to
   use the raw value initializer.
 
-  For example:
+  For example,
 
   ```swift
   let animationCurve =
     unsafeBitCast(userInfo[UIKeyboardAnimationCurveUserInfoKey].integerValue,
     UIViewAnimationCurve.self)
-  can now be written instead as:
+  ```
+
+  can now be written instead as
+
+  ```swift
   let animationCurve = UIViewAnimationCurve(rawValue:
     userInfo[UIKeyboardAnimationCurveUserInfoKey].integerValue)!
   ```
@@ -9245,6 +9433,7 @@ Swift 1.0
 [SE-0300]: <https://github.com/apple/swift-evolution/blob/main/proposals/0300-continuation.md>
 [SE-0302]: <https://github.com/apple/swift-evolution/blob/main/proposals/0302-concurrent-value-and-concurrent-closures.md>
 [SE-0306]: <https://github.com/apple/swift-evolution/blob/main/proposals/0306-actors.md>
+[SE-0309]: <https://github.com/apple/swift-evolution/blob/main/proposals/0309-unlock-existential-types-for-all-protocols.md>
 [SE-0310]: <https://github.com/apple/swift-evolution/blob/main/proposals/0310-effectful-readonly-properties.md>
 [SE-0311]: <https://github.com/apple/swift-evolution/blob/main/proposals/0311-task-locals.md>
 [SE-0313]: <https://github.com/apple/swift-evolution/blob/main/proposals/0313-actor-isolation-control.md>
@@ -9257,19 +9446,28 @@ Swift 1.0
 [SE-0326]: <https://github.com/apple/swift-evolution/blob/main/proposals/0326-extending-multi-statement-closure-inference.md>
 [SE-0327]: <https://github.com/apple/swift-evolution/blob/main/proposals/0327-actor-initializers.md>
 [SE-0328]: <https://github.com/apple/swift-evolution/blob/main/proposals/0328-structural-opaque-result-types.md>
+[SE-0329]: <https://github.com/apple/swift-evolution/blob/main/proposals/0329-clock-instant-duration.md>
 [SE-0331]: <https://github.com/apple/swift-evolution/blob/main/proposals/0331-remove-sendable-from-unsafepointer.md>
 [SE-0333]: <https://github.com/apple/swift-evolution/blob/main/proposals/0333-with-memory-rebound.md>
 [SE-0334]: <https://github.com/apple/swift-evolution/blob/main/proposals/0334-pointer-usability-improvements.md>
 [SE-0335]: <https://github.com/apple/swift-evolution/blob/main/proposals/0335-existential-any.md>
 [SE-0336]: <https://github.com/apple/swift-evolution/blob/main/proposals/0336-distributed-actor-isolation.md>
 [SE-0337]: <https://github.com/apple/swift-evolution/blob/main/proposals/0337-support-incremental-migration-to-concurrency-checking.md>
+[SE-0338]: <https://github.com/apple/swift-evolution/blob/main/proposals/0338-clarify-execution-non-actor-async.md>
 [SE-0340]: <https://github.com/apple/swift-evolution/blob/main/proposals/0340-swift-noasync.md>
 [SE-0341]: <https://github.com/apple/swift-evolution/blob/main/proposals/0341-opaque-parameters.md>
 [SE-0343]: <https://github.com/apple/swift-evolution/blob/main/proposals/0343-top-level-concurrency.md>
 [SE-0345]: <https://github.com/apple/swift-evolution/blob/main/proposals/0345-if-let-shorthand.md>
+[SE-0346]: <https://github.com/apple/swift-evolution/blob/main/proposals/0346-light-weight-same-type-syntax.md>
 [SE-0347]: <https://github.com/apple/swift-evolution/blob/main/proposals/0347-type-inference-from-default-exprs.md>
 [SE-0349]: <https://github.com/apple/swift-evolution/blob/main/proposals/0349-unaligned-loads-and-stores.md>
+[SE-0350]: <https://github.com/apple/swift-evolution/blob/main/proposals/0350-regex-type-overview.md>
 [SE-0352]: <https://github.com/apple/swift-evolution/blob/main/proposals/0352-implicit-open-existentials.md>
+[SE-0353]: <https://github.com/apple/swift-evolution/blob/main/proposals/0353-constrained-existential-types.md>
+[SE-0354]: <https://github.com/apple/swift-evolution/blob/main/proposals/0354-regex-literals.md>
+[SE-0355]: <https://github.com/apple/swift-evolution/blob/main/proposals/0355-regex-syntax-run-time-construction.md>
+[SE-0357]: <https://github.com/apple/swift-evolution/blob/main/proposals/0357-regex-string-processing-algorithms.md>
+[SE-0358]: <https://github.com/apple/swift-evolution/blob/main/proposals/0358-primary-associated-types-in-stdlib.md>
 
 [SR-75]: <https://bugs.swift.org/browse/SR-75>
 [SR-106]: <https://bugs.swift.org/browse/SR-106>

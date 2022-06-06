@@ -64,6 +64,21 @@ using namespace swift;
 
 #define DEBUG_TYPE "TypeCheckDeclPrimary"
 
+static Type containsParameterizedProtocolType(Type inheritedTy) {
+  if (inheritedTy->is<ParameterizedProtocolType>()) {
+    return inheritedTy;
+  }
+
+  if (auto *compositionTy = inheritedTy->getAs<ProtocolCompositionType>()) {
+    for (auto memberTy : compositionTy->getMembers()) {
+      if (auto paramTy = containsParameterizedProtocolType(memberTy))
+        return paramTy;
+    }
+  }
+
+  return Type();
+}
+
 /// Check the inheritance clause of a type declaration or extension thereof.
 ///
 /// This routine performs detailed checking of the inheritance clause of the
@@ -212,10 +227,10 @@ static void checkInheritanceClause(
       inheritedAnyObject = { i, inherited.getSourceRange() };
     }
 
-    if (inheritedTy->is<ParameterizedProtocolType>()) {
+    if (auto paramTy = containsParameterizedProtocolType(inheritedTy)) {
       if (!isa<ProtocolDecl>(decl)) {
         decl->diagnose(diag::inheritance_from_parameterized_protocol,
-                       inheritedTy);
+                       paramTy);
       }
       continue;
     }
@@ -232,21 +247,21 @@ static void checkInheritanceClause(
         continue;
       }
 
+      // Classes and protocols can inherit from subclass existentials.
+      // For classes, we check for a duplicate superclass below.
+      // For protocols, the requirement machine emits a requirement
+      // conflict instead.
+      if (isa<ProtocolDecl>(decl))
+        continue;
+
       // AnyObject is not allowed except on protocols.
-      if (layout.hasExplicitAnyObject &&
-          !isa<ProtocolDecl>(decl)) {
+      if (layout.hasExplicitAnyObject) {
         decl->diagnose(diag::inheritance_from_anyobject);
         continue;
       }
 
       // If the existential did not have a class constraint, we're done.
       if (!layout.explicitSuperclass)
-        continue;
-
-      // Classes and protocols can inherit from subclass existentials.
-      // For classes, we check for a duplicate superclass below.
-      // For protocols, the GSB emits its own warning instead.
-      if (isa<ProtocolDecl>(decl))
         continue;
 
       assert(isa<ClassDecl>(decl));
@@ -2713,10 +2728,7 @@ public:
 
     checkInheritanceClause(PD);
 
-    if (PD->getASTContext().LangOpts.RequirementMachineProtocolSignatures
-        == RequirementMachineMode::Enabled) {
-      checkProtocolRefinementRequirements(PD);
-    }
+    checkProtocolRefinementRequirements(PD);
 
     TypeChecker::checkDeclCircularity(PD);
     if (PD->isResilient())
@@ -2747,20 +2759,12 @@ public:
     }
 
     if (!reqSig.getErrors()) {
-      if (getASTContext().LangOpts.RequirementMachineProtocolSignatures ==
-          RequirementMachineMode::Disabled) {
-    #ifndef NDEBUG
-        // The GenericSignatureBuilder outputs incorrectly-minimized signatures
-        // sometimes, so only check invariants in asserts builds.
-        PD->getGenericSignature().verify(reqSig.getRequirements());
-    #endif
-      } else {
-        // When using the Requirement Machine, always verify signatures.
-        // An incorrect signature indicates a serious problem which can cause
-        // miscompiles or inadvertent ABI dependencies on compiler bugs, so
-        // we really want to avoid letting one slip by.
-        PD->getGenericSignature().verify(reqSig.getRequirements());
-      }
+      // Always verify signatures, even if building without asserts.
+      //
+      // An incorrect signature indicates a serious problem which can cause
+      // miscompiles or inadvertent ABI dependencies on compiler bugs, so
+      // we really want to avoid letting one slip by.
+      PD->getGenericSignature().verify(reqSig.getRequirements());
     }
 
     checkExplicitAvailability(PD);

@@ -295,7 +295,7 @@ Expr *resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE, DeclContext *Context,
 void checkExistentialTypes(Decl *decl);
 
 /// Check for invalid existential types in the given statement.
-void checkExistentialTypes(ASTContext &ctx, Stmt *stmt);
+void checkExistentialTypes(ASTContext &ctx, Stmt *stmt, DeclContext *DC);
 
 /// Check for invalid existential types in the underlying type of
 /// the given type alias.
@@ -601,6 +601,10 @@ Optional<constraints::SolutionApplicationTarget>
 typeCheckExpression(constraints::SolutionApplicationTarget &target,
                     TypeCheckExprOptions options = TypeCheckExprOptions());
 
+Optional<constraints::SolutionApplicationTarget>
+typeCheckTarget(constraints::SolutionApplicationTarget &target,
+                TypeCheckExprOptions options = TypeCheckExprOptions());
+
 /// Return the type of operator function for specified LHS, or a null
 /// \c Type on error.
 FunctionType *getTypeOfCompletionOperator(DeclContext *DC, Expr *LHS,
@@ -800,7 +804,8 @@ ProtocolConformanceRef containsProtocol(Type T, ProtocolDecl *Proto,
 /// protocol \c Proto, or \c None.
 ProtocolConformanceRef conformsToProtocol(Type T, ProtocolDecl *Proto,
                                           ModuleDecl *M,
-                                          bool allowMissing = true);
+                                          bool allowMissing = true,
+                                          bool allowUnavailable = true);
 
 /// Check whether the type conforms to a given known protocol.
 bool conformsToKnownProtocol(Type type, KnownProtocolKind protocol,

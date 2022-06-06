@@ -5,3 +5,6 @@
 import parameterized_protocol_other
 
 func testParameterizedProtocol(_: some MySequence<Int>) {}
+func testParameterizedProtocol(x : any MySequence<Int>) -> MySequenceHolder<Int> {
+  return MySequenceHolder(seq: x)
+}

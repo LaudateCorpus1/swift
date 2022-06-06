@@ -254,6 +254,11 @@ public:
   /// Path prefixes that should be rewritten in coverage info.
   PathRemapper CoveragePrefixMap;
 
+  /// Path prefixes that should be rewritten in info besides debug and coverage
+  /// (use DebugPrefixMap and CoveragePrefixMap for those) - currently just
+  /// indexing info.
+  PathRemapper FilePrefixMap;
+
   /// What level of debug info to generate.
   IRGenDebugInfoLevel DebugInfoLevel : 2;
 
@@ -457,7 +462,7 @@ public:
         PrespecializeGenericMetadata(false), UseIncrementalLLVMCodeGen(true),
         UseTypeLayoutValueHandling(true), ForceStructTypeLayouts(false),
         GenerateProfile(false), EnableDynamicReplacementChaining(false),
-        DisableRoundTripDebugTypes(false), DisableDebuggerShadowCopies(false),
+        DisableDebuggerShadowCopies(false),
         DisableConcreteTypeMetadataMangledNameAccessors(false),
         DisableStandardSubstitutionsInReflectionMangling(false),
         EnableGlobalISel(false), VirtualFunctionElimination(false),
@@ -466,7 +471,13 @@ public:
         NoPreallocatedInstantiationCaches(false),
         CmdArgs(),
         SanitizeCoverage(llvm::SanitizerCoverageOptions()),
-        TypeInfoFilter(TypeInfoDumpFilter::All) {}
+        TypeInfoFilter(TypeInfoDumpFilter::All) {
+#ifndef NDEBUG
+    DisableRoundTripDebugTypes = false;
+#else
+    DisableRoundTripDebugTypes = true;
+#endif
+  }
 
   /// Appends to \p os an arbitrary string representing all options which
   /// influence the llvm compilation but are not reflected in the llvm module

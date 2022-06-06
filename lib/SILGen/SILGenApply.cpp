@@ -2924,7 +2924,6 @@ private:
     // substituted argument type by abstraction and/or bridging.
     auto paramSlice = claimNextParameters(1);
     SILParameterInfo param = paramSlice.front();
-
     assert(arg.hasLValueType() == param.isIndirectInOut());
 
     // Make sure we use the same value category for these so that we
@@ -3119,7 +3118,7 @@ private:
     auto emissionKind = SGFAccessKind::BorrowedObjectRead;
     for (auto param : claimedParams) {
       assert(!param.isConsumed());
-      if (param.isIndirectInGuaranteed()) {
+      if (param.isIndirectInGuaranteed() && SGF.silConv.useLoweredAddresses()) {
         emissionKind = SGFAccessKind::BorrowedAddressRead;
         break;
       }
@@ -3439,8 +3438,7 @@ void DelayedArgument::emitDefaultArgument(SILGenFunction &SGF,
   auto value = SGF.emitApplyOfDefaultArgGenerator(info.loc,
                                                   info.defaultArgsOwner,
                                                   info.destIndex,
-                                                  info.resultType,
-                                                  info.origResultType);
+                                                  info.resultType);
 
   SmallVector<ManagedValue, 4> loweredArgs;
   SmallVector<DelayedArgument, 4> delayedArgs;
@@ -3497,8 +3495,10 @@ static void emitBorrowedLValueRecursive(SILGenFunction &SGF,
 
   // Load if necessary.
   assert(!param.isConsumed() && "emitting borrow into consumed parameter?");
-  if (!param.isIndirectInGuaranteed() && value.getType().isAddress()) {
-    value = SGF.B.createFormalAccessLoadBorrow(loc, value);
+  if (value.getType().isAddress()) {
+    if (!param.isIndirectInGuaranteed() || !SGF.silConv.useLoweredAddresses()) {
+      value = SGF.B.createFormalAccessLoadBorrow(loc, value);
+    }
   }
 
   assert(param.getInterfaceType() == value.getType().getASTType());
@@ -3960,15 +3960,20 @@ SILGenFunction::emitBeginApply(SILLocation loc, ManagedValue fn,
   // Manage all the yielded values.
   auto yieldInfos = substFnType->getYields();
   assert(yieldValues.size() == yieldInfos.size());
+  bool useLoweredAddresses = silConv.useLoweredAddresses();
   for (auto i : indices(yieldValues)) {
     auto value = yieldValues[i];
     auto info = yieldInfos[i];
     if (info.isIndirectInOut()) {
       yields.push_back(ManagedValue::forLValue(value));
     } else if (info.isConsumed()) {
-      yields.push_back(emitManagedRValueWithCleanup(value));
+      !useLoweredAddresses && value->getType().isTrivial(getFunction())
+          ? yields.push_back(ManagedValue::forTrivialRValue(value))
+          : yields.push_back(emitManagedRValueWithCleanup(value));
     } else if (info.isGuaranteed()) {
-      yields.push_back(ManagedValue::forBorrowedRValue(value));
+      !useLoweredAddresses && value->getType().isTrivial(getFunction())
+          ? yields.push_back(ManagedValue::forTrivialRValue(value))
+          : yields.push_back(ManagedValue::forBorrowedRValue(value));
     } else {
       yields.push_back(ManagedValue::forTrivialRValue(value));
     }

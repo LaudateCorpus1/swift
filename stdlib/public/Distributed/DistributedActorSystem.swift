@@ -12,7 +12,12 @@
 import Swift
 import _Concurrency
 
-/// A distributed actor system
+/// A distributed actor system is what enables all functionality of distributed actors.
+///
+/// Distributed actors must always be associated with a concrete distributed actor system,
+/// and do so by declaring a `typealias ActorSystem = ...`, or by having a module wide
+/// `typealias DefaultDistributedActorSystem` declared which then applies to all distributed
+/// actors that do not declare a specific type alias in their bodies.
 @available(SwiftStdlib 5.7, *)
 public protocol DistributedActorSystem: Sendable {
   /// The identity used by actors that communicate via this transport
@@ -64,7 +69,7 @@ public protocol DistributedActorSystem: Sendable {
   // - MARK: Actor Lifecycle
   /// Create an `ActorID` for the passed actor type.
   ///
-  /// This function is invoked by an distributed actor during its initialization,
+  /// This function is invoked by a distributed actor during its initialization,
   /// and the returned address value is stored along with it for the time of its
   /// lifetime.
   ///

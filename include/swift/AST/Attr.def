@@ -85,6 +85,8 @@ TYPE_ATTR(yields)
 TYPE_ATTR(yield_once)
 TYPE_ATTR(yield_many)
 TYPE_ATTR(captures_generics)
+// Used at the SIL level to mark a type as moveOnly.
+TYPE_ATTR(moveOnly)
 
 // SIL metatype attributes.
 TYPE_ATTR(thin)
@@ -268,6 +270,7 @@ SIMPLE_DECL_ATTR(objcMembers, ObjCMembers,
   34)
 CONTEXTUAL_SIMPLE_DECL_ATTR(_compilerInitialized, CompilerInitialized,
   OnVar |
+  UserInaccessible |
   ABIStableToAdd | ABIStableToRemove | APIStableToAdd | APIStableToRemove,
   35)
 CONTEXTUAL_SIMPLE_DECL_ATTR(__consuming, Consuming,
@@ -727,6 +730,7 @@ DECL_ATTR(_backDeploy, BackDeploy,
 
 CONTEXTUAL_SIMPLE_DECL_ATTR(_local, KnownToBeLocal,
   DeclModifier | OnFunc | OnParam | OnVar |
+  UserInaccessible |
   ABIBreakingToAdd | ABIBreakingToRemove |
   APIBreakingToAdd | APIBreakingToRemove,
   130)

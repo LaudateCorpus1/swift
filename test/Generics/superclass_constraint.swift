@@ -1,5 +1,5 @@
-// RUN: %target-typecheck-verify-swift -requirement-machine-protocol-signatures=on -requirement-machine-inferred-signatures=on
-// RUN: not %target-swift-frontend -typecheck %s -debug-generic-signatures -requirement-machine-protocol-signatures=on -requirement-machine-inferred-signatures=on > %t.dump 2>&1
+// RUN: %target-typecheck-verify-swift -warn-redundant-requirements
+// RUN: not %target-swift-frontend -typecheck %s -debug-generic-signatures > %t.dump 2>&1
 // RUN: %FileCheck %s < %t.dump
 
 class A {
@@ -221,3 +221,16 @@ public struct Barn<T: Teddy> {
   // CHECK: Generic signature: <T, S where T : Teddy>
   public func foo<S>(_: S, _: Barn<T>, _: Paddock<T>) {}
 }
+
+
+public class Animal { }
+
+@available(*, unavailable, message: "Not a pony")
+extension Animal: Pony { }
+
+public struct AnimalWrapper<Friend: Animal> { }
+
+// FIXME: Generic signature: <Friend where Friend : Animal, Friend : Pony>
+// Generic signature: <Friend where Friend : Animal>
+extension AnimalWrapper: Pony where Friend: Pony { }
+// expected-warning@-1{{redundant conformance constraint 'Animal' : 'Pony'}}

@@ -4460,6 +4460,32 @@ public:
   SILType getDirectFormalResultsType(SILModule &M,
                                      TypeExpansionContext expansion);
 
+  unsigned getNumIndirectFormalYields() const {
+    return isCoroutine() ? NumAnyIndirectFormalResults : 0;
+  }
+  /// Does this function have any formally indirect yields?
+  bool hasIndirectFormalYields() const {
+    return getNumIndirectFormalYields() != 0;
+  }
+  unsigned getNumDirectFormalYields() const {
+    return isCoroutine() ? NumAnyResults - NumAnyIndirectFormalResults : 0;
+  }
+
+  struct IndirectFormalYieldFilter {
+    bool operator()(SILYieldInfo yield) const {
+      return !yield.isFormalIndirect();
+    }
+  };
+
+  using IndirectFormalYieldIter =
+      llvm::filter_iterator<const SILYieldInfo *, IndirectFormalYieldFilter>;
+  using IndirectFormalYieldRange = iterator_range<IndirectFormalYieldIter>;
+
+  /// A range of SILYieldInfo for all formally Indirect Yields.
+  IndirectFormalYieldRange getIndirectFormalYields() const {
+    return llvm::make_filter_range(getYields(), IndirectFormalYieldFilter());
+  }
+
   /// Get a single non-address SILType for all SIL results regardless of whether
   /// they are formally indirect. The actual SIL result type of an apply
   /// instruction that calls this function depends on the current SIL stage and
@@ -4968,6 +4994,33 @@ public:
   }
 };
 DEFINE_EMPTY_CAN_TYPE_WRAPPER(SILBoxType, Type)
+
+class SILMoveOnlyType;
+class SILModule; // From SIL
+typedef CanTypeWrapper<SILMoveOnlyType> CanMoveOnlyType;
+
+/// A wrapper type that marks an inner type as being a move only value. Can not
+/// be written directly at the Swift level, instead it is triggered by adding
+/// the type attribute @_moveOnly to a different type. We transform these in
+/// TypeLowering into a moveOnly SILType on the inner type.
+class SILMoveOnlyType final : public TypeBase, public llvm::FoldingSetNode {
+  CanType innerType;
+
+  SILMoveOnlyType(CanType innerType)
+      : TypeBase(TypeKind::SILMoveOnly, &innerType->getASTContext(),
+                 innerType->getRecursiveProperties()),
+        innerType(innerType) {}
+
+public:
+  CanType getInnerType() const { return innerType; }
+
+  static CanMoveOnlyType get(CanType innerType);
+
+  static bool classof(const TypeBase *T) {
+    return T->getKind() == TypeKind::SILMoveOnly;
+  }
+};
+DEFINE_EMPTY_CAN_TYPE_WRAPPER(SILMoveOnlyType, Type)
 
 class SILBlockStorageType;
 typedef CanTypeWrapper<SILBlockStorageType> CanSILBlockStorageType;
@@ -5796,7 +5849,6 @@ class OpenedArchetypeType final : public ArchetypeType,
   friend ArchetypeType;
   friend GenericEnvironment;
 
-  TypeBase *Opened;
   UUID ID;
 
   /// Create a new opened archetype in the given environment representing
@@ -5892,6 +5944,9 @@ private:
                       LayoutConstraint layout);
 };
 BEGIN_CAN_TYPE_WRAPPER(OpenedArchetypeType, ArchetypeType)
+  CanOpenedArchetypeType getRoot() const {
+    return CanOpenedArchetypeType(getPointer()->getRoot());
+  }
 END_CAN_TYPE_WRAPPER(OpenedArchetypeType, ArchetypeType)
 
 /// An archetype that represents an opaque element of a type sequence in context.
@@ -6750,38 +6805,6 @@ inline TypeBase *TypeBase::getDesugaredType() {
   if (!isa<SugarType>(this))
     return this;
   return cast<SugarType>(this)->getSinglyDesugaredType()->getDesugaredType();
-}
-
-inline bool TypeBase::hasSimpleTypeRepr() const {
-  // NOTE: Please keep this logic in sync with TypeRepr::isSimple().
-  switch (getKind()) {
-  case TypeKind::Function:
-  case TypeKind::GenericFunction:
-    return false;
-
-  case TypeKind::Metatype:
-    return !cast<const AnyMetatypeType>(this)->hasRepresentation();
-
-  case TypeKind::ExistentialMetatype:
-  case TypeKind::Existential:
-    return false;
-
-  case TypeKind::OpaqueTypeArchetype:
-  case TypeKind::OpenedArchetype:
-    return false;
-
-  case TypeKind::ProtocolComposition: {
-    // 'Any', 'AnyObject' and single protocol compositions are simple
-    auto composition = cast<const ProtocolCompositionType>(this);
-    auto memberCount = composition->getMembers().size();
-    if (composition->hasExplicitAnyObject())
-      return memberCount == 0;
-    return memberCount <= 1;
-  }
-
-  default:
-    return true;
-  }
 }
 
 } // end namespace swift

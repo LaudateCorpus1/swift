@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift -requirement-machine-protocol-signatures=on -requirement-machine-inferred-signatures=on
+// RUN: %target-typecheck-verify-swift
 
 protocol P0 {
   associatedtype Assoc1 : PSimple // expected-note{{ambiguous inference of associated type 'Assoc1': 'Double' vs. 'Int'}}
@@ -682,6 +682,27 @@ struct S40<E: Equatable>: P40c {
   func foo(arg: Never) {}
 
   typealias B = Self
+}
+
+protocol P41a {
+  associatedtype A
+  associatedtype B
+
+  func bar(_: B) -> A?
+}
+protocol P42b: P41a {
+  associatedtype A
+  associatedtype B
+
+  func foo(_: A, _: B)
+}
+extension P42b {
+  func bar(_: B) -> A? {}
+}
+do {
+  class Conformer: P42b {
+    func foo(_: Bool, _: String) {}
+  }
 }
 
 // Fails to find the fixed type witness B == FIXME_S1<A>.

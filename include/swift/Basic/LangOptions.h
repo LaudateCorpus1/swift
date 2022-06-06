@@ -18,6 +18,7 @@
 #ifndef SWIFT_BASIC_LANGOPTIONS_H
 #define SWIFT_BASIC_LANGOPTIONS_H
 
+#include "swift/Basic/Feature.h"
 #include "swift/Basic/FunctionBodySkipping.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/Version.h"
@@ -25,6 +26,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Triple.h"
@@ -91,21 +93,6 @@ namespace swift {
     RemarkOnFailure,
     RemarkOnFailureOrSuccess,
     ErrorOnFailureRemarkOnSuccess
-  };
-
-  /// Value for LangOptions::EnableRequirementMachine.
-  enum class RequirementMachineMode {
-    /// Use the GenericSignatureBuilder for all queries.
-    Disabled = 0,
-
-    /// Use the RequirementMachine for all queries.
-    Enabled = 1,
-
-    /// Use both and assert if the results do not match.
-    Verify = 2,
-
-    /// Use both, print a message only but do not assert on mismatch.
-    Check = 3,
   };
 
   /// A collection of options that affect the language dialect and
@@ -208,10 +195,6 @@ namespace swift {
 
     /// Require public declarations to declare that they are Sendable (or not).
     bool RequireExplicitSendable = false;
-
-    /// If false, '#file' evaluates to the full path rather than a
-    /// human-readable string.
-    bool EnableConcisePoundFile = false;
 
     /// Detect and automatically import modules' cross-import overlays.
     bool EnableCrossImportOverlays = false;
@@ -327,26 +310,12 @@ namespace swift {
     /// Specifies how strict concurrency checking will be.
     StrictConcurrency StrictConcurrencyLevel = StrictConcurrency::Targeted;
 
-    /// Enable experimental #assert feature.
-    bool EnableExperimentalStaticAssert = false;
-
     /// Enable experimental concurrency model.
     bool EnableExperimentalConcurrency = false;
-
-    /// Enable experimental support for named opaque result types, e.g.
-    /// `func f() -> <T> T`.
-    bool EnableExperimentalNamedOpaqueTypes = false;
 
     /// Enable support for implicitly opening existential argument types
     /// in calls to generic functions.
     bool EnableOpenedExistentialTypes = false;
-
-    /// Enable support for parameterized protocol types in existential
-    /// position.
-    bool EnableParameterizedExistentialTypes = false;
-
-    /// Enable experimental flow-sensitive concurrent captures.
-    bool EnableExperimentalFlowSensitiveConcurrentCaptures = false;
 
     /// Disable experimental ClangImporter diagnostics.
     bool DisableExperimentalClangImporterDiagnostics = false;
@@ -356,16 +325,6 @@ namespace swift {
 
     /// Enable inference of Sendable conformances for public types.
     bool EnableInferPublicSendable = false;
-
-    /// Enable experimental 'move only' features.
-    bool EnableExperimentalMoveOnly = false;
-
-    /// Enable variadic generics.
-    bool EnableExperimentalVariadicGenerics = false;
-
-    /// Enable experimental associated type inference using type witness
-    /// systems.
-    bool EnableExperimentalAssociatedTypeInference = false;
 
     /// Disable the implicit import of the _Concurrency module.
     bool DisableImplicitConcurrencyModuleImport =
@@ -387,6 +346,12 @@ namespace swift {
     /// Whether to enable the new operator decl and precedencegroup lookup
     /// behavior. This is a staging flag, and will be removed in the future.
     bool EnableNewOperatorLookup = false;
+
+    /// The set of features that have been enabled.
+    llvm::SmallSet<Feature, 2> Features;
+
+    /// Temporary flag to support LLDB's transition to using \c Features.
+    bool EnableBareSlashRegexLiterals = false;
 
     /// Use Clang function types for computing canonical types.
     /// If this option is false, the clang function types will still be computed
@@ -461,17 +426,6 @@ namespace swift {
     /// file.
     bool EmitFineGrainedDependencySourcefileDotFiles = false;
 
-    /// Whether to enable experimental differentiable programming features:
-    /// `@differentiable` declaration attribute, etc.
-    bool EnableExperimentalDifferentiableProgramming = false;
-
-    /// Whether to enable forward mode differentiation.
-    bool EnableExperimentalForwardModeDifferentiation = false;
-
-    /// Whether to enable experimental `AdditiveArithmetic` derived
-    /// conformances.
-    bool EnableExperimentalAdditiveArithmeticDerivedConformances = false;
-
     /// Enable verification when every SubstitutionMap is constructed.
     bool VerifyAllSubstitutionMaps = false;
 
@@ -492,13 +446,6 @@ namespace swift {
     // Allow errors during module generation. See corresponding option in
     // FrontendOptions.
     bool AllowModuleWithCompilerErrors = false;
-
-    /// Enable extensions of (sugared) bound generic types
-    ///
-    /// \code
-    /// extension [Int] { /**/ }
-    /// \endcode
-    bool EnableExperimentalBoundGenericExtensions = false;
 
     /// A helper enum to represent whether or not we customized the default
     /// ASTVerifier behavior via a frontend flag. By default, we do not
@@ -539,21 +486,6 @@ namespace swift {
     /// classes.
     unsigned RequirementMachineMaxSplitConcreteEquivClassAttempts = 2;
 
-    /// Enable the new experimental protocol requirement signature minimization
-    /// algorithm.
-    RequirementMachineMode RequirementMachineProtocolSignatures =
-        RequirementMachineMode::Enabled;
-
-    /// Enable the new experimental generic signature minimization algorithm
-    /// for abstract generic signatures.
-    RequirementMachineMode RequirementMachineAbstractSignatures =
-        RequirementMachineMode::Enabled;
-
-    /// Enable the new experimental generic signature minimization algorithm
-    /// for user-written generic signatures.
-    RequirementMachineMode RequirementMachineInferredSignatures =
-        RequirementMachineMode::Enabled;
-
     /// Enable preprocessing pass to eliminate conformance requirements
     /// on generic parameters which are made concrete. Usually you want this
     /// enabled. It can be disabled for debugging and testing.
@@ -572,12 +504,11 @@ namespace swift {
     /// rewrite system.
     bool EnableRequirementMachineOpaqueArchetypes = false;
 
+    /// Enable warnings for redundant requirements in generic signatures.
+    bool WarnRedundantRequirements = false;
+
     /// Enables dumping type witness systems from associated type inference.
     bool DumpTypeWitnessSystems = false;
-
-    /// Enables `/.../` syntax regular-expression literals. This requires
-    /// experimental string processing. Note this does not affect `#/.../#`.
-    bool EnableBareSlashRegexLiterals = false;
 
     /// Sets the target we are building for and updates platform conditions
     /// to match.
@@ -646,6 +577,13 @@ namespace swift {
     bool isSwiftVersionAtLeast(unsigned major, unsigned minor = 0) const {
       return EffectiveLanguageVersion.isVersionAtLeast(major, minor);
     }
+
+    /// Determine whether the given feature is enabled.
+    bool hasFeature(Feature feature) const;
+
+    /// Determine whether the given feature is enabled, looking up the feature
+    /// by name.
+    bool hasFeature(llvm::StringRef featureName) const;
 
     /// Returns true if the given platform condition argument represents
     /// a supported target operating system.
@@ -755,10 +693,6 @@ namespace swift {
     
     /// Disable constraint system performance hacks.
     bool DisableConstraintSolverPerformanceHacks = false;
-
-    /// Enable experimental support for one-way constraints for the
-    /// parameters of closures.
-    bool EnableOneWayClosureParameters = false;
 
     /// See \ref FrontendOptions.PrintFullConvention
     bool PrintFullConvention = false;
