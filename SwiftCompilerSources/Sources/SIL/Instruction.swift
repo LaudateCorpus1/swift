@@ -38,8 +38,8 @@ public class Instruction : ListNode, CustomStringConvertible, Hashable {
   final public var function: Function { block.function }
 
   final public var description: String {
-    var s = SILNode_debugDescription(bridgedNode)
-    return String(cString: s.c_str())
+    let stdString = SILNode_debugDescription(bridgedNode)
+    return String(_cxxString: stdString)
   }
 
   final public var operands: OperandArray {
@@ -143,8 +143,8 @@ public class SingleValueInstruction : Instruction, Value {
 
 public final class MultipleValueInstructionResult : Value {
   final public var description: String {
-    var s = SILNode_debugDescription(bridgedNode)
-    return String(cString: s.c_str())
+    let stdString = SILNode_debugDescription(bridgedNode)
+    return String(_cxxString: stdString)
   }
 
   public var instruction: Instruction {
@@ -514,7 +514,10 @@ final public class PartialApplyInst : SingleValueInstruction, ApplySite {
   public func callerArgIndex(calleeArgIndex: Int) -> Int? {
     let firstIdx = PartialApply_getCalleeArgIndexOfFirstAppliedArg(bridged)
     if calleeArgIndex >= firstIdx {
-      return calleeArgIndex - firstIdx
+      let callerIdx = calleeArgIndex - firstIdx
+      if callerIdx < numArguments {
+        return callerIdx
+      }
     }
     return nil
   }

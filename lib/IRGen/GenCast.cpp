@@ -850,7 +850,7 @@ void irgen::emitScalarExistentialDowncast(IRGenFunction &IGF,
 /// that the actual value isn't changed in any way, thus preserving its
 /// reference identity.
 ///
-/// These restrictions are set by canUseScalarCheckedCastInstructions.
+/// These restrictions are set by \c canSILUseScalarCheckedCastInstructions.
 /// Essentially, both the source and target types must be one of:
 ///   - a (possibly generic) concrete class type,
 ///   - a class-bounded archetype,
@@ -1070,14 +1070,19 @@ llvm::Value *irgen::emitFastClassCastIfPossible(IRGenFunction &IGF,
   if (!classTy)
     return nullptr;
 
+  ClassDecl *toClass = classTy->getDecl();
+
+  // Also exclude non-generic classes nested inside other generic types.
+  if (toClass->isGenericContext())
+    return nullptr;
+
   // TODO: we could use the ClassHierarchyAnalysis do also handle "effectively"
   // final classes, e.g. not-subclassed internal classes in WMO.
   // This would need some rearchitecting of ClassHierarchyAnalysis to make it
   // available in IRGen.
-  ClassDecl *toClass = classTy->getDecl();
   if (!toClass->isFinal())
     return nullptr;
-    
+
   AncestryOptions forbidden = AncestryOptions(AncestryFlags::ObjC) |
                               AncestryFlags::Resilient |
                               AncestryFlags::ResilientOther |

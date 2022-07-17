@@ -1,8 +1,22 @@
 include_guard(GLOBAL)
 
 include(${CMAKE_CURRENT_LIST_DIR}/../../../cmake/modules/SwiftUtils.cmake)
+
 precondition(SWIFT_HOST_VARIANT_SDK)
 precondition(SWIFT_DARWIN_PLATFORMS)
+
+# +----------------------------------------------------------------------+
+# |                                                                      |
+# |  NOTE: It makes no sense setting defaults here on the basis of       |
+# |        SWIFT_HOST_VARIANT_SDK, because the stdlib is a *TARGET*      |
+# |        library, not a host library.                                  |
+# |                                                                      |
+# |        Rather, if you have a default to set, you need to do that     |
+# |        in AddSwiftStdlib.cmake, in an appropriate place,             |
+# |        likely on the basis of CFLAGS_SDK, SWIFTLIB_SINGLE_SDK or     |
+# |        similar.                                                      |
+# |                                                                      |
+# +----------------------------------------------------------------------+
 
 if("${SWIFT_HOST_VARIANT_SDK}" MATCHES "CYGWIN")
   set(SWIFT_STDLIB_SUPPORTS_BACKTRACE_REPORTING_default FALSE)
@@ -158,6 +172,16 @@ option(SWIFT_ENABLE_REFLECTION
   "Build stdlib with support for runtime reflection and mirrors."
   TRUE)
 
+if(SWIFT_FREESTANDING_FLAVOR STREQUAL "apple" AND NOT SWIFT_FREESTANDING_IS_DARWIN)
+  set(SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY_default TRUE)
+else()
+  set(SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY_default FALSE)
+endif()
+
+option(SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
+       "Should concurrency use the task-to-thread model."
+       "${SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY_default}")
+
 option(SWIFT_STDLIB_HAS_STDIN
        "Build stdlib assuming the platform supports stdin and getline API."
        TRUE)
@@ -166,11 +190,11 @@ option(SWIFT_STDLIB_HAS_ENVIRON
        "Build stdlib assuming the platform supports environment variables."
        TRUE)
 
-option(SWIFT_STDLIB_SINGLE_THREADED_RUNTIME
+option(SWIFT_STDLIB_SINGLE_THREADED_CONCURRENCY
        "Build the standard libraries assuming that they will be used in an environment with only a single thread."
        FALSE)
 
-if(SWIFT_STDLIB_SINGLE_THREADED_RUNTIME)
+if(SWIFT_STDLIB_SINGLE_THREADED_CONCURRENCY)
   set(SWIFT_CONCURRENCY_GLOBAL_EXECUTOR_default "singlethreaded")
 else()
   set(SWIFT_CONCURRENCY_GLOBAL_EXECUTOR_default "dispatch")

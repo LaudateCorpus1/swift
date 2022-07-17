@@ -20,6 +20,7 @@
 #include "swift/ABI/MetadataValues.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/DefaultArgumentKind.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsClangImporter.h"
 #include "swift/AST/ExistentialLayout.h"
@@ -228,7 +229,7 @@ namespace {
 
     // TODO: Add support for dependent types (SR-13809).
 #define DEPENDENT_TYPE(Class, Base)                                            \
-  ImportResult Visit##Class##Type(const clang::Class##Type *) { return Impl.SwiftContext.TheAnyType; }
+  ImportResult Visit##Class##Type(const clang::Class##Type *) { return Impl.SwiftContext.getAnyExistentialType(); }
 #define TYPE(Class, Base)
 #include "clang/AST/TypeNodes.inc"
 
@@ -908,7 +909,7 @@ namespace {
       if (type->isSugared())                                                   \
         return Visit(type->desugar());                                         \
       if (type->isDependentType())                                             \
-        return Impl.SwiftContext.TheAnyType;                                   \
+        return Impl.SwiftContext.getAnyExistentialType();                      \
       return Type();                                                           \
     }
     MAYBE_SUGAR_TYPE(TypeOfExpr)
@@ -1252,7 +1253,7 @@ namespace {
       if (type->isObjCIdType()) {
         return { Impl.SwiftContext.getAnyObjectType(),
                  ImportHint(ImportHint::ObjCBridged,
-                            Impl.SwiftContext.TheAnyType)};
+                            Impl.SwiftContext.getAnyExistentialType())};
       }
 
       return { importedType, ImportHint::ObjCPointer };
@@ -1919,7 +1920,7 @@ private:
   NEVER_VISIT(SILBlockStorageType)
   NEVER_VISIT(SILBoxType)
   NEVER_VISIT(SILTokenType)
-  NEVER_VISIT(SILMoveOnlyType)
+  NEVER_VISIT(SILMoveOnlyWrappedType)
 
   VISIT(ProtocolCompositionType, compose)
 
@@ -2385,7 +2386,7 @@ ParameterList *ClangImporter::Implementation::importFunctionParameterList(
   if (isVariadic) {
     auto paramTy =
         BoundGenericType::get(SwiftContext.getArrayDecl(), Type(),
-                              {SwiftContext.TheAnyType});
+                              {SwiftContext.getAnyExistentialType()});
     auto name = SwiftContext.getIdentifier("varargs");
     auto param = new (SwiftContext) ParamDecl(SourceLoc(), SourceLoc(),
                                               Identifier(), SourceLoc(),
@@ -2410,7 +2411,7 @@ static bool isObjCMethodResultAudited(const clang::Decl *decl) {
           decl->hasAttr<clang::ObjCReturnsInnerPointerAttr>());
 }
 
-DefaultArgumentKind ClangImporter::Implementation::inferDefaultArgument(
+ArgumentAttrs ClangImporter::Implementation::inferDefaultArgument(
     clang::QualType type, OptionalTypeKind clangOptionality,
     DeclBaseName baseName, StringRef argumentLabel, bool isFirstParameter,
     bool isLastParameter, NameImporter &nameImporter) {
@@ -2455,10 +2456,29 @@ DefaultArgumentKind ClangImporter::Implementation::inferDefaultArgument(
       // If we've taken this branch it means we have an enum type, and it is
       // likely an integer or NSInteger that is being used by NS/CF_OPTIONS to
       // behave like a C enum in the presence of C++.
-      auto enumName = typedefType->getDecl()->getDeclName().getAsString();
+      auto enumName = typedefType->getDecl()->getName();
+      ArgumentAttrs argumentAttrs(DefaultArgumentKind::None, true, enumName);
       for (auto word : llvm::reverse(camel_case::getWords(enumName))) {
-        if (camel_case::sameWordIgnoreFirstCase(word, "options"))
-          return DefaultArgumentKind::EmptyArray;
+        if (camel_case::sameWordIgnoreFirstCase(word, "options")) {
+          argumentAttrs.argumentKind = DefaultArgumentKind::EmptyArray;
+          return argumentAttrs;
+        }
+        if (camel_case::sameWordIgnoreFirstCase(word, "units"))
+          return argumentAttrs;
+        if (camel_case::sameWordIgnoreFirstCase(word, "domain"))
+          return argumentAttrs;
+        if (camel_case::sameWordIgnoreFirstCase(word, "action"))
+          return argumentAttrs;
+        if (camel_case::sameWordIgnoreFirstCase(word, "controlevents"))
+          return argumentAttrs;
+        if (camel_case::sameWordIgnoreFirstCase(word, "state"))
+          return argumentAttrs;
+        if (camel_case::sameWordIgnoreFirstCase(word, "unit"))
+          return argumentAttrs;
+        if (camel_case::sameWordIgnoreFirstCase(word, "scrollposition"))
+          return argumentAttrs;
+        if (camel_case::sameWordIgnoreFirstCase(word, "edge"))
+          return argumentAttrs;
       }
     }
   }

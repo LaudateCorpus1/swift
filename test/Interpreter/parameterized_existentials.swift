@@ -43,4 +43,20 @@ ParameterizedProtocolsTestSuite.test("metadataEquality") {
   expectEqual(typeOne, typeTwo)
 }
 
+ParameterizedProtocolsTestSuite.test("casting") {
+  let a = GenericHolder(value: 5) as any Holder<Int>
+  let b = GenericHolder(value: 5) as! any Holder<Int>
+  expectEqual(a.value, b.value)
+}
+
+// rdar://96571508
+struct ErasingHolder<T> {
+  let box: any Holder<T>
+}
+ParameterizedProtocolsTestSuite.test("casting") {
+  let a = ErasingHolder(box: IntHolder(value: 5))
+  expectEqual(a.box.value, 5)
+}
+
 runAllTests()
+

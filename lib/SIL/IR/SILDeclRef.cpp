@@ -396,13 +396,20 @@ SILLinkage SILDeclRef::getLinkage(ForDefinition_t forDefinition) const {
     if (fn->hasForcedStaticDispatch()) {
       limit = Limit::OnDemand;
     }
+  }
 
+  if (auto fn = dyn_cast<AbstractFunctionDecl>(d)) {
     // Native-to-foreign thunks for top-level decls are created on-demand,
     // unless they are marked @_cdecl, in which case they expose a dedicated
     // entry-point with the visibility of the function.
+    //
+    // Native-to-foreign thunks for methods are always just private, since
+    // they're anchored by Objective-C metadata.
     if (isNativeToForeignThunk() && !fn->getAttrs().hasAttribute<CDeclAttr>()) {
       if (fn->getDeclContext()->isModuleScopeContext())
         limit = Limit::OnDemand;
+      else
+        return SILLinkage::Private;
     }
   }
 
@@ -662,13 +669,14 @@ IsSerialized_t SILDeclRef::isSerialized() const {
     return IsSerialized;
 
   // The allocating entry point for designated initializers are serialized
-  // if the class is @usableFromInline or public.
+  // if the class is @usableFromInline or public. Actors are excluded because
+  // whether the init is designated is not clearly reflected in the source code.
   if (kind == SILDeclRef::Kind::Allocator) {
     auto *ctor = cast<ConstructorDecl>(d);
-    if (ctor->isDesignatedInit() &&
-        ctor->getDeclContext()->getSelfClassDecl()) {
-      if (!ctor->hasClangNode())
-        return IsSerialized;
+    if (auto classDecl = ctor->getDeclContext()->getSelfClassDecl()) {
+      if (!classDecl->isAnyActor() && ctor->isDesignatedInit())
+        if (!ctor->hasClangNode())
+          return IsSerialized;
     }
   }
 
@@ -1044,8 +1052,6 @@ bool SILDeclRef::requiresNewVTableEntry() const {
     if (derivativeFunctionRequiresNewVTableEntry(*this))
       return true;
   if (!hasDecl())
-    return false;
-  if (isDistributedThunk())
     return false;
   if (isBackDeploymentThunk())
     return false;

@@ -1593,6 +1593,7 @@ void Serializer::writeLocalNormalProtocolConformance(
         subs = subs.mapReplacementTypesOutOfContext();
 
       data.push_back(addSubstitutionMapRef(subs));
+      data.push_back(witness.getEnterIsolation().hasValue() ? 1 : 0);
   });
 
   unsigned abbrCode
@@ -3890,6 +3891,7 @@ public:
                            fn->needsNewVTableEntry(),
                            S.addDeclRef(fn->getOpaqueResultTypeDecl()),
                            fn->isUserAccessible(),
+                           fn->isDistributedThunk(),
                            nameComponentsAndDependencies);
 
     writeGenericParams(fn->getGenericParams());
@@ -4001,6 +4003,7 @@ public:
                                rawAccessLevel,
                                fn->needsNewVTableEntry(),
                                fn->isTransparent(),
+                               fn->isDistributedThunk(),
                                dependencies);
 
     writeGenericParams(fn->getGenericParams());
@@ -4720,9 +4723,10 @@ public:
         storageTy->getCaptureType());
   }
 
-  void visitSILMoveOnlyType(const SILMoveOnlyType *moveOnlyTy) {
+  void visitSILMoveOnlyWrappedType(const SILMoveOnlyWrappedType *moveOnlyTy) {
     using namespace decls_block;
-    serializeSimpleWrapper<SILMoveOnlyTypeLayout>(moveOnlyTy->getInnerType());
+    serializeSimpleWrapper<SILMoveOnlyWrappedTypeLayout>(
+        moveOnlyTy->getInnerType());
   }
 
   void visitSILBoxType(const SILBoxType *boxTy) {
@@ -5538,10 +5542,10 @@ static void collectInterestingNestedDeclarations(
       if (isLocal)
         return;
 
-      if (auto owningClass = func->getDeclContext()->getSelfClassDecl()) {
+      if (auto owningType = func->getDeclContext()->getSelfNominalTypeDecl()) {
         if (func->isObjC()) {
           Mangle::ASTMangler mangler;
-          std::string ownerName = mangler.mangleNominalType(owningClass);
+          std::string ownerName = mangler.mangleNominalType(owningType);
           assert(!ownerName.empty() && "Mangled type came back empty!");
 
           objcMethods[func->getObjCSelector()].push_back(

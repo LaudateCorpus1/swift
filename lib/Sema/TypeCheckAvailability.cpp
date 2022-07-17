@@ -356,21 +356,34 @@ namespace {
 /// A class to walk the AST to build the type refinement context hierarchy.
 class TypeRefinementContextBuilder : private ASTWalker {
 
+  ASTContext &Context;
+
+  /// Represents an entry in a stack of active type refinement contexts. The
+  /// stack is used to facilitate building the TRC's tree structure. A new TRC
+  /// is pushed onto this stack before visiting children whenever the current
+  /// AST node requires a new context and the TRC is then popped
+  /// post-visitation.
   struct ContextInfo {
     TypeRefinementContext *TRC;
 
-    /// The node whose end marks the end of the refinement context.
-    /// If the builder sees this node in a post-visitor, it will pop
-    /// the context from the stack. This node can be null (ParentTy()),
+    /// The AST node. This node can be null (ParentTy()),
     /// indicating that custom logic elsewhere will handle removing
     /// the context when needed.
     ParentTy ScopeNode;
 
     bool ContainedByDeploymentTarget;
   };
-
   std::vector<ContextInfo> ContextStack;
-  ASTContext &Context;
+
+  /// Represents an entry in a stack of pending decl body type refinement
+  /// contexts. TRCs in this stack should be pushed onto \p ContextStack when
+  /// \p BodyStmt is encountered.
+  struct DeclBodyContextInfo {
+    TypeRefinementContext *TRC;
+    Decl *Decl;
+    Stmt *BodyStmt;
+  };
+  std::vector<DeclBodyContextInfo> DeclBodyContextStack;
 
   /// A mapping from abstract storage declarations with accessors to
   /// to the type refinement contexts for those declarations. We refer to
@@ -409,6 +422,15 @@ class TypeRefinementContextBuilder : private ASTWalker {
     }
 
     ContextStack.push_back(Info);
+  }
+
+  void pushDeclBodyContext(TypeRefinementContext *TRC, Decl *D, Stmt *S) {
+    DeclBodyContextInfo Info;
+    Info.TRC = TRC;
+    Info.Decl = D;
+    Info.BodyStmt = S;
+
+    DeclBodyContextStack.push_back(Info);
   }
 
   const char *stackTraceAction() const {
@@ -474,6 +496,12 @@ private:
     while (ContextStack.back().ScopeNode.getAsDecl() == D) {
       ContextStack.pop_back();
     }
+
+    while (!DeclBodyContextStack.empty() &&
+           DeclBodyContextStack.back().Decl == D) {
+      DeclBodyContextStack.pop_back();
+    }
+
     return true;
   }
 
@@ -582,10 +610,10 @@ private:
     // This rule is a convenience for library authors who have written
     // extensions without specifying availabilty on the extension itself.
     if (auto *ED = dyn_cast<ExtensionDecl>(D)) {
-      auto *Nominal = ED->getExtendedNominal();
-      if (Nominal && !hasActiveAvailableAttribute(D, Context)) {
+      auto ET = ED->getExtendedType();
+      if (ET && !hasActiveAvailableAttribute(D, Context)) {
         EffectiveAvailability.intersectWith(
-            swift::AvailabilityInference::availableRange(Nominal, Context));
+            swift::AvailabilityInference::inferForType(ET));
 
         // We want to require availability to be specified on extensions of
         // types that would be potentially unavailable to the module containing
@@ -689,18 +717,22 @@ private:
 
     // Top level code always uses the deployment target.
     if (auto tlcd = dyn_cast<TopLevelCodeDecl>(D)) {
-      auto *topLevelTRC = createContext(tlcd, tlcd->getSourceRange());
-      pushContext(topLevelTRC, D);
+      if (auto bodyStmt = tlcd->getBody()) {
+        pushDeclBodyContext(createContext(tlcd, tlcd->getSourceRange()), tlcd,
+                            bodyStmt);
+      }
       return;
     }
 
     // Function bodies use the deployment target if they are within the module's
     // resilience domain.
     if (auto afd = dyn_cast<AbstractFunctionDecl>(D)) {
-      if (!afd->isImplicit() && afd->getBodySourceRange().isValid() &&
+      if (!afd->isImplicit() &&
           afd->getResilienceExpansion() != ResilienceExpansion::Minimal) {
-        auto *functionBodyTRC = createContext(afd, afd->getBodySourceRange());
-        pushContext(functionBodyTRC, D);
+        if (auto body = afd->getBody(/*canSynthesize*/ false)) {
+          pushDeclBodyContext(createContext(afd, afd->getBodySourceRange()),
+                              afd, body);
+        }
       }
       return;
     }
@@ -748,6 +780,10 @@ private:
   std::pair<bool, Stmt *> walkToStmtPre(Stmt *S) override {
     PrettyStackTraceStmt trace(Context, stackTraceAction(), S);
 
+    if (consumeDeclBodyContextIfNecessary(S)) {
+      return std::make_pair(true, S);
+    }
+
     if (auto *IS = dyn_cast<IfStmt>(S)) {
       buildIfStmtRefinementContext(IS);
       return std::make_pair(false, S);
@@ -776,6 +812,22 @@ private:
     }
 
     return S;
+  }
+
+  /// Consumes the top TRC from \p DeclBodyContextStack and pushes it onto the
+  /// \p Context stack if the given \p Stmt is the matching body statement.
+  /// Returns \p true if a context was pushed.
+  bool consumeDeclBodyContextIfNecessary(Stmt *S) {
+    if (DeclBodyContextStack.empty())
+      return false;
+
+    auto Info = DeclBodyContextStack.back();
+    if (S != Info.BodyStmt)
+      return false;
+
+    pushContext(Info.TRC, Info.BodyStmt);
+    DeclBodyContextStack.pop_back();
+    return true;
   }
 
   /// Builds the type refinement hierarchy for the IfStmt if the guard
@@ -2345,13 +2397,40 @@ static void fixItAvailableAttrRename(InFlightDiagnostic &diag,
                         ("." + baseReplace.str() + "(").str());
       diag.fixItReplace(SE->getEndLoc(), ")");
     } else {
-      if (parsed.IsFunctionName && parsed.ArgumentLabels.empty() &&
-          isa<VarDecl>(renamedDecl)) {
-        // If we're going from a var to a function with no arguments, emit an
-        // empty parameter list.
-        baseReplace += "()";
+      bool shouldEmitRenameFixit = true;
+      if (auto *CE = dyn_cast_or_null<CallExpr>(call)) {
+        SmallString<64> callContextName;
+        llvm::raw_svector_ostream name(callContextName);
+        if (auto *DCE = dyn_cast<DotSyntaxCallExpr>(CE->getDirectCallee())) {
+          if (auto *TE = dyn_cast<TypeExpr>(DCE->getBase())) {
+            TE->getTypeRepr()->print(name);
+            if (!parsed.ContextName.empty()) {
+              // If there is a context in rename function e.g.
+              // `Context.function()` and call context is a `DotSyntaxCallExpr`
+              // adjust the range so it replaces the base as well.
+              referenceRange =
+                  SourceRange(TE->getStartLoc(), referenceRange.End);
+            }
+          }
+        }
+        // Function names are the same(including context if applicable), so
+        // renaming fix-it doesn't need do be produced.
+        if ((parsed.ContextName.empty() ||
+             parsed.ContextName == callContextName) &&
+            CE->getCalledValue()->getBaseName() == parsed.BaseName) {
+          shouldEmitRenameFixit = false;
+        }
       }
-      diag.fixItReplace(referenceRange, baseReplace);
+      if (shouldEmitRenameFixit) {
+        if (parsed.IsFunctionName && parsed.ArgumentLabels.empty() &&
+            isa<VarDecl>(renamedDecl)) {
+          // If we're going from a var to a function with no arguments, emit an
+          // empty parameter list.
+          baseReplace += "()";
+        }
+
+        diag.fixItReplace(referenceRange, baseReplace);
+      }
     }
   }
 
@@ -3177,7 +3256,7 @@ public:
       maybeDiagParameterizedExistentialErasure(EE, Where);
     }
     if (auto *CC = dyn_cast<ExplicitCastExpr>(E)) {
-      if (!isa<CoerceExpr>(CC) &&
+      if (!isa<CoerceExpr>(CC) && CC->getCastType() &&
           CC->getCastType()->hasParameterizedExistential()) {
         SourceLoc loc = CC->getCastTypeRepr() ? CC->getCastTypeRepr()->getLoc()
                                               : E->getLoc();
@@ -3521,11 +3600,13 @@ diagnoseDeclUnavailableFromAsync(const ValueDecl *D, SourceRange R,
     return false;
 
   ASTContext &ctx = Where.getDeclContext()->getASTContext();
+  // @available(noasync) spelling
   if (const AvailableAttr *attr = D->getAttrs().getNoAsync(ctx)) {
     SourceLoc diagLoc = call ? call->getLoc() : R.Start;
     auto diag = ctx.Diags.diagnose(diagLoc, diag::async_unavailable_decl,
                                    D->getDescriptiveKind(), D->getBaseName(),
                                    attr->Message);
+    diag.warnUntilSwiftVersion(6);
 
     if (!attr->Rename.empty()) {
       fixItAvailableAttrRename(diag, R, D, attr, call);
@@ -3538,7 +3619,7 @@ diagnoseDeclUnavailableFromAsync(const ValueDecl *D, SourceRange R,
 
   if (!hasUnavailableAttr)
     return false;
-  // @available(noasync) spelling
+  // @_unavailableFromAsync spelling
   const UnavailableFromAsyncAttr *attr =
       D->getAttrs().getAttribute<UnavailableFromAsyncAttr>();
   SourceLoc diagLoc = call ? call->getLoc() : R.Start;

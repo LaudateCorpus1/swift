@@ -424,6 +424,8 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::MarkDependenceInst:
   case SILInstructionKind::MoveValueInst:
   case SILInstructionKind::MarkMustCheckInst:
+  case SILInstructionKind::CopyableToMoveOnlyWrapperValueInst:
+  case SILInstructionKind::MoveOnlyWrapperToCopyableValueInst:
   case SILInstructionKind::UncheckedOwnershipConversionInst:
   case SILInstructionKind::LoadInst:
   case SILInstructionKind::LoadBorrowInst:
@@ -594,6 +596,8 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::AllocGlobalInst: {
     SILType glTy = cast<AllocGlobalInst>(inst)->getReferencedGlobal()->
                       getLoweredType();
+    if (glTy.isLoadable(*inst->getFunction()))
+      return RuntimeEffect::NoEffect;
     if (glTy.hasOpaqueArchetype()) {
       impactType = glTy;
       return RuntimeEffect::Allocating | RuntimeEffect::MetaData;

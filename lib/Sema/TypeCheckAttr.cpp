@@ -149,7 +149,6 @@ public:
   IGNORED_ATTR(OriginallyDefinedIn)
   IGNORED_ATTR(NoDerivative)
   IGNORED_ATTR(SpecializeExtension)
-  IGNORED_ATTR(Sendable)
   IGNORED_ATTR(NonSendable)
   IGNORED_ATTR(AtRethrows)
   IGNORED_ATTR(AtReasync)
@@ -321,6 +320,8 @@ public:
   void checkBackDeployAttrs(ArrayRef<BackDeployAttr *> Attrs);
 
   void visitKnownToBeLocalAttr(KnownToBeLocalAttr *attr);
+
+  void visitSendableAttr(SendableAttr *attr);
 };
 
 } // end anonymous namespace
@@ -475,6 +476,75 @@ void AttributeChecker::visitDynamicAttr(DynamicAttr *attr) {
     diagnoseAndRemoveAttr(attr, diag::dynamic_with_transparent);
 }
 
+/// Replaces asynchronous IBActionAttr/IBSegueActionAttr function declarations
+/// with a synchronous function. The body of the original function is moved
+/// inside of a task executed on the MainActor
+static void emitFixItIBActionRemoveAsync(ASTContext &ctx, const FuncDecl &FD) {
+  // If we don't have an async loc for some reason, things will explode
+  if (!FD.getAsyncLoc())
+    return;
+
+  std::string replacement = "";
+
+  // attributes, function name and everything up to `async` (exclusive)
+  replacement +=
+      CharSourceRange(ctx.SourceMgr, FD.getSourceRangeIncludingAttrs().Start,
+                      FD.getAsyncLoc())
+          .str();
+
+  CharSourceRange returnType = Lexer::getCharSourceRangeFromSourceRange(
+      ctx.SourceMgr, FD.getResultTypeSourceRange());
+
+  // If we have a return type, include that here
+  if (returnType.isValid()) {
+    replacement +=
+        (llvm::Twine("-> ") + Lexer::getCharSourceRangeFromSourceRange(
+                                  ctx.SourceMgr, FD.getResultTypeSourceRange())
+                                  .str())
+            .str();
+  }
+
+  if (!FD.hasBody()) {
+    // If we don't have any body, the sourcelocs won't work and will result in
+    // crashes, so just swap out what we can
+
+    SourceLoc endLoc =
+        returnType.isValid() ? returnType.getEnd() : FD.getAsyncLoc();
+    ctx.Diags
+        .diagnose(FD.getAsyncLoc(), diag::remove_async_add_task, FD.getName())
+        .fixItReplace(
+            SourceRange(FD.getSourceRangeIncludingAttrs().Start, endLoc),
+            replacement);
+    return;
+  }
+
+  if (returnType.isValid())
+    replacement += " "; // insert space between type name and lbrace
+
+  replacement += "{\nTask { @MainActor in";
+
+  // If the body of the function is just "{}", there isn't anything to wrap.
+  // stepping over the braces to grab just the body will result in the `Start`
+  // location of the source range to come after the `End` of the range, and we
+  // will overflow. Dance around this by just appending the end of the fix to
+  // the replacement.
+  if (FD.getBody()->getLBraceLoc() !=
+      FD.getBody()->getRBraceLoc().getAdvancedLocOrInvalid(-1)) {
+    // We actually have a body, so add that to the string
+    CharSourceRange functionBody(
+        ctx.SourceMgr, FD.getBody()->getLBraceLoc().getAdvancedLocOrInvalid(1),
+        FD.getBody()->getRBraceLoc().getAdvancedLocOrInvalid(-1));
+    replacement += functionBody.str();
+  }
+  replacement += " }\n}";
+
+  ctx.Diags
+      .diagnose(FD.getAsyncLoc(), diag::remove_async_add_task, FD.getName())
+      .fixItReplace(SourceRange(FD.getSourceRangeIncludingAttrs().Start,
+                                FD.getBody()->getRBraceLoc()),
+                    replacement);
+}
+
 static bool
 validateIBActionSignature(ASTContext &ctx, DeclAttribute *attr,
                           const FuncDecl *FD, unsigned minParameters,
@@ -498,6 +568,13 @@ validateIBActionSignature(ASTContext &ctx, DeclAttribute *attr,
   if (resultType->isVoid() != hasVoidResult) {
     ctx.Diags.diagnose(FD, diag::invalid_ibaction_result, attr->getAttrName(),
                        hasVoidResult);
+    valid = false;
+  }
+
+  if (FD->isAsyncContext()) {
+    ctx.Diags.diagnose(FD->getAsyncLoc(), diag::attr_decl_async,
+                       attr->getAttrName(), FD->getDescriptiveKind());
+    emitFixItIBActionRemoveAsync(ctx, *FD);
     valid = false;
   }
 
@@ -2258,6 +2335,14 @@ SynthesizeMainFunctionRequest::evaluate(Evaluator &evaluator,
   auto where = ExportContext::forDeclSignature(D);
   diagnoseDeclAvailability(mainFunction, attr->getRange(), nullptr, where, None);
 
+  if (mainFunction->hasAsync() &&
+      context.LangOpts.isConcurrencyModelTaskToThread() &&
+      !AvailableAttr::isUnavailable(mainFunction)) {
+    mainFunction->diagnose(diag::concurrency_task_to_thread_model_async_main,
+                           "task-to-thread concurrency model");
+    return nullptr;
+  }
+
   auto *const func = FuncDecl::createImplicit(
       context, StaticSpellingKind::KeywordStatic,
       DeclName(context, DeclBaseName(context.Id_MainEntryPoint),
@@ -3230,6 +3315,15 @@ void AttributeChecker::visitFrozenAttr(FrozenAttr *attr) {
   }
 }
 
+/// Determine whether this is the main actor type.
+/// FIXME: the diagnostics engine and TypeCheckConcurrency both have a copy of
+///        this
+static bool isMainActor(NominalTypeDecl *nominal) {
+  return nominal->getName().is("MainActor") &&
+         nominal->getParentModule()->getName() ==
+             nominal->getASTContext().Id_Concurrency;
+}
+
 void AttributeChecker::visitCustomAttr(CustomAttr *attr) {
   auto dc = D->getDeclContext();
 
@@ -3262,6 +3356,14 @@ void AttributeChecker::visitCustomAttr(CustomAttr *attr) {
     }
 
     attr->setInvalid();
+    return;
+  }
+
+  if (isMainActor(nominal) && Ctx.LangOpts.isConcurrencyModelTaskToThread() &&
+      !AvailableAttr::isUnavailable(D)) {
+    Ctx.Diags.diagnose(attr->getLocation(),
+                       diag::concurrency_task_to_thread_model_main_actor,
+                       "task-to-thread concurrency model");
     return;
   }
 
@@ -3525,6 +3627,13 @@ AttributeChecker::visitImplementationOnlyAttr(ImplementationOnlyAttr *attr) {
         overrideInterfaceFuncTy->getResult(), overrideInterfaceInfo);
   }
 
+  // If @preconcurrency is involved, strip concurrency from the types before
+  // comparing them.
+  if (overridden->preconcurrency() || VD->preconcurrency()) {
+    derivedInterfaceTy = derivedInterfaceTy->stripConcurrency(true, false);
+    overrideInterfaceTy = overrideInterfaceTy->stripConcurrency(true, false);
+  }
+
   if (!derivedInterfaceTy->isEqual(overrideInterfaceTy)) {
     diagnose(VD, diag::implementation_only_override_changed_type,
              overrideInterfaceTy);
@@ -3660,6 +3769,12 @@ void AttributeChecker::checkBackDeployAttrs(ArrayRef<BackDeployAttr *> Attrs) {
         diagnoseAndRemoveAttr(Attr, diag::attr_not_on_stored_properties, Attr);
         continue;
       }
+    }
+
+    if (isa<DestructorDecl>(D) || isa<ConstructorDecl>(D)) {
+      diagnoseAndRemoveAttr(Attr, diag::attr_invalid_on_decl_kind, Attr,
+                            D->getDescriptiveKind());
+      continue;
     }
 
     auto AtLoc = Attr->AtLoc;
@@ -5836,6 +5951,21 @@ void AttributeChecker::visitKnownToBeLocalAttr(KnownToBeLocalAttr *attr) {
   }
 }
 
+void AttributeChecker::visitSendableAttr(SendableAttr *attr) {
+
+  if ((isa<AbstractFunctionDecl>(D) || isa<AbstractStorageDecl>(D)) &&
+      !isAsyncDecl(cast<ValueDecl>(D))) {
+    auto value = cast<ValueDecl>(D);
+    ActorIsolation isolation = getActorIsolation(value);
+    if (isolation.isActorIsolated()) {
+      diagnoseAndRemoveAttr(
+          attr, diag::sendable_isolated_sync_function,
+          isolation, value->getDescriptiveKind(), value->getName())
+        .warnUntilSwiftVersion(6);
+    }
+  }
+}
+
 void AttributeChecker::visitNonisolatedAttr(NonisolatedAttr *attr) {
   // 'nonisolated' can be applied to global and static/class variables
   // that do not have storage.
@@ -5919,6 +6049,15 @@ void AttributeChecker::visitGlobalActorAttr(GlobalActorAttr *attr) {
   auto nominal = dyn_cast<NominalTypeDecl>(D);
   if (!nominal)
     return; // already diagnosed
+
+  auto &context = nominal->getASTContext();
+  if (context.LangOpts.isConcurrencyModelTaskToThread() &&
+      !AvailableAttr::isUnavailable(nominal)) {
+    context.Diags.diagnose(attr->getLocation(),
+                           diag::concurrency_task_to_thread_model_global_actor,
+                           "task-to-thread concurrency model");
+    return;
+  }
 
   (void)nominal->isGlobalActor();
 }
@@ -6196,7 +6335,8 @@ static bool parametersMatch(const AbstractFunctionDecl *a,
 
 ValueDecl *RenamedDeclRequest::evaluate(Evaluator &evaluator,
                                         const ValueDecl *attached,
-                                        const AvailableAttr *attr) const {
+                                        const AvailableAttr *attr,
+                                        bool isKnownObjC) const {
   if (!attached || !attr)
     return nullptr;
 
@@ -6227,7 +6367,7 @@ ValueDecl *RenamedDeclRequest::evaluate(Evaluator &evaluator,
   auto minAccess = AccessLevel::Private;
   if (attached->getModuleContext()->isExternallyConsumed())
     minAccess = AccessLevel::Public;
-  bool attachedIsObjcVisible =
+  bool attachedIsObjcVisible = isKnownObjC ||
       objc_translation::isVisibleToObjC(attached, minAccess);
 
   SmallVector<ValueDecl *, 4> lookupResults;

@@ -602,6 +602,7 @@ static swift::file_types::ID computeFileTypeForPath(const StringRef Path) {
     // then iterate over all preceeding possible extension variants.
     while (llvm::sys::path::has_extension(PathStem)) {
       auto NextExtension = llvm::sys::path::extension(PathStem);
+      PathStem = llvm::sys::path::stem(PathStem);
       Extension = NextExtension.str() + Extension;
       FileType = file_types::lookupTypeForExtension(Extension);
       if (FileType != swift::file_types::ID::TY_INVALID)
@@ -765,7 +766,9 @@ bool swift::performCompileStepsPostSema(CompilerInstance &Instance,
     const PrimarySpecificPaths PSPs =
         Instance.getPrimarySpecificPathsForWholeModuleOptimizationMode();
     SILOptions SILOpts = getSILOptions(PSPs);
-    auto SM = performASTLowering(mod, Instance.getSILTypes(), SILOpts);
+    IRGenOptions irgenOpts = Invocation.getIRGenOptions();
+    auto SM = performASTLowering(mod, Instance.getSILTypes(), SILOpts,
+                                 &irgenOpts);
     return performCompileStepsPostSILGen(Instance, std::move(SM), mod, PSPs,
                                          ReturnValue, observer);
   }
@@ -778,8 +781,9 @@ bool swift::performCompileStepsPostSema(CompilerInstance &Instance,
       const PrimarySpecificPaths PSPs =
           Instance.getPrimarySpecificPathsForSourceFile(*PrimaryFile);
       SILOptions SILOpts = getSILOptions(PSPs);
+    IRGenOptions irgenOpts = Invocation.getIRGenOptions();
       auto SM = performASTLowering(*PrimaryFile, Instance.getSILTypes(),
-                                   SILOpts);
+                                   SILOpts, &irgenOpts);
       result |= performCompileStepsPostSILGen(Instance, std::move(SM),
                                               PrimaryFile, PSPs, ReturnValue,
                                               observer);
@@ -1726,6 +1730,13 @@ static bool performCompileStepsPostSILGen(CompilerInstance &Instance,
   if (validateTBDIfNeeded(Invocation, MSF, *IRModule.getModule()))
     return true;
 
+  if (IRGenOpts.UseSingleModuleLLVMEmission) {
+    // Pretend the other files that drivers/build systems expect exist by
+    // creating empty files.
+    if (writeEmptyOutputFilesFor(Context, ParallelOutputFilenames, IRGenOpts))
+      return true;
+  }
+
   return generateCode(Instance, OutputFilename, IRModule.getModule(),
                       HashGlobal);
 }
@@ -1764,7 +1775,9 @@ static void emitIndexDataForSourceFile(SourceFile *PrimarySourceFile,
                                  opts.IndexStorePath,
                                  !opts.IndexIgnoreClangModules,
                                  opts.IndexSystemModules,
-                                 opts.IndexIgnoreStdlib, isDebugCompilation,
+                                 opts.IndexIgnoreStdlib,
+                                 opts.IndexIncludeLocals,
+                                 isDebugCompilation,
                                  Invocation.getTargetTriple(),
                                  *Instance.getDependencyTracker(),
                                  Invocation.getIRGenOptions().FilePrefixMap);
@@ -1781,6 +1794,7 @@ static void emitIndexDataForSourceFile(SourceFile *PrimarySourceFile,
                                  !opts.IndexIgnoreClangModules,
                                  opts.IndexSystemModules,
                                  opts.IndexIgnoreStdlib,
+                                 opts.IndexIncludeLocals,
                                  isDebugCompilation,
                                  Invocation.getTargetTriple(),
                                  *Instance.getDependencyTracker(),
@@ -2130,7 +2144,8 @@ int swift::performFrontend(ArrayRef<const char *> Args,
     }
   };
 
-  auto emitParseableFinishedMessage = [&Invocation, &Args, &FileSpecificDiagnostics](int ExitStatus) {
+  auto emitParseableFinishedMessage = [&Invocation, &FileSpecificDiagnostics](
+                                          int ExitStatus) {
     const auto &IO = Invocation.getFrontendOptions().InputsAndOutputs;
     const auto OSPid = getpid();
     const auto ProcInfo = sys::TaskProcessInformation(OSPid);

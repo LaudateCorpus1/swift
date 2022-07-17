@@ -17,6 +17,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "CSDiagnostics.h"
+#include "TypeCheckConcurrency.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/Type.h"
@@ -36,6 +37,22 @@ using namespace swift;
 using namespace constraints;
 
 ConstraintFix::~ConstraintFix() {}
+
+Optional<ScoreKind> ConstraintFix::impact() const {
+  switch (fixBehavior) {
+  case FixBehavior::AlwaysWarning:
+    return None;
+
+  case FixBehavior::Error:
+    return SK_Fix;
+
+  case FixBehavior::DowngradeToWarning:
+    return SK_DisfavoredOverload;
+
+  case FixBehavior::Suppress:
+    return None;
+  }
+}
 
 ASTNode ConstraintFix::getAnchor() const { return getLocator()->getAnchor(); }
 
@@ -173,12 +190,37 @@ bool TreatArrayLiteralAsDictionary::diagnose(const Solution &solution,
 }
 
 TreatArrayLiteralAsDictionary *
-TreatArrayLiteralAsDictionary::create(ConstraintSystem &cs,
-                                      Type dictionaryTy, Type arrayTy,
-                                      ConstraintLocator *locator) {
-  assert(getAsExpr<ArrayExpr>(locator->getAnchor())->getNumElements() <= 1);
+TreatArrayLiteralAsDictionary::attempt(ConstraintSystem &cs, Type dictionaryTy,
+                                       Type arrayTy,
+                                       ConstraintLocator *locator) {
+  if (!cs.isArrayType(arrayTy))
+    return nullptr;
+
+  // Determine the ArrayExpr from the locator.
+  auto *expr = getAsExpr(simplifyLocatorToAnchor(locator));
+  if (!expr)
+    return nullptr;
+
+  if (auto *AE = dyn_cast<AssignExpr>(expr))
+    expr = AE->getSrc();
+
+  auto *arrayExpr = dyn_cast<ArrayExpr>(expr);
+  if (!arrayExpr)
+    return nullptr;
+
+  // This fix only applies if the array is used as a dictionary.
+  auto unwrappedDict = dictionaryTy->lookThroughAllOptionalTypes();
+  if (unwrappedDict->isTypeVariableOrMember())
+    return nullptr;
+
+  if (!TypeChecker::conformsToKnownProtocol(
+          unwrappedDict, KnownProtocolKind::ExpressibleByDictionaryLiteral,
+          cs.DC->getParentModule()))
+    return nullptr;
+
+  auto arrayLoc = cs.getConstraintLocator(arrayExpr);
   return new (cs.getAllocator())
-      TreatArrayLiteralAsDictionary(cs, dictionaryTy, arrayTy, locator);
+      TreatArrayLiteralAsDictionary(cs, dictionaryTy, arrayTy, arrayLoc);
 }
 
 bool MarkExplicitlyEscaping::diagnose(const Solution &solution,
@@ -200,28 +242,78 @@ MarkExplicitlyEscaping::create(ConstraintSystem &cs, Type lhs, Type rhs,
 }
 
 bool MarkGlobalActorFunction::diagnose(const Solution &solution,
-                                      bool asNote) const {
+                                       bool asNote) const {
   DroppedGlobalActorFunctionAttr failure(
-      solution, getFromType(), getToType(), getLocator(), isWarning());
+      solution, getFromType(), getToType(), getLocator(), fixBehavior);
   return failure.diagnose(asNote);
+}
+
+/// The fix behavior to apply to a concurrency-related diagnostic.
+static Optional<FixBehavior>
+getConcurrencyFixBehavior(
+    ConstraintSystem &cs, ConstraintKind constraintKind,
+    ConstraintLocatorBuilder locator, bool forSendable) {
+  // We can only handle the downgrade for conversions.
+  switch (constraintKind) {
+  case ConstraintKind::Conversion:
+  case ConstraintKind::ArgumentConversion:
+    break;
+
+  default:
+    if (!cs.shouldAttemptFixes())
+      return None;
+
+    return FixBehavior::Error;
+  }
+
+  // For a @preconcurrency callee outside of a strict concurrency
+  // context, ignore.
+  if (cs.hasPreconcurrencyCallee(locator) &&
+      !contextRequiresStrictConcurrencyChecking(
+          cs.DC, GetClosureType{cs}, ClosureIsolatedByPreconcurrency{cs}))
+    return FixBehavior::Suppress;
+
+  // Otherwise, warn until Swift 6.
+  if (!cs.getASTContext().LangOpts.isSwiftVersionAtLeast(6))
+    return FixBehavior::DowngradeToWarning;
+
+  return FixBehavior::Error;
 }
 
 MarkGlobalActorFunction *
 MarkGlobalActorFunction::create(ConstraintSystem &cs, Type lhs, Type rhs,
-                               ConstraintLocator *locator, bool warning) {
+                                ConstraintLocator *locator,
+                                FixBehavior fixBehavior) {
   if (locator->isLastElement<LocatorPathElt::ApplyArgToParam>())
     locator = cs.getConstraintLocator(
         locator, LocatorPathElt::ArgumentAttribute::forGlobalActor());
 
   return new (cs.getAllocator()) MarkGlobalActorFunction(
-      cs, lhs, rhs, locator, warning);
+      cs, lhs, rhs, locator, fixBehavior);
+}
+
+bool MarkGlobalActorFunction::attempt(ConstraintSystem &cs,
+                                      ConstraintKind constraintKind,
+                                      FunctionType *fromType,
+                                      FunctionType *toType,
+                                      ConstraintLocatorBuilder locator) {
+  auto fixBehavior = getConcurrencyFixBehavior(
+      cs, constraintKind, locator, /*forSendable=*/false);
+  if (!fixBehavior)
+    return true;
+
+  auto *fix = MarkGlobalActorFunction::create(
+      cs, fromType, toType, cs.getConstraintLocator(locator),
+      *fixBehavior);
+
+  return cs.recordFix(fix);
 }
 
 bool AddSendableAttribute::diagnose(const Solution &solution,
                                       bool asNote) const {
   AttributedFuncToTypeConversionFailure failure(
       solution, getFromType(), getToType(), getLocator(),
-      AttributedFuncToTypeConversionFailure::Concurrent, isWarning());
+      AttributedFuncToTypeConversionFailure::Concurrent, fixBehavior);
   return failure.diagnose(asNote);
 }
 
@@ -230,14 +322,30 @@ AddSendableAttribute::create(ConstraintSystem &cs,
                              FunctionType *fromType,
                              FunctionType *toType,
                              ConstraintLocator *locator,
-                             bool warning) {
+                             FixBehavior fixBehavior) {
   if (locator->isLastElement<LocatorPathElt::ApplyArgToParam>())
     locator = cs.getConstraintLocator(
         locator, LocatorPathElt::ArgumentAttribute::forConcurrent());
 
   return new (cs.getAllocator()) AddSendableAttribute(
-      cs, fromType, toType, locator, warning);
+      cs, fromType, toType, locator, fixBehavior);
 }
+
+bool AddSendableAttribute::attempt(ConstraintSystem &cs,
+                                   ConstraintKind constraintKind,
+                                   FunctionType *fromType,
+                                   FunctionType *toType,
+                                   ConstraintLocatorBuilder locator) {
+  auto fixBehavior = getConcurrencyFixBehavior(
+      cs, constraintKind, locator, /*forSendable=*/true);
+  if (!fixBehavior)
+    return true;
+
+  auto *fix = AddSendableAttribute::create(
+      cs, fromType, toType, cs.getConstraintLocator(locator), *fixBehavior);
+  return cs.recordFix(fix);
+}
+
 bool RelabelArguments::diagnose(const Solution &solution, bool asNote) const {
   LabelingFailure failure(solution, getLocator(), getLabels());
   return failure.diagnose(asNote);
@@ -405,7 +513,7 @@ ContextualMismatch *ContextualMismatch::create(ConstraintSystem &cs, Type lhs,
                                                Type rhs,
                                                ConstraintLocator *locator) {
   return new (cs.getAllocator()) ContextualMismatch(
-      cs, lhs, rhs, locator, /*warning=*/false);
+      cs, lhs, rhs, locator, FixBehavior::Error);
 }
 
 bool AllowWrappedValueMismatch::diagnose(const Solution &solution, bool asError) const {
@@ -583,7 +691,7 @@ bool AllowFunctionTypeMismatch::diagnoseForAmbiguity(
       auto *decl = overload->choice.getDecl();
       if (decl->getLoc().isValid()) {
         DE.diagnose(decl, diag::found_candidate_type,
-                    solution.simplifyType(overload->openedType));
+                    solution.simplifyType(overload->adjustedOpenedType));
       }
     }
 
@@ -811,7 +919,7 @@ AllowTypeOrInstanceMember::create(ConstraintSystem &cs, Type baseType,
 
 bool AllowInvalidPartialApplication::diagnose(const Solution &solution,
                                               bool asNote) const {
-  PartialApplicationFailure failure(isWarning(), solution, getLocator());
+  PartialApplicationFailure failure(isWarning, solution, getLocator());
   return failure.diagnose(asNote);
 }
 
@@ -1166,7 +1274,7 @@ NotCompileTimeConst::NotCompileTimeConst(ConstraintSystem &cs, Type paramTy,
                                          ConstraintLocator *locator):
   ContextualMismatch(cs, FixKind::NotCompileTimeConst, paramTy,
                      cs.getASTContext().TheEmptyTupleType, locator,
-                     /*warning*/true) {}
+                     FixBehavior::AlwaysWarning) {}
 
 NotCompileTimeConst *
 NotCompileTimeConst::create(ConstraintSystem &cs, Type paramTy,
@@ -1597,7 +1705,7 @@ bool TreatEphemeralAsNonEphemeral::diagnose(const Solution &solution,
                                             bool asNote) const {
   NonEphemeralConversionFailure failure(solution, getLocator(), getFromType(),
                                         getToType(), ConversionKind,
-                                        isWarning());
+                                        fixBehavior);
   return failure.diagnose(asNote);
 }
 
@@ -1606,7 +1714,9 @@ TreatEphemeralAsNonEphemeral *TreatEphemeralAsNonEphemeral::create(
     Type dstType, ConversionRestrictionKind conversionKind,
     bool downgradeToWarning) {
   return new (cs.getAllocator()) TreatEphemeralAsNonEphemeral(
-      cs, locator, srcType, dstType, conversionKind, downgradeToWarning);
+      cs, locator, srcType, dstType, conversionKind,
+      downgradeToWarning ? FixBehavior::DowngradeToWarning
+                         : FixBehavior::Error);
 }
 
 std::string TreatEphemeralAsNonEphemeral::getName() const {
@@ -2189,7 +2299,7 @@ IgnoreDefaultExprTypeMismatch::create(ConstraintSystem &cs, Type argType,
 bool AddExplicitExistentialCoercion::diagnose(const Solution &solution,
                                               bool asNote) const {
   MissingExplicitExistentialCoercion failure(solution, ErasedResultType,
-                                             getLocator());
+                                             getLocator(), fixBehavior);
   return failure.diagnose(asNote);
 }
 
@@ -2421,6 +2531,25 @@ bool AddExplicitExistentialCoercion::isRequired(
 AddExplicitExistentialCoercion *
 AddExplicitExistentialCoercion::create(ConstraintSystem &cs, Type resultTy,
                                        ConstraintLocator *locator) {
+  FixBehavior fixBehavior = FixBehavior::Error;
   return new (cs.getAllocator())
-      AddExplicitExistentialCoercion(cs, resultTy, locator);
+      AddExplicitExistentialCoercion(cs, resultTy, locator, fixBehavior);
+}
+
+bool RenameConflictingPatternVariables::diagnose(const Solution &solution,
+                                                 bool asNote) const {
+  ConflictingPatternVariables failure(solution, ExpectedType,
+                                      getConflictingVars(), getLocator());
+  return failure.diagnose(asNote);
+}
+
+RenameConflictingPatternVariables *
+RenameConflictingPatternVariables::create(ConstraintSystem &cs, Type expectedTy,
+                                          ArrayRef<VarDecl *> conflicts,
+                                          ConstraintLocator *locator) {
+  unsigned size = totalSizeToAlloc<VarDecl *>(conflicts.size());
+  void *mem = cs.getAllocator().Allocate(
+      size, alignof(RenameConflictingPatternVariables));
+  return new (mem)
+      RenameConflictingPatternVariables(cs, expectedTy, conflicts, locator);
 }

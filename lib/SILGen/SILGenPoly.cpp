@@ -183,7 +183,7 @@ collectExistentialConformances(ModuleDecl *M, CanType fromType, CanType toType) 
   SmallVector<ProtocolConformanceRef, 4> conformances;
   for (auto proto : protocols) {
     auto conformance =
-      M->lookupConformance(fromType, proto);
+      M->lookupConformance(fromType, proto, /*allowMissing=*/true);
     assert(conformance);
     conformances.push_back(conformance);
   }
@@ -4352,7 +4352,7 @@ getWitnessFunctionRef(SILGenFunction &SGF,
                       SILLocation loc) {
   switch (witnessKind) {
   case WitnessDispatchKind::Static:
-    if (auto *derivativeId = witness.getDerivativeFunctionIdentifier()) {
+    if (auto *derivativeId = witness.getDerivativeFunctionIdentifier()) { // TODO Maybe we need check here too
       auto originalFn =
           SGF.emitGlobalFunctionRef(loc, witness.asAutoDiffOriginalFunction());
       auto *loweredParamIndices = autodiff::getLoweredParameterIndices(
@@ -4411,14 +4411,16 @@ emitOpenExistentialInSelfConformance(SILGenFunction &SGF, SILLocation loc,
                                    : AccessKind::Read);
 }
 
-void SILGenFunction::emitProtocolWitness(AbstractionPattern reqtOrigTy,
-                                         CanAnyFunctionType reqtSubstTy,
-                                         SILDeclRef requirement,
-                                         SubstitutionMap reqtSubs,
-                                         SILDeclRef witness,
-                                         SubstitutionMap witnessSubs,
-                                         IsFreeFunctionWitness_t isFree,
-                                         bool isSelfConformance) {
+void SILGenFunction::emitProtocolWitness(
+    AbstractionPattern reqtOrigTy,
+    CanAnyFunctionType reqtSubstTy,
+    SILDeclRef requirement,
+    SubstitutionMap reqtSubs,
+    SILDeclRef witness,
+    SubstitutionMap witnessSubs,
+    IsFreeFunctionWitness_t isFree,
+    bool isSelfConformance,
+    Optional<ActorIsolation> enterIsolation) {
   // FIXME: Disable checks that the protocol witness carries debug info.
   // Should we carry debug info for witnesses?
   F.setBare(IsBare);
@@ -4432,13 +4434,36 @@ void SILGenFunction::emitProtocolWitness(AbstractionPattern reqtOrigTy,
   FullExpr scope(Cleanups, cleanupLoc);
   FormalEvaluationScope formalEvalScope(*this);
 
-  auto witnessKind = getWitnessDispatchKind(witness, isSelfConformance);
   auto thunkTy = F.getLoweredFunctionType();
 
   SmallVector<ManagedValue, 8> origParams;
   collectThunkParams(loc, origParams);
 
+  if (enterIsolation) {
+    // If we are supposed to enter the actor, do so now by hopping to the
+    // actor.
+    Optional<ManagedValue> actorSelf;
+
+    // For an instance actor, get the actor 'self'.
+    if (*enterIsolation == ActorIsolation::ActorInstance) {
+      auto actorSelfVal = origParams.back();
+
+      if (actorSelfVal.getType().isAddress()) {
+        auto &actorSelfTL = getTypeLowering(actorSelfVal.getType());
+        if (!actorSelfTL.isAddressOnly()) {
+          actorSelfVal = emitManagedLoad(
+              *this, loc, actorSelfVal, actorSelfTL);
+        }
+      }
+
+      actorSelf = actorSelfVal;
+    }
+
+    emitHopToTargetActor(loc, enterIsolation, actorSelf);
+  }
+
   // Get the type of the witness.
+  auto witnessKind = getWitnessDispatchKind(witness, isSelfConformance);
   auto witnessInfo = getConstantInfo(getTypeExpansionContext(), witness);
   CanAnyFunctionType witnessSubstTy = witnessInfo.LoweredType;
   if (auto genericFnType = dyn_cast<GenericFunctionType>(witnessSubstTy)) {

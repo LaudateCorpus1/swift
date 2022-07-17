@@ -16,6 +16,7 @@
 #include "DeclAndTypePrinter.h"
 #include "OutputLanguageMode.h"
 #include "PrimitiveTypeMapping.h"
+#include "PrintSwiftToClangCoreScaffold.h"
 
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/Module.h"
@@ -138,6 +139,8 @@ public:
                 access, outputLang),
         outputLangMode(outputLang) {}
 
+  PrimitiveTypeMapping &getTypeMapping() { return typeMapping; }
+
   /// Returns true if we added the decl's module to the import set, false if
   /// the decl is a local decl.
   ///
@@ -237,6 +240,12 @@ public:
   }
   
   void forwardDeclare(const EnumDecl *ED) {
+    // TODO: skip for now; will overhaul the forward decals for c++ in the
+    // future
+    if (outputLangMode == swift::OutputLanguageMode::Cxx) {
+      return;
+    }
+
     assert(ED->isObjC() || ED->hasClangNode());
     
     forwardDeclare(ED, [&]{
@@ -265,6 +274,9 @@ public:
       forwardDeclare(ED);
     } else if (isa<AbstractTypeParamDecl>(TD)) {
       llvm_unreachable("should not see type params here");
+    } else if (isa<StructDecl>(TD)) {
+      // FIXME: add support here.
+      return;
     } else {
       assert(false && "unknown local type decl");
     }
@@ -427,8 +439,10 @@ public:
     bool allRequirementsSatisfied = true;
 
     for (auto proto : PD->getInheritedProtocols()) {
-      assert(proto->isObjC());
-      allRequirementsSatisfied &= require(proto);
+      if (printer.shouldInclude(proto)) {
+        assert(proto->isObjC());
+        allRequirementsSatisfied &= require(proto);
+      }
     }
 
     if (!allRequirementsSatisfied)
@@ -589,7 +603,9 @@ public:
       const Decl *D = declsToWrite.back();
       bool success = true;
 
-      if (outputLangMode == OutputLanguageMode::Cxx) {
+      if (auto ED = dyn_cast<EnumDecl>(D)) {
+        success = writeEnum(ED);
+      } else if (outputLangMode == OutputLanguageMode::Cxx) {
         if (auto FD = dyn_cast<FuncDecl>(D))
           success = writeFunc(FD);
         if (auto SD = dyn_cast<StructDecl>(D))
@@ -600,8 +616,6 @@ public:
           success = writeClass(CD);
         else if (auto PD = dyn_cast<ProtocolDecl>(D))
           success = writeProtocol(PD);
-        else if (auto ED = dyn_cast<EnumDecl>(D))
-          success = writeEnum(ED);
         else if (auto ED = dyn_cast<FuncDecl>(D))
           success = writeFunc(ED);
         else
@@ -656,9 +670,15 @@ void swift::printModuleContentsAsCxx(
   std::string modulePrologueBuf;
   llvm::raw_string_ostream prologueOS{modulePrologueBuf};
 
-  ModuleWriter(moduleOS, prologueOS, imports, M, interopContext,
-               getRequiredAccess(M), OutputLanguageMode::Cxx)
-      .write();
+  // FIXME: Use getRequiredAccess once @expose is supported.
+  ModuleWriter writer(moduleOS, prologueOS, imports, M, interopContext,
+                      AccessLevel::Public, OutputLanguageMode::Cxx);
+  writer.write();
+
+  os << "#ifndef SWIFT_PRINTED_CORE\n";
+  os << "#define SWIFT_PRINTED_CORE\n";
+  printSwiftToClangCoreScaffold(interopContext, writer.getTypeMapping(), os);
+  os << "#endif\n";
 
   // FIXME: refactor.
   if (!prologueOS.str().empty()) {
@@ -668,11 +688,13 @@ void swift::printModuleContentsAsCxx(
     M.ValueDecl::getName().print(os);
     os << " {\n";
     os << "namespace " << cxx_synthesis::getCxxImplNamespaceName() << " {\n";
+    os << "extern \"C\" {\n";
     os << "#endif\n\n";
 
     os << prologueOS.str();
 
     os << "\n#ifdef __cplusplus\n";
+    os << "}\n";
     os << "}\n";
     os << "}\n";
   }

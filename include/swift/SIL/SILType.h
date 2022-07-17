@@ -86,15 +86,18 @@ enum class SILValueCategory : uint8_t {
   Address,
 };
 
+class SILPrinter;
+class SILParser;
+
 /// SILType - A Swift type that has been lowered to a SIL representation type.
 /// In addition to the Swift type system, SIL adds "address" types that can
 /// reference any Swift type (but cannot take the address of an address). *T
 /// is the type of an address pointing at T.
-///
 class SILType {
 public:
   /// The unsigned is a SILValueCategory.
   using ValueType = llvm::PointerIntPair<TypeBase *, 2, unsigned>;
+
 private:
   ValueType value;
 
@@ -113,6 +116,9 @@ private:
 
   friend class Lowering::TypeConverter;
   friend struct llvm::DenseMapInfo<SILType>;
+  friend class SILPrinter;
+  friend class SILParser;
+
 public:
   SILType() = default;
 
@@ -145,7 +151,7 @@ public:
 
   /// Returns the \p Category variant of this type.
   SILType getCategoryType(SILValueCategory Category) const {
-    return SILType(getASTType(), Category);
+    return SILType(getRawASTType(), Category);
   }
 
   /// Returns the variant of this type that matches \p Ty.getCategory()
@@ -156,13 +162,13 @@ public:
   /// Returns the address variant of this type.  Instructions which
   /// manipulate memory will generally work with object addresses.
   SILType getAddressType() const {
-    return SILType(getASTType(), SILValueCategory::Address);
+    return SILType(getRawASTType(), SILValueCategory::Address);
   }
 
   /// Returns the object variant of this type.  Note that address-only
   /// types are not legal to manipulate directly as objects in SIL.
   SILType getObjectType() const {
-    return SILType(getASTType(), SILValueCategory::Object);
+    return SILType(getRawASTType(), SILValueCategory::Object);
   }
 
   /// Returns the canonical AST type referenced by this SIL type.
@@ -184,7 +190,9 @@ public:
   ///    type. This is done under the assumption that in all cases where we are
   ///    performing these AST queries on SILType, we are not interested in the
   ///    move only-ness of the value (which we can query separately anyways).
-  CanType getASTType() const { return withoutMoveOnly().getRawASTType(); }
+  CanType getASTType() const {
+    return removingMoveOnlyWrapper().getRawASTType();
+  }
 
   /// Returns the canonical AST type references by this SIL type without looking
   /// through move only. Should only be used by internal utilities of SILType.
@@ -597,33 +605,34 @@ public:
   ///
   /// Canonical way to check if a SILType is move only. Using is/getAs/castTo
   /// will look through moveonly-ness.
-  bool isMoveOnly() const { return getRawASTType()->is<SILMoveOnlyType>(); }
+  bool isMoveOnlyWrapped() const {
+    return getRawASTType()->is<SILMoveOnlyWrappedType>();
+  }
 
-  /// Return *this if already move only... otherwise, wrap the current type
-  /// within a move only type wrapper and return that. Idempotent!
-  SILType asMoveOnly() const {
-    if (isMoveOnly())
+  /// If this is already a move only wrapped type, return *this. Otherwise, wrap
+  /// the copyable type in the mov eonly wrapper.
+  SILType addingMoveOnlyWrapper() const {
+    if (isMoveOnlyWrapped())
       return *this;
-    auto newType = SILMoveOnlyType::get(getRawASTType());
+    auto newType = SILMoveOnlyWrappedType::get(getRawASTType());
     return SILType::getPrimitiveType(newType, getCategory());
   }
 
-  /// Return this SILType, removing moveonly-ness.
-  ///
-  /// Is idempotent.
-  SILType withoutMoveOnly() const {
-    if (!isMoveOnly())
+  /// If this is already a copyable type, just return *this. Otherwise, if this
+  /// is a move only wrapped copyable type, return the inner type.
+  SILType removingMoveOnlyWrapper() const {
+    if (!isMoveOnlyWrapped())
       return *this;
-    auto moveOnly = getRawASTType()->castTo<SILMoveOnlyType>();
+    auto moveOnly = getRawASTType()->castTo<SILMoveOnlyWrappedType>();
     return SILType::getPrimitiveType(moveOnly->getInnerType(), getCategory());
   }
 
-  /// If \p otherType is move only, return this type that is move only as
-  /// well. Otherwise, returns self. Useful for propagating "move only"-ness
+  /// If \p otherType is move only wrapped, return this type that is move only
+  /// as well. Otherwise, returns self. Useful for propagating "move only"-ness
   /// from a parent type to a subtype.
-  SILType copyMoveOnly(SILType otherType) const {
-    if (otherType.isMoveOnly()) {
-      return asMoveOnly();
+  SILType copyingMoveOnlyWrapper(SILType otherType) const {
+    if (otherType.isMoveOnlyWrapped()) {
+      return addingMoveOnlyWrapper();
     }
     return *this;
   }

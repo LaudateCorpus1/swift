@@ -284,6 +284,8 @@ public:
   /// objects.
   unsigned EmitStackPromotionChecks : 1;
 
+  unsigned UseSingleModuleLLVMEmission : 1;
+
   /// Emit functions to separate sections.
   unsigned FunctionSections : 1;
 
@@ -400,6 +402,8 @@ public:
   /// and protocol conformance caches.
   unsigned NoPreallocatedInstantiationCaches : 1;
 
+  unsigned DisableReadonlyStaticObjects : 1;
+
   /// The number of threads for multi-threaded code generation.
   unsigned NumThreads = 0;
 
@@ -447,13 +451,13 @@ public:
         DebugInfoFormat(IRGenDebugInfoFormat::None),
         DisableClangModuleSkeletonCUs(false), UseJIT(false),
         DisableLLVMOptzns(false), DisableSwiftSpecificLLVMOptzns(false),
-        Playground(false),
-        EmitStackPromotionChecks(false), FunctionSections(false),
+        Playground(false), EmitStackPromotionChecks(false),
+        UseSingleModuleLLVMEmission(false), FunctionSections(false),
         PrintInlineTree(false), EmbedMode(IRGenEmbedMode::None),
         LLVMLTOKind(IRGenLLVMLTOKind::None),
         SwiftAsyncFramePointer(SwiftAsyncFramePointerKind::Auto),
-        HasValueNamesSetting(false),
-        ValueNames(false), ReflectionMetadata(ReflectionMetadataMode::Runtime),
+        HasValueNamesSetting(false), ValueNames(false),
+        ReflectionMetadata(ReflectionMetadataMode::Runtime),
         EnableReflectionNames(true), EnableAnonymousContextMangledNames(false),
         ForcePublicLinkage(false), LazyInitializeClassMetadata(false),
         LazyInitializeProtocolConformances(false),
@@ -469,7 +473,7 @@ public:
         WitnessMethodElimination(false), ConditionalRuntimeRecords(false),
         InternalizeAtLink(false), InternalizeSymbols(false),
         NoPreallocatedInstantiationCaches(false),
-        CmdArgs(),
+        DisableReadonlyStaticObjects(false), CmdArgs(),
         SanitizeCoverage(llvm::SanitizerCoverageOptions()),
         TypeInfoFilter(TypeInfoDumpFilter::All) {
 #ifndef NDEBUG
@@ -530,8 +534,8 @@ public:
     return llvm::hash_value(0);
   }
 
-  bool hasMultipleIRGenThreads() const { return NumThreads > 1; }
-  bool shouldPerformIRGenerationInParallel() const { return NumThreads != 0; }
+  bool hasMultipleIRGenThreads() const { return !UseSingleModuleLLVMEmission && NumThreads > 1; }
+  bool shouldPerformIRGenerationInParallel() const { return !UseSingleModuleLLVMEmission && NumThreads != 0; }
   bool hasMultipleIGMs() const { return hasMultipleIRGenThreads(); }
 };
 

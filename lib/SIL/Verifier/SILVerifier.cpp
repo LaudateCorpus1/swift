@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-verifier"
+
 #include "VerifierPrivate.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/AnyFunctionRef.h"
@@ -36,6 +37,7 @@
 #include "swift/SIL/PrettyStackTrace.h"
 #include "swift/SIL/SILDebugScope.h"
 #include "swift/SIL/SILFunction.h"
+#include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/SILVTable.h"
 #include "swift/SIL/SILVTableVisitor.h"
@@ -1844,9 +1846,6 @@ public:
     SILFunctionConventions substConv(substTy, F.getModule());
     unsigned appliedArgStartIdx =
         substConv.getNumSILArguments() - PAI->getNumArguments();
-    bool isSendableAndStageIsCanonical =
-        PAI->getFunctionType()->isSendable() &&
-        F.getModule().getStage() >= SILStage::Canonical;
     for (auto p : llvm::enumerate(PAI->getArguments())) {
       requireSameType(
           p.value()->getType(),
@@ -1854,14 +1853,6 @@ public:
                                        F.getTypeExpansionContext()),
           "applied argument types do not match suffix of function type's "
           "inputs");
-
-      // TODO: Expand this to also be true for address only types.
-      if (isSendableAndStageIsCanonical)
-        require(
-            !p.value()->getType().getASTType()->is<SILBoxType>() ||
-                p.value()->getType().getSILBoxFieldType(&F).isAddressOnly(F),
-            "Concurrent partial apply in canonical SIL with a loadable box "
-            "type argument?!");
     }
 
     // The arguments to the result function type must match the prefix of the
@@ -2709,6 +2700,9 @@ public:
     require(!fnConv.useLoweredAddresses() || F.hasOwnership(),
             "copy_value is only valid in functions with qualified "
             "ownership");
+    require(I->getModule().getStage() == SILStage::Raw ||
+                !I->getOperand()->getType().isMoveOnlyWrapped(),
+            "@moveOnly types can only be copied in Raw SIL?!");
   }
 
   void checkDestroyValueInst(DestroyValueInst *I) {
@@ -2997,8 +2991,7 @@ public:
     // metatype with the same constraint type as its existential operand.
     auto formalInstanceTy
       = MI->getType().castTo<ExistentialMetatypeType>().getInstanceType();
-    if (formalInstanceTy->isConstraintType() &&
-        !(formalInstanceTy->isAny() || formalInstanceTy->isAnyObject())) {
+    if (formalInstanceTy->isConstraintType()) {
       require(MI->getOperand()->getType().is<ExistentialType>(),
               "existential_metatype operand must be an existential type");
       formalInstanceTy =
@@ -5391,6 +5384,26 @@ public:
     require(i->getModule().getStage() == SILStage::Raw,
             "Only valid in Raw SIL! Should have been eliminated by /some/ "
             "diagnostic pass");
+  }
+
+  void checkMoveOnlyWrapperToCopyableValueInst(
+      MoveOnlyWrapperToCopyableValueInst *cvt) {
+    require(cvt->getOperand()->getType().isObject(),
+            "Operand value should be an object");
+    require(!cvt->getType().isMoveOnlyWrapped(), "Output should not move only");
+    require(cvt->getType() ==
+                cvt->getOperand()->getType().removingMoveOnlyWrapper(),
+            "Result and operand must have the same type, today.");
+  }
+
+  void checkCopyableToMoveOnlyWrapperValueInst(
+      CopyableToMoveOnlyWrapperValueInst *cvt) {
+    require(cvt->getOperand()->getType().isObject(),
+            "Operand value should be an object");
+    require(cvt->getType().isMoveOnlyWrapped(), "Output should be move only");
+    require(cvt->getType() ==
+                cvt->getOperand()->getType().addingMoveOnlyWrapper(),
+            "Result and operand must have the same type, today.");
   }
 
   void verifyEpilogBlocks(SILFunction *F) {

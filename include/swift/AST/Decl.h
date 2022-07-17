@@ -412,7 +412,7 @@ protected:
   SWIFT_INLINE_BITFIELD(SubscriptDecl, VarDecl, 2,
     StaticSpelling : 2
   );
-  SWIFT_INLINE_BITFIELD(AbstractFunctionDecl, ValueDecl, 3+2+8+1+1+1+1+1+1,
+  SWIFT_INLINE_BITFIELD(AbstractFunctionDecl, ValueDecl, 3+2+8+1+1+1+1+1+1+1,
     /// \see AbstractFunctionDecl::BodyKind
     BodyKind : 3,
 
@@ -439,7 +439,11 @@ protected:
 
     /// Whether peeking into this function detected nested type declarations.
     /// This is set when skipping over the decl at parsing.
-    HasNestedTypeDeclarations : 1
+    HasNestedTypeDeclarations : 1,
+
+    /// Whether this function is a distributed thunk for a distributed
+    /// function or computed property.
+    DistributedThunk: 1
   );
 
   SWIFT_INLINE_BITFIELD(FuncDecl, AbstractFunctionDecl, 1+1+2+1+1+2+1,
@@ -3644,7 +3648,7 @@ public:
   bool isActor() const;
 
   /// Whether this nominal type qualifies as a distributed actor, meaning that
-  /// it is either a distributed actor.
+  /// it is either a distributed actor or a DistributedActor constrained protocol.
   bool isDistributedActor() const;
 
   /// Whether this nominal type qualifies as any actor (plain or distributed).
@@ -5119,6 +5123,13 @@ public:
 
   bool hasAnyNativeDynamicAccessors() const;
 
+  /// Does this have a 'distributed' modifier?
+  bool isDistributed() const;
+
+  /// Return a distributed thunk if this computed property is marked as
+  /// 'distributed' and and nullptr otherwise.
+  FuncDecl *getDistributedThunk() const;
+
   // Implement isa/cast/dyncast/etc.
   static bool classof(const Decl *D) {
     return D->getKind() >= DeclKind::First_AbstractStorageDecl &&
@@ -5351,9 +5362,6 @@ public:
 
   /// Is this an "async let" property?
   bool isAsyncLet() const;
-
-  /// Does this have a 'distributed' modifier?
-  bool isDistributed() const;
 
   /// Is this var known to be a "local" distributed actor,
   /// if so the implicit throwing ans some isolation checks can be skipped.
@@ -5742,6 +5750,10 @@ public:
   }
   void setDefaultArgumentKind(DefaultArgumentKind K) {
     Bits.ParamDecl.defaultArgumentKind = static_cast<unsigned>(K);
+  }
+
+  void setDefaultArgumentKind(ArgumentAttrs K) {
+    setDefaultArgumentKind(K.argumentKind);
   }
 
   bool isNoImplicitCopy() const {
@@ -6327,6 +6339,7 @@ protected:
     Bits.AbstractFunctionDecl.Throws = Throws;
     Bits.AbstractFunctionDecl.HasSingleExpressionBody = false;
     Bits.AbstractFunctionDecl.HasNestedTypeDeclarations = false;
+    Bits.AbstractFunctionDecl.DistributedThunk = false;
   }
 
   void setBodyKind(BodyKind K) {
@@ -6424,6 +6437,16 @@ public:
 
   /// Returns 'true' if the function is distributed.
   bool isDistributed() const;
+
+  /// Is this a thunk function used to access a distributed method
+  /// or computed property outside of its actor isolation context?
+  bool isDistributedThunk() const {
+    return Bits.AbstractFunctionDecl.DistributedThunk;
+  }
+
+  void setDistributedThunk(bool isThunk) {
+    Bits.AbstractFunctionDecl.DistributedThunk = isThunk;
+  }
 
   /// For a 'distributed' target (func or computed property),
   /// get the 'thunk' responsible for performing the 'remoteCall'.
@@ -6753,7 +6776,7 @@ public:
   bool hasDynamicSelfResult() const;
 
   /// The async function marked as the alternative to this function, if any.
-  AbstractFunctionDecl *getAsyncAlternative() const;
+  AbstractFunctionDecl *getAsyncAlternative(bool isKnownObjC = false) const;
 
   /// If \p asyncAlternative is set, then compare its parameters to this
   /// (presumed synchronous) function's parameters to find the index of the

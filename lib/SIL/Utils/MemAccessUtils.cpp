@@ -892,8 +892,14 @@ void swift::findGuaranteedReferenceRoots(SILValue value,
         if (addAllOperandsToWorklist(result)) {
           continue;
         }
+      } else if (auto *mvi =
+                     dyn_cast<MoveOnlyWrapperToCopyableValueInst>(inst)) {
+        if (addAllOperandsToWorklist(mvi)) {
+          continue;
+        }
       }
     }
+
     if (value.getOwnershipKind() == OwnershipKind::Guaranteed)
       roots.push_back(value);
   }
@@ -2428,6 +2434,11 @@ static void visitBuiltinAddress(BuiltinInst *builtin,
 
       visitor(&builtin->getAllOperands()[1]);
       visitor(&builtin->getAllOperands()[2]);
+      return;
+
+    // Writes back to the first operand.
+    case BuiltinValueKind::TaskRunInline:
+      visitor(&builtin->getAllOperands()[0]);
       return;
 
     // These effect both operands.

@@ -26,10 +26,10 @@ using namespace swift::constraints;
 namespace {
 
 // Produce an implicit empty tuple expression.
-Expr *getVoidExpr(ASTContext &ctx) {
+Expr *getVoidExpr(ASTContext &ctx, SourceLoc contextLoc = SourceLoc()) {
   auto *voidExpr = TupleExpr::createEmpty(ctx,
-                                          /*LParenLoc=*/SourceLoc(),
-                                          /*RParenLoc=*/SourceLoc(),
+                                          /*LParenLoc=*/contextLoc,
+                                          /*RParenLoc=*/contextLoc,
                                           /*Implicit=*/true);
   voidExpr->setType(ctx.TheEmptyTupleType);
   return voidExpr;
@@ -338,6 +338,8 @@ public:
         hadError = true;
         return;
       }
+
+      caseItem->setPattern(pattern, /*resolved=*/true);
     }
 
     // Let's generate constraints for pattern + where clause.
@@ -427,6 +429,9 @@ private:
         locator, LocatorPathElt::SyntacticElement(patternBinding));
 
     for (unsigned index : range(patternBinding->getNumPatternEntries())) {
+      if (patternBinding->isInitializerChecked(index))
+        continue;
+
       auto *pattern = TypeChecker::resolvePattern(
           patternBinding->getPattern(index), patternBinding->getDeclContext(),
           /*isStmtCondition=*/true);
@@ -501,6 +506,9 @@ private:
     auto index =
         locator->castLastElementTo<LocatorPathElt::PatternBindingElement>()
             .getIndex();
+
+    if (patternBinding->isInitializerChecked(index))
+      return;
 
     auto contextualPattern =
         ContextualPattern::forPatternBindingDecl(patternBinding, index);
@@ -774,8 +782,6 @@ private:
       }
     }
 
-    bindSwitchCasePatternVars(context.getAsDeclContext(), caseStmt);
-
     auto *caseLoc = cs.getConstraintLocator(
         locator, LocatorPathElt::SyntacticElement(caseStmt));
 
@@ -799,10 +805,8 @@ private:
             locator->castLastElementTo<LocatorPathElt::SyntacticElement>()
                 .asStmt());
 
-        for (auto caseBodyVar : caseStmt->getCaseBodyVariablesOrEmptyArray()) {
-          auto parentVar = caseBodyVar->getParentVarDecl();
-          assert(parentVar && "Case body variables always have parents");
-          cs.setType(caseBodyVar, cs.getType(parentVar));
+        if (recordInferredSwitchCasePatternVars(caseStmt)) {
+          hadError = true;
         }
       }
 
@@ -881,7 +885,9 @@ private:
     } else {
       // If this is simplify `return`, let's create an empty tuple
       // which is also useful if contextual turns out to be e.g. `Void?`.
-      resultExpr = getVoidExpr(cs.getASTContext());
+      // Also, attach return stmt source location so if there is a contextual
+      // mismatch we can produce a diagnostic in a valid source location.
+      resultExpr = getVoidExpr(cs.getASTContext(), returnStmt->getEndLoc());
     }
 
     SolutionApplicationTarget target(resultExpr, context.getAsDeclContext(),
@@ -928,6 +934,75 @@ private:
     auto parentElt =
         locator->getLastElementAs<LocatorPathElt::SyntacticElement>();
     return parentElt ? parentElt->getElement().isStmt(kind) : false;
+  }
+
+  bool recordInferredSwitchCasePatternVars(CaseStmt *caseStmt) {
+    llvm::SmallDenseMap<Identifier, SmallVector<VarDecl *, 2>, 4> patternVars;
+
+    auto recordVar = [&](VarDecl *var) {
+      if (!var->hasName())
+        return;
+      patternVars[var->getName()].push_back(var);
+    };
+
+    for (auto &caseItem : caseStmt->getMutableCaseLabelItems()) {
+      assert(caseItem.isPatternResolved());
+
+      auto *pattern = caseItem.getPattern();
+      pattern->forEachVariable([&](VarDecl *var) { recordVar(var); });
+    }
+
+    for (auto bodyVar : caseStmt->getCaseBodyVariablesOrEmptyArray()) {
+      if (!bodyVar->hasName())
+        continue;
+
+      const auto &variants = patternVars[bodyVar->getName()];
+
+      auto getType = [&](VarDecl *var) {
+        auto type = cs.simplifyType(cs.getType(var));
+        assert(!type->hasTypeVariable());
+        return type;
+      };
+
+      switch (variants.size()) {
+      case 0:
+        break;
+
+      case 1:
+        // If there is only one choice here, let's use it directly.
+        cs.setType(bodyVar, getType(variants.front()));
+        break;
+
+      default: {
+        // If there are multiple choices it could only mean multiple
+        // patterns e.g. `.a(let x), .b(let x), ...:`. Let's join them.
+        Type joinType = getType(variants.front());
+
+        SmallVector<VarDecl *, 2> conflicts;
+        for (auto *var : llvm::drop_begin(variants)) {
+          auto varType = getType(var);
+          // Type mismatch between different patterns.
+          if (!joinType->isEqual(varType))
+            conflicts.push_back(var);
+        }
+
+        if (!conflicts.empty()) {
+          if (!cs.shouldAttemptFixes())
+            return true;
+
+          // dfdf
+          auto *locator = cs.getConstraintLocator(bodyVar);
+          if (cs.recordFix(RenameConflictingPatternVariables::create(
+                  cs, joinType, conflicts, locator)))
+            return true;
+        }
+
+        cs.setType(bodyVar, joinType);
+      }
+      }
+    }
+
+    return false;
   }
 };
 }
@@ -1336,6 +1411,8 @@ private:
       }
     }
 
+    bindSwitchCasePatternVars(context.getAsDeclContext(), caseStmt);
+
     for (auto *expected : caseStmt->getCaseBodyVariablesOrEmptyArray()) {
       assert(expected->hasName());
       auto prev = expected->getParentVarDecl();
@@ -1580,6 +1657,9 @@ SolutionApplicationToFunctionResult ConstraintSystem::applySolution(
       if (param->getDeclContext() == closure)
         param->setIsolated(true);
     }
+
+    if (llvm::is_contained(solution.preconcurrencyClosures, closure))
+      closure->setIsolatedByPreconcurrency();
 
     // Coerce the result type, if it was written explicitly.
     if (closure->hasExplicitResultType()) {

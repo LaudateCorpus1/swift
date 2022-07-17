@@ -804,8 +804,7 @@ ProtocolConformanceRef containsProtocol(Type T, ProtocolDecl *Proto,
 /// protocol \c Proto, or \c None.
 ProtocolConformanceRef conformsToProtocol(Type T, ProtocolDecl *Proto,
                                           ModuleDecl *M,
-                                          bool allowMissing = true,
-                                          bool allowUnavailable = true);
+                                          bool allowMissing = true);
 
 /// Check whether the type conforms to a given known protocol.
 bool conformsToKnownProtocol(Type type, KnownProtocolKind protocol,
@@ -1101,6 +1100,9 @@ diagnosePotentialOpaqueTypeUnavailability(SourceRange ReferenceRange,
 
 /// Type check a 'distributed actor' declaration.
 void checkDistributedActor(SourceFile *SF, NominalTypeDecl *decl);
+
+/// Type check a single 'distributed func' declaration.
+void checkDistributedFunc(FuncDecl *func);
 
 void checkConcurrencyAvailability(SourceRange ReferenceRange,
                                   const DeclContext *ReferenceDC);

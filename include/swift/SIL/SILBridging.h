@@ -247,7 +247,7 @@ OptionalBridgedOperand SILValue_firstUse(BridgedValue value);
 BridgedType SILValue_getType(BridgedValue value);
 BridgedOwnership SILValue_getOwnership(BridgedValue value);
 
-BridgedStringRef SILType_debugDescription(BridgedType);
+std::string SILType_debugDescription(BridgedType);
 SwiftInt SILType_isAddress(BridgedType);
 SwiftInt SILType_isTrivial(BridgedType, BridgedFunction);
 SwiftInt SILType_isReferenceCounted(BridgedType type, BridgedFunction);
@@ -328,6 +328,7 @@ SwiftInt CondBranchInst_getNumTrueArgs(BridgedInstruction cbr);
 BridgedSubstitutionMap ApplySite_getSubstitutionMap(BridgedInstruction inst);
 BridgedArgumentConvention
 ApplySite_getArgumentConvention(BridgedInstruction inst, SwiftInt calleeArgIdx);
+SwiftInt ApplySite_getNumArguments(BridgedInstruction inst);
 
 BridgedInstruction SILBuilder_createBuiltinBinaryFunction(
           BridgedBuilder builder, BridgedStringRef name,

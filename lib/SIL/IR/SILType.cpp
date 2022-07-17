@@ -88,11 +88,9 @@ SILType SILType::getBuiltinWordType(const ASTContext &C) {
 }
 
 SILType SILType::getOptionalType(SILType type) {
-  auto &ctx = type.getASTContext();
-  auto optType = BoundGenericEnumType::get(ctx.getOptionalDecl(), Type(),
-                                           { type.getASTType() });
-  return getPrimitiveType(CanType(optType), type.getCategory())
-      .copyMoveOnly(type);
+  return getPrimitiveType(type.getASTType().wrapInOptionalType(),
+                          type.getCategory())
+      .copyingMoveOnlyWrapper(type);
 }
 
 SILType SILType::getEmptyTupleType(const ASTContext &C) {
@@ -296,8 +294,8 @@ SILType SILType::getFieldType(VarDecl *field, TypeConverter &TC,
 
   // If this type is not a class type, then we propagate "move only"-ness to the
   // field. Example:
-  if (!getClassOrBoundGenericClass() && isMoveOnly())
-    loweredTy = SILMoveOnlyType::get(loweredTy);
+  if (!getClassOrBoundGenericClass() && isMoveOnlyWrapped())
+    loweredTy = SILMoveOnlyWrappedType::get(loweredTy);
 
   if (isAddress() || getClassOrBoundGenericClass() != nullptr) {
     return SILType::getPrimitiveAddressType(loweredTy);
@@ -318,7 +316,7 @@ SILType SILType::getEnumElementType(EnumElementDecl *elt, TypeConverter &TC,
 
   if (auto objectType = getASTType().getOptionalObjectType()) {
     assert(elt == TC.Context.getOptionalSomeDecl());
-    return SILType(objectType, getCategory()).copyMoveOnly(*this);
+    return SILType(objectType, getCategory()).copyingMoveOnlyWrapper(*this);
   }
 
   // If the case is indirect, then the payload is boxed.
@@ -333,7 +331,7 @@ SILType SILType::getEnumElementType(EnumElementDecl *elt, TypeConverter &TC,
   auto loweredTy = TC.getLoweredRValueType(
       context, TC.getAbstractionPattern(elt), substEltTy);
 
-  return SILType(loweredTy, getCategory()).copyMoveOnly(*this);
+  return SILType(loweredTy, getCategory()).copyingMoveOnlyWrapper(*this);
 }
 
 SILType SILType::getEnumElementType(EnumElementDecl *elt, SILModule &M,
@@ -438,15 +436,15 @@ bool SILType::aggregateHasUnreferenceableStorage() const {
 
 SILType SILType::getOptionalObjectType() const {
   if (auto objectTy = getASTType().getOptionalObjectType()) {
-    return SILType(objectTy, getCategory()).copyMoveOnly(*this);
+    return SILType(objectTy, getCategory()).copyingMoveOnlyWrapper(*this);
   }
 
   return SILType();
 }
 
 SILType SILType::unwrapOptionalType() const {
-  if (auto objectTy = withoutMoveOnly().getOptionalObjectType()) {
-    return objectTy.copyMoveOnly(*this);
+  if (auto objectTy = removingMoveOnlyWrapper().getOptionalObjectType()) {
+    return objectTy.copyingMoveOnlyWrapper(*this);
   }
 
   return *this;

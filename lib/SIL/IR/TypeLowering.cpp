@@ -244,22 +244,10 @@ namespace {
                                            RecursiveProperties::forReference());
     }
 
-    RecursiveProperties getMoveOnlyReferenceRecursiveProperties(
-        IsTypeExpansionSensitive_t isSensitive) {
-      return mergeIsTypeExpansionSensitive(isSensitive,
-                                           RecursiveProperties::forReference());
-    }
-
     RecursiveProperties
     getOpaqueRecursiveProperties(IsTypeExpansionSensitive_t isSensitive) {
       return mergeIsTypeExpansionSensitive(isSensitive,
                                            RecursiveProperties::forOpaque());
-    }
-
-    RecursiveProperties getMoveOnlyOpaqueRecursiveProperties(
-        IsTypeExpansionSensitive_t isSensitive) {
-      return mergeIsTypeExpansionSensitive(
-          isSensitive, RecursiveProperties::forMoveOnlyOpaque());
     }
 
 #define IMPL(TYPE, LOWERING)                                                 \
@@ -694,22 +682,22 @@ namespace {
           type, getReferenceRecursiveProperties(isSensitive));
     }
 
-    RetTy visitSILMoveOnlyType(CanSILMoveOnlyType type,
-                               AbstractionPattern origType,
-                               IsTypeExpansionSensitive_t isSensitive) {
-      AbstractionPattern innerAbstraction = origType.withoutMoveOnly();
+    RetTy visitSILMoveOnlyWrappedType(CanSILMoveOnlyWrappedType type,
+                                      AbstractionPattern origType,
+                                      IsTypeExpansionSensitive_t isSensitive) {
+      AbstractionPattern innerAbstraction = origType.removingMoveOnlyWrapper();
       CanType innerType = type->getInnerType();
       auto &lowering =
           TC.getTypeLowering(innerAbstraction, innerType, Expansion);
       if (lowering.isAddressOnly()) {
         return asImpl().handleMoveOnlyAddressOnly(
             type->getCanonicalType(),
-            getMoveOnlyOpaqueRecursiveProperties(isSensitive));
+            getOpaqueRecursiveProperties(isSensitive));
       }
 
       return asImpl().handleMoveOnlyReference(
           type->getCanonicalType(),
-          getMoveOnlyReferenceRecursiveProperties(isSensitive));
+          getReferenceRecursiveProperties(isSensitive));
     }
 
     RetTy handleAggregateByProperties(CanType type, RecursiveProperties props) {
@@ -2500,6 +2488,47 @@ TypeConverter::computeLoweredRValueType(TypeExpansionContext forExpansion,
                                              MetatypeRepresentation::Thick);
     }
 
+    CanType visitExistentialType(CanExistentialType substExistType) {
+      // Try to avoid walking into the constraint type if we can help it
+      if (!substExistType->hasTypeParameter() &&
+          !substExistType->hasArchetype() &&
+          !substExistType->hasOpaqueArchetype()) {
+        return substExistType;
+      }
+
+      return CanExistentialType::get(visit(substExistType.getConstraintType()));
+    }
+
+    CanType
+    visitParameterizedProtocolType(CanParameterizedProtocolType substPPT) {
+      bool changed = false;
+      SmallVector<Type, 4> loweredSubstArgs;
+      loweredSubstArgs.reserve(substPPT.getArgs().size());
+
+      auto origConstraint = origType.getExistentialConstraintType();
+      auto origPPT = origConstraint.getAs<ParameterizedProtocolType>();
+      if (!origPPT)
+        return substPPT;
+      
+      for (auto i : indices(substPPT.getArgs())) {
+        auto origArgTy = AbstractionPattern(
+            origConstraint.getGenericSignatureOrNull(), origPPT.getArgs()[i]);
+        auto substArgType = substPPT.getArgs()[i];
+
+        CanType loweredSubstEltType =
+            TC.getLoweredRValueType(forExpansion, origArgTy, substArgType);
+        changed = changed || substArgType != loweredSubstEltType;
+
+        loweredSubstArgs.push_back(loweredSubstEltType);
+      }
+
+      if (!changed)
+        return substPPT;
+
+      return CanParameterizedProtocolType::get(
+          TC.Context, substPPT->getBaseType(), loweredSubstArgs);
+    }
+
     CanType visitPackType(CanPackType substPackType) {
       llvm_unreachable("");
     }
@@ -2558,7 +2587,11 @@ TypeConverter::getTypeLowering(SILType type,
                                CanGenericSignature sig) {
   // The type lowering for a type parameter relies on its context.
   assert(sig || !type.getASTType()->hasTypeParameter());
-  auto loweredType = type.getASTType();
+
+  // We use the Raw AST type to ensure that moveonlywrapped values use the move
+  // only type lowering. This ensures that trivial moveonlywrapped values are
+  // not trivial.
+  auto loweredType = type.getRawASTType();
   auto isTypeExpansionSensitive = loweredType->hasOpaqueArchetype()
                                       ? IsTypeExpansionSensitive
                                       : IsNotTypeExpansionSensitive;
@@ -3862,6 +3895,19 @@ TypeConverter::getConstantAbstractionPattern(SILDeclRef constant) {
   return None;
 }
 
+TypeExpansionContext
+TypeConverter::getCaptureTypeExpansionContext(SILDeclRef constant) {
+  auto found = CaptureTypeExpansionContexts.find(constant);
+  if (found != CaptureTypeExpansionContexts.end()) {
+    return found->second;
+  }
+  // Insert a minimal type expansion context into the cache, so that further
+  // attempts to change it raise an error.
+  auto minimal = TypeExpansionContext::minimal();
+  CaptureTypeExpansionContexts.insert({constant, minimal});
+  return minimal;
+}
+
 void TypeConverter::setAbstractionPattern(AbstractClosureExpr *closure,
                                           AbstractionPattern pattern) {
   auto existing = ClosureAbstractionPatterns.find(closure);
@@ -3870,6 +3916,31 @@ void TypeConverter::setAbstractionPattern(AbstractClosureExpr *closure,
      && "closure shouldn't be emitted at different abstraction level contexts");
   } else {
     ClosureAbstractionPatterns[closure] = pattern;
+  }
+}
+
+void TypeConverter::setCaptureTypeExpansionContext(SILDeclRef constant,
+                                                   SILModule &M) {
+  if (!hasLoweredLocalCaptures(constant)) {
+    return;
+  }
+  
+  TypeExpansionContext context = constant.isSerialized()
+    ? TypeExpansionContext::minimal()
+    : TypeExpansionContext::maximal(constant.getAnyFunctionRef()->getAsDeclContext(),
+                                    M.isWholeModule());
+
+  auto existing = CaptureTypeExpansionContexts.find(constant);
+  if (existing != CaptureTypeExpansionContexts.end()) {
+    assert(existing->second == context
+     && "closure shouldn't be emitted with different capture type expansion contexts");
+  } else {
+    // Lower in the context of the closure. Since the set of captures is a
+    // private contract between the closure and its enclosing context, we
+    // don't need to keep its capture types opaque.
+    // The exception is if it's inlinable, in which case it might get inlined into
+    // some place we need to keep opaque types opaque.
+    CaptureTypeExpansionContexts.insert({constant, context});
   }
 }
 

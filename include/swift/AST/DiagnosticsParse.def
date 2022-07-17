@@ -143,6 +143,9 @@ ERROR(lex_invalid_closing_delimiter,none,
 ERROR(lex_regex_literal_invalid_starting_char,none,
       "regex literal may not start with %0; add backslash to escape",
       (StringRef))
+ERROR(lex_regex_literal_invalid_ending_char,none,
+      "regex literal may not end with %0; use extended literal instead",
+      (StringRef))
 ERROR(lex_regex_literal_unterminated,none,
       "unterminated regex literal", ())
 
@@ -655,6 +658,10 @@ ERROR(sil_markmustcheck_invalid_attribute,none,
       "Attribute '[%0]' can not be applied to mark_value_as_moveonly", (StringRef))
 ERROR(sil_markmustcheck_requires_attribute,none,
       "mark_must_check requires an attribute like 'noImplicitCopy'", ())
+ERROR(sil_moveonlytocopyable_invalid_attribute,none,
+      "Attribute '[%0]' can not be applied to moveonlywrapper_to_copyable", (StringRef))
+ERROR(sil_moveonlytocopyable_requires_attribute,none,
+      "moveonlywrapper_to_copyable requires either a [guaranteed] or [owned] attribute", ())
 
 // SIL Basic Blocks
 ERROR(expected_sil_block_name,none,

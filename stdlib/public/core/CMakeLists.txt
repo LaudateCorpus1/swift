@@ -170,6 +170,7 @@ set(SWIFTLIB_ESSENTIAL
   StringUTF16View.swift
   StringUTF8View.swift
   StringUTF8Validation.swift
+  StringWordBreaking.swift
   Substring.swift
   SwiftNativeNSArray.swift
   TemporaryAllocation.swift
@@ -178,7 +179,7 @@ set(SWIFTLIB_ESSENTIAL
   UnavailableStringAPIs.swift
   UnicodeData.swift
   UnicodeEncoding.swift
-  UnicodeGraphemeBreakProperty.swift
+  UnicodeBreakProperty.swift
   UnicodeHelpers.swift
   UnicodeParser.swift
   UnicodeScalarProperties.swift
@@ -260,7 +261,7 @@ elseif(SWIFT_PRIMARY_VARIANT_SDK STREQUAL LINUX)
     list(APPEND swift_core_private_link_libraries)
   endif()
 elseif(SWIFT_PRIMARY_VARIANT_SDK STREQUAL WINDOWS)
-  list(APPEND swift_core_private_link_libraries shell32;DbgHelp)
+  list(APPEND swift_core_private_link_libraries shell32;DbgHelp;Synchronization)
 endif()
 
 option(SWIFT_CHECK_ESSENTIAL_STDLIB
@@ -299,6 +300,7 @@ list(APPEND swift_core_incorporate_object_libraries swiftRuntime)
 list(APPEND swift_core_incorporate_object_libraries swiftLLVMSupport)
 list(APPEND swift_core_incorporate_object_libraries swiftDemangling)
 list(APPEND swift_core_incorporate_object_libraries swiftStdlibStubs)
+list(APPEND swift_core_incorporate_object_libraries swiftThreading)
 if(SWIFT_STDLIB_HAS_COMMANDLINE)
   list(APPEND swift_core_incorporate_object_libraries swiftCommandLineSupport)
 endif()

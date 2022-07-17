@@ -383,11 +383,12 @@ BridgedOwnership SILValue_getOwnership(BridgedValue value) {
 //                            SILType
 //===----------------------------------------------------------------------===//
 
-BridgedStringRef SILType_debugDescription(BridgedType type) {
+std::string SILType_debugDescription(BridgedType type) {
   std::string str;
   llvm::raw_string_ostream os(str);
   castToSILType(type).print(os);
-  return getCopiedBridgedStringRef(str, /*removeTrailingNewline*/ true);
+  str.pop_back(); // Remove trailing newline.
+  return str;
 }
 
 SwiftInt SILType_isAddress(BridgedType type) {
@@ -776,6 +777,11 @@ ApplySite_getArgumentConvention(BridgedInstruction inst, SwiftInt calleeArgIdx) 
     case SILArgumentConvention::Direct_Guaranteed:
       return ArgumentConvention_Direct_Guaranteed;
   }
+}
+
+SwiftInt ApplySite_getNumArguments(BridgedInstruction inst) {
+  auto as = ApplySite(castToInst(inst));
+  return as.getNumArguments();
 }
 
 //===----------------------------------------------------------------------===//

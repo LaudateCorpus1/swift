@@ -763,6 +763,9 @@ public:
 
   llvm::GlobalVariable *TheTrivialPropertyDescriptor = nullptr;
 
+  llvm::GlobalVariable *swiftImmortalRefCount = nullptr;
+  llvm::GlobalVariable *swiftStaticArrayMetadata = nullptr;
+
   /// Used to create unique names for class layout types with tail allocated
   /// elements.
   unsigned TailElemTypeID = 0;
@@ -874,6 +877,9 @@ public:
   llvm::PointerType *getValueWitnessTablePtrTy();
   llvm::PointerType *getEnumValueWitnessTablePtrTy();
 
+  llvm::IntegerType *getTypeMetadataRequestParamTy();
+  llvm::StructType *getTypeMetadataResponseTy();
+
   void unimplemented(SourceLoc, StringRef Message);
   [[noreturn]]
   void fatal_unimplemented(SourceLoc, StringRef Message);
@@ -882,6 +888,8 @@ public:
   bool useDllStorage();
 
   bool shouldPrespecializeGenericMetadata();
+  
+  bool canMakeStaticObjectsReadOnly();
   
   Size getAtomicBoolSize() const { return AtomicBoolSize; }
   Alignment getAtomicBoolAlignment() const { return AtomicBoolAlign; }
@@ -1442,6 +1450,10 @@ public:
   void emitClassDecl(ClassDecl *D);
   void emitExtension(ExtensionDecl *D);
   void emitOpaqueTypeDecl(OpaqueTypeDecl *D);
+  /// This method does additional checking vs. \c emitOpaqueTypeDecl
+  /// based on the state and flags associated with the module.
+  void maybeEmitOpaqueTypeDecl(OpaqueTypeDecl *D);
+
   void emitSILGlobalVariable(SILGlobalVariable *gv);
   void emitCoverageMapping();
   void emitSILFunction(SILFunction *f);
@@ -1764,7 +1776,6 @@ private:
 
   void emitLazyPrivateDefinitions();
   void addRuntimeResolvableType(GenericTypeDecl *nominal);
-  void maybeEmitOpaqueTypeDecl(OpaqueTypeDecl *opaque);
 
   /// Add all conformances of the given \c IterableDeclContext
   /// LazyWitnessTables.

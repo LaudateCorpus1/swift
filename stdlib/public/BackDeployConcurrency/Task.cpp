@@ -17,8 +17,8 @@
 #include "CompatibilityOverride.h"
 #include "ConcurrencyRuntime.h"
 #include "swift/ABI/Metadata.h"
-#include "swift/Runtime/Mutex.h"
 #include "swift/Runtime/HeapObject.h"
+#include "swift/Threading/Mutex.h"
 #include "Task.h"
 #include "TaskGroupPrivate.h"
 #include "TaskLocal.h"
@@ -481,7 +481,7 @@ static AsyncTaskAndContext swift_task_create_commonImpl(
       jobFlags.task_setIsChildTask(true);
       break;
 
-    case TaskOptionRecordKind::AsyncLetWithBuffer:
+    case TaskOptionRecordKind::AsyncLetWithBuffer: {
       auto *aletRecord = cast<AsyncLetWithBufferTaskOptionRecord>(option);
       asyncLet = aletRecord->getAsyncLet();
       // TODO: Actually digest the result buffer into the async let task
@@ -492,6 +492,10 @@ static AsyncTaskAndContext swift_task_create_commonImpl(
         
       jobFlags.task_setIsAsyncLetTask(true);
       jobFlags.task_setIsChildTask(true);
+      break;
+    }
+    case TaskOptionRecordKind::RunInline:
+      assert(false && "used task option record kind which isn't back deployed");
       break;
     }
   }

@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 @_exported import BasicBridging
+import std
 
 //===----------------------------------------------------------------------===//
 //                              StringRef
@@ -45,11 +46,11 @@ extension BridgedStringRef {
     let buffer = UnsafeBufferPointer<UInt8>(start: data, count: Int(length))
     return String(decoding: buffer, as: UTF8.self)
   }
+}
 
-  public func takeString() -> String {
-    let str = string
-    freeBridgedStringRef(self)
-    return str
+extension llvm.StringRef {
+  public init(_ bridged: BridgedStringRef) {
+    self.init(bridged.data, bridged.length)
   }
 }
 
@@ -59,6 +60,13 @@ extension String {
     return str.withUTF8 { buffer in
       return c(BridgedStringRef(data: buffer.baseAddress, length: buffer.count))
     }
+  }
+
+  /// Underscored to avoid name collision with the std overlay.
+  /// To be replaced with an overlay call once the CI uses SDKs built with Swift 5.8.
+  public init(_cxxString s: std.string) {
+    self.init(cString: s.c_str())
+    withExtendedLifetime(s) {}
   }
 }
 

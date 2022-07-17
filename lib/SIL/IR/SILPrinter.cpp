@@ -23,8 +23,8 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/Types.h"
 #include "swift/Basic/QuotedString.h"
-#include "swift/Basic/SourceManager.h"
 #include "swift/Basic/STLExtras.h"
+#include "swift/Basic/SourceManager.h"
 #include "swift/Demangling/Demangle.h"
 #include "swift/SIL/ApplySite.h"
 #include "swift/SIL/CFG.h"
@@ -32,6 +32,7 @@
 #include "swift/SIL/SILDebugScope.h"
 #include "swift/SIL/SILDeclRef.h"
 #include "swift/SIL/SILFunction.h"
+#include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/SILPrintContext.h"
 #include "swift/SIL/SILVTable.h"
@@ -532,8 +533,6 @@ static void printSILFunctionNameAndType(llvm::raw_ostream &OS,
 }
 
 namespace {
-  
-class SILPrinter;
 
 // 1. Accumulate opcode-specific comments in this stream.
 // 2. Start emitting comments: lineComments.start()
@@ -597,6 +596,10 @@ protected:
     return opcodeCommentString.size();
   }
 };
+
+} // namespace
+
+namespace swift {
 
 /// SILPrinter class - This holds the internal implementation details of
 /// printing SIL structures.
@@ -891,6 +894,7 @@ public:
     llvm::SmallVector<SILValue, 8> values;
     llvm::copy(inst->getResults(), std::back_inserter(values));
     printUserList(values, inst);
+    printBranchTargets(inst);
   }
 
   void printUserList(ArrayRef<SILValue> values, SILNodePointer node) {
@@ -932,6 +936,31 @@ public:
     llvm::interleave(
         UserIDs.begin(), UserIDs.end(), [&](ID id) { *this << id; },
         [&] { *this << ", "; });
+  }
+
+  void printBranchTargets(const SILInstruction *inst) {
+    if (auto condBr = dyn_cast<CondBranchInst>(inst)) {
+      if (condBr->getTrueBB()->getDebugName().hasValue()) {
+        *this << ", true->" << condBr->getTrueBB()->getDebugName().getValue();
+      }
+      if (condBr->getFalseBB()->getDebugName().hasValue()) {
+        *this << ", false->" << condBr->getFalseBB()->getDebugName().getValue();
+      }
+    } else if (auto br = dyn_cast<BranchInst>(inst)) {
+      if (br->getDestBB()->getDebugName().hasValue()) {
+        *this << ", dest->" << br->getDestBB()->getDebugName().getValue();
+      }
+    } else if (auto termInst = dyn_cast<TermInst>(inst)) {
+      // Otherwise, we just print the successors in order without pretty printing
+      for (unsigned i = 0, numSuccessors = termInst->getSuccessors().size();
+           i != numSuccessors; ++i) {
+        auto &successor = termInst->getSuccessors()[i];
+        if (successor.getBB()->getDebugName().hasValue()) {
+          *this << ", #" << i
+                << "->" << successor.getBB()->getDebugName().getValue();
+        }
+      }
+    }
   }
 
   void printConformances(ArrayRef<ProtocolConformanceRef> conformances) {
@@ -1911,6 +1940,24 @@ public:
     *this << getIDAndType(I->getOperand());
   }
 
+  void visitCopyableToMoveOnlyWrapperValueInst(
+      CopyableToMoveOnlyWrapperValueInst *I) {
+    *this << getIDAndType(I->getOperand());
+  }
+
+  void visitMoveOnlyWrapperToCopyableValueInst(
+      MoveOnlyWrapperToCopyableValueInst *I) {
+    switch (I->getInitialKind()) {
+    case MoveOnlyWrapperToCopyableValueInst::Owned:
+      *this << "[owned] ";
+      break;
+    case MoveOnlyWrapperToCopyableValueInst::Guaranteed:
+      *this << "[guaranteed] ";
+      break;
+    }
+    *this << getIDAndType(I->getOperand());
+  }
+
 #define UNCHECKED_REF_STORAGE(Name, ...)                                       \
   void visitStrongCopy##Name##ValueInst(StrongCopy##Name##ValueInst *I) {      \
     *this << getIDAndType(I->getOperand());                                    \
@@ -2740,7 +2787,8 @@ public:
     }
   }
 };
-} // end anonymous namespace
+
+} // namespace swift
 
 static void printBlockID(raw_ostream &OS, SILBasicBlock *bb) {
   SILPrintContext Ctx(OS);

@@ -173,6 +173,16 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
                                          //   value.
   P.addMoveOnlyChecker();                // Check noImplicitCopy isn't copied.
 
+  // Now that we have run move only checking, eliminate SILMoveOnly wrapped
+  // trivial types from the IR. We cannot introduce extra "copies" of trivial
+  // things so we can simplify our implementation by eliminating them here.
+  P.addTrivialMoveOnlyTypeEliminator();
+
+  // As a temporary measure, we also eliminate move only for non-trivial types
+  // until we can audit the later part of the pipeline. Eventually, this should
+  // occur before IRGen.
+  P.addMoveOnlyTypeEliminator();
+
   // This phase performs optimizations necessary for correct interoperation of
   // Swift os log APIs with C os_log ABIs.
   // Pass dependencies: this pass depends on MandatoryInlining and Mandatory
@@ -363,6 +373,10 @@ void addFunctionPasses(SILPassPipelinePlan &P,
   // stack locations. Should run before aggregate lowering since that
   // splits up copy_addr.
   P.addCopyForwarding();
+
+  // This DCE pass is the only DCE on ownership SIL. It can cleanup OSSA related
+  // dead code, e.g. left behind by the ObjCBridgingOptimization.
+  P.addDCE();
 
   // Optimize copies from a temporary (an "l-value") to a destination.
   P.addTempLValueOpt();
@@ -612,6 +626,7 @@ static void addHighLevelFunctionPipeline(SILPassPipelinePlan &P) {
   P.startPipeline("HighLevel,Function+EarlyLoopOpt");
   // FIXME: update EagerSpecializer to be a function pass!
   P.addEagerSpecializer();
+  P.addObjCBridgingOptimization();
 
   addFunctionPasses(P, OptimizationLevelKind::HighLevel);
 
@@ -661,6 +676,7 @@ static void addMidLevelFunctionPipeline(SILPassPipelinePlan &P) {
 static void addClosureSpecializePassPipeline(SILPassPipelinePlan &P) {
   P.startPipeline("ClosureSpecialize");
   P.addDeadFunctionAndGlobalElimination();
+  P.addTargetConstantFolding();
   P.addDeadStoreElimination();
   P.addDeadObjectElimination();
 
@@ -961,6 +977,9 @@ SILPassPipelinePlan::getOnonePassPipeline(const SILOptions &Options) {
   // Finally perform some small transforms.
   P.startPipeline("Rest of Onone");
   P.addUsePrespecialized();
+
+  // Needed to fold MemoryLayout constants in performance-annotated functions.
+  P.addTargetConstantFolding();
 
   // Has only an effect if the -assume-single-thread option is specified.
   if (P.getOptions().AssumeSingleThreaded) {
