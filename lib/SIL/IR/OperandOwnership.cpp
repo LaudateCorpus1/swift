@@ -59,7 +59,7 @@ public:
   SILValue getValue() const { return op.get(); }
 
   ValueOwnershipKind getOwnershipKind() const {
-    return op.get().getOwnershipKind();
+    return op.get()->getOwnershipKind();
   }
 
   unsigned getOperandIndex() const { return op.getOperandNumber(); }
@@ -147,6 +147,7 @@ OPERAND_OWNERSHIP(TrivialUse, CheckedCastAddrBranch)
 OPERAND_OWNERSHIP(TrivialUse, CondBranch)
 OPERAND_OWNERSHIP(TrivialUse, CondFail)
 OPERAND_OWNERSHIP(TrivialUse, CopyAddr)
+OPERAND_OWNERSHIP(TrivialUse, ExplicitCopyAddr)
 OPERAND_OWNERSHIP(TrivialUse, MarkUnresolvedMoveAddr)
 OPERAND_OWNERSHIP(TrivialUse, DeallocStack)
 OPERAND_OWNERSHIP(TrivialUse, DeinitExistentialAddr)
@@ -256,7 +257,6 @@ OPERAND_OWNERSHIP(DestroyingConsume, EndCOWMutation)
 
 // TODO: Should this be a forwarding consume.
 OPERAND_OWNERSHIP(DestroyingConsume, MoveValue)
-OPERAND_OWNERSHIP(DestroyingConsume, CopyableToMoveOnlyWrapperValue)
 
 // Instructions that move an owned value.
 OPERAND_OWNERSHIP(ForwardingConsume, InitExistentialValue)
@@ -330,6 +330,7 @@ FORWARDING_OWNERSHIP(DifferentiableFunction)
 FORWARDING_OWNERSHIP(LinearFunction)
 FORWARDING_OWNERSHIP(MarkMustCheck)
 FORWARDING_OWNERSHIP(MoveOnlyWrapperToCopyableValue)
+FORWARDING_OWNERSHIP(CopyableToMoveOnlyWrapperValue)
 #undef FORWARDING_OWNERSHIP
 
 // Arbitrary value casts are forwarding instructions that are also allowed to
@@ -783,7 +784,6 @@ BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, USubOver)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, UToSCheckedTrunc)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, UToUCheckedTrunc)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, Unreachable)
-BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, UnsafeGuaranteedEnd)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, Xor)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, GenericXor)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, ZExt)
@@ -805,7 +805,6 @@ BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, CreateTaskGroup)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, DestroyTaskGroup)
 
 BUILTIN_OPERAND_OWNERSHIP(ForwardingConsume, COWBufferForReading)
-BUILTIN_OPERAND_OWNERSHIP(ForwardingConsume, UnsafeGuaranteed)
 
 const int PARAMETER_INDEX_CREATE_ASYNC_TASK_FUTURE_FUNCTION = 2;
 const int PARAMETER_INDEX_CREATE_ASYNC_TASK_GROUP_FUTURE_FUNCTION = 3;

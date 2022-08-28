@@ -53,6 +53,11 @@
 using namespace swift;
 using namespace constraints;
 
+bool Solution::hasFixedType(TypeVariableType *typeVar) const {
+  auto knownBinding = typeBindings.find(typeVar);
+  return knownBinding != typeBindings.end();
+}
+
 /// Retrieve the fixed type for the given type variable.
 Type Solution::getFixedType(TypeVariableType *typeVar) const {
   auto knownBinding = typeBindings.find(typeVar);
@@ -587,8 +592,9 @@ namespace {
                                                    ctx);
                     cs.setType(base, MetatypeType::get(baseTy));
 
-                    refExpr = DotSyntaxCallExpr::create(ctx, declRefExpr,
-                                                        SourceLoc(), base);
+                    refExpr =
+                        DotSyntaxCallExpr::create(ctx, declRefExpr, SourceLoc(),
+                                                  Argument::unlabeled(base));
                     auto refType = adjustedFullType->castTo<FunctionType>()->getResult();
                     cs.setType(refExpr, refType);
                   } else {
@@ -999,30 +1005,6 @@ namespace {
       return false;
     }
 
-    /// If the given parameter \p param has non-trivial ownership semantics,
-    /// adjust the type of the given expression \p expr to reflect it. The
-    /// expression is expected to serve as either an argument or reference
-    /// to the parameter.
-    void adjustExprOwnershipForParam(Expr *expr,
-                                     const AnyFunctionType::Param &param) {
-      // If the 'self' parameter has non-trivial ownership, adjust the
-      // argument accordingly.
-      switch (param.getValueOwnership()) {
-      case ValueOwnership::Default:
-      case ValueOwnership::InOut:
-        break;
-
-      case ValueOwnership::Owned:
-      case ValueOwnership::Shared:
-        assert(param.getPlainType()->isEqual(cs.getType(expr)));
-
-        expr->setType(ParenType::get(cs.getASTContext(), param.getPlainType(),
-                                     param.getParameterFlags()));
-        cs.cacheType(expr);
-        break;
-      }
-    }
-
     /// Build the call inside the body of a single curry thunk
     /// "{ args in base.fn(args) }".
     ///
@@ -1048,10 +1030,6 @@ namespace {
         const auto calleeSelfParam = calleeFnTy->getParams().front();
         baseExpr =
             coerceToType(baseExpr, calleeSelfParam.getOldType(), locator);
-
-        // If the 'self' parameter has non-trivial ownership, adjust the
-        // argument type accordingly.
-        adjustExprOwnershipForParam(baseExpr, calleeSelfParam);
 
         // Uncurry the callee type in the presence of a base expression; we
         // want '(args) -> result' vs. '(self) -> (args) -> result'.
@@ -1149,7 +1127,8 @@ namespace {
                                           fnTy->getExtInfo()));
         cs.cacheType(fnExpr);
 
-        fnExpr = DotSyntaxCallExpr::create(ctx, fnExpr, SourceLoc(), baseExpr);
+        fnExpr = DotSyntaxCallExpr::create(ctx, fnExpr, SourceLoc(),
+                                           Argument::unlabeled(baseExpr));
       }
       fnExpr->setType(newCalleeFnTy);
       cs.cacheType(fnExpr);
@@ -1357,11 +1336,6 @@ namespace {
 
         selfOpenedRef = new (ctx) OpaqueValueExpr(SourceLoc(), opaqueValueTy);
         cs.cacheType(selfOpenedRef);
-
-        // If we're opening an existential and the thunk's 'self' parameter has
-        // non-trivial ownership, we must adjust the parameter reference type
-        // here, because the body will use the opaque value instead.
-        adjustExprOwnershipForParam(selfParamRef, selfThunkParam);
       }
 
       Expr *outerThunkBody = nullptr;
@@ -1385,11 +1359,6 @@ namespace {
 
         // Close the existential if warranted.
         if (hasOpenedExistential) {
-          // If the callee's 'self' parameter has non-trivial ownership, adjust
-          // the argument type accordingly.
-          adjustExprOwnershipForParam(selfOpenedRef,
-                                      selfCalleeTy->getParams().front());
-
           outerThunkBody = new (ctx) OpenExistentialExpr(
               selfParamRef, cast<OpaqueValueExpr>(selfOpenedRef),
               outerThunkBody, outerThunkBody->getType());
@@ -1871,7 +1840,7 @@ namespace {
         assert((!baseIsInstance || member->isInstanceMember()) &&
                "can't call a static method on an instance");
         ref = forceUnwrapIfExpected(ref, memberLocator);
-        apply = DotSyntaxCallExpr::create(context, ref, dotLoc, base);
+        apply = DotSyntaxCallExpr::create(context, ref, dotLoc, Argument::unlabeled(base));
         if (Implicit) {
           apply->setImplicit();
         }
@@ -3163,7 +3132,8 @@ namespace {
                                                base, nameLoc, ctorLocator,
                                                implicit);
       auto *call =
-          DotSyntaxCallExpr::create(cs.getASTContext(), ctorRef, dotLoc, base);
+          DotSyntaxCallExpr::create(cs.getASTContext(), ctorRef, dotLoc,
+                                    Argument::unlabeled(base));
 
       return finishApply(call, cs.getType(expr), locator, ctorLocator);
     }
@@ -3466,7 +3436,10 @@ namespace {
       // type.
       auto *subExpr = expr->getSubExpr();
       auto type = simplifyType(cs.getType(expr));
-      subExpr = coerceToType(subExpr, type, cs.getConstraintLocator(subExpr));
+      subExpr = coerceToType(
+          subExpr, type,
+          cs.getConstraintLocator(
+              expr, ConstraintLocator::UnresolvedMemberChainResult));
       cs.setType(subExpr, type);
       return subExpr;
     }
@@ -5221,6 +5194,10 @@ namespace {
       return E;
     }
 
+    Expr *visitTypeJoinExpr(TypeJoinExpr *E) {
+      llvm_unreachable("already type-checked?");
+    }
+
     /// Interface for ExprWalker
     void walkToExprPre(Expr *expr) {
       // If we have an apply, make a note of its callee locator prior to
@@ -5398,7 +5375,7 @@ Expr *ExprRewriter::coerceTupleToTuple(Expr *expr,
 
     converted.push_back(toElt);
     labels.push_back(toLabel);
-    convertedElts.emplace_back(toEltType, toLabel, ParameterTypeFlags());
+    convertedElts.emplace_back(toEltType, toLabel);
   }
 
   // Shuffling tuple elements is an anti-pattern worthy of a diagnostic.  We
@@ -5935,7 +5912,7 @@ ArgumentList *ExprRewriter::coerceCallArguments(
 
     // If the argument is an existential type that has been opened, perform
     // the open operation.
-    if (argType->getInOutObjectType()->isAnyExistentialType() &&
+    if (argType->getWithoutSpecifierType()->isAnyExistentialType() &&
         paramType->hasOpenedExistential()) {
       // FIXME: Look for an opened existential and use it. We need to
       // know how far out we need to go to close the existentials. Huh.
@@ -6815,7 +6792,25 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
     case ConversionRestrictionKind::DoubleToCGFloat: {
       auto conversionKind = knownRestriction->second;
 
-      auto *argExpr = locator.trySimplifyToExpr();
+      auto shouldUseCoercedExpr = [&]() {
+        // If conversion wraps the whole body of a single-expression closure,
+        // let's use the passed-in expression since the closure itself doesn't
+        // get updated until coercion is done.
+        if (locator.endsWith<LocatorPathElt::ClosureBody>())
+          return true;
+
+        // Contextual type locator always uses the original version of
+        // expression (before any coercions have been applied) because
+        // otherwise it wouldn't be possible to find the overload choice.
+        if (locator.endsWith<LocatorPathElt::ContextualType>())
+          return true;
+
+        // In all other cases use the expression associated with locator.
+        return false;
+      };
+
+      auto *argExpr =
+          shouldUseCoercedExpr() ? expr : locator.trySimplifyToExpr();
       assert(argExpr);
 
       // Source requires implicit conversion to match destination
@@ -6881,11 +6876,11 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
   // below is just an approximate check since the above would be expensive to
   // verify and still relies on the type checker ensuing `fromType` is
   // compatible with any opaque archetypes.
-  if (toType->hasOpaqueArchetype() &&
+  if (toType->getCanonicalType()->hasOpaqueArchetype() &&
       cs.getConstraintLocator(locator)->isForContextualType()) {
     // Find the opaque type declaration. We need its generic signature.
     OpaqueTypeDecl *opaqueDecl = nullptr;
-    bool found = toType.findIf([&](Type type) {
+    bool found = toType->getCanonicalType().findIf([&](Type type) {
       if (auto opaqueType = type->getAs<OpaqueTypeArchetypeType>()) {
         opaqueDecl = opaqueType->getDecl();
         return true;
@@ -7744,9 +7739,14 @@ Expr *ExprRewriter::finishApply(ApplyExpr *apply, Type openedType,
     callee = resolveConcreteDeclRef(decl, calleeLoc);
   }
 
+  // Make sure we have a function type that is callable. This helps ensure
+  // Type::mayBeCallable stays up-to-date.
+  auto fnRValueTy = cs.getType(fn)->getRValueType();
+  assert(fnRValueTy->mayBeCallable(dc));
+
   // If this is an implicit call to a `callAsFunction` method, build the
   // appropriate member reference.
-  if (cs.getType(fn)->getRValueType()->isCallableNominalType(dc)) {
+  if (fnRValueTy->isCallAsFunctionType(dc)) {
     fn = buildCallAsFunctionMethodRef(*this, apply, *overload, calleeLoc);
     if (!fn)
       return nullptr;
@@ -8588,7 +8588,7 @@ static Optional<SolutionApplicationTarget> applySolutionToInitialization(
   // Convert the initializer to the type of the pattern.
   auto &cs = solution.getConstraintSystem();
   auto locator = cs.getConstraintLocator(
-      initializer, LocatorPathElt::ContextualType(CTP_Initialization));
+      target.getAsExpr(), LocatorPathElt::ContextualType(CTP_Initialization));
   initializer = solution.coerceToType(initializer, initType, locator);
   if (!initializer)
     return None;
@@ -8604,8 +8604,8 @@ static Optional<SolutionApplicationTarget> applySolutionToInitialization(
         wrappedVar, initType->mapTypeOutOfContext());
 
     // Record the semantic initializer on the outermost property wrapper.
-    wrappedVar->getAttachedPropertyWrappers().front()
-        ->setSemanticInit(initializer);
+    wrappedVar->getOutermostAttachedPropertyWrapper()->setSemanticInit(
+        initializer);
 
     // If this is a wrapped parameter, we're done.
     if (isa<ParamDecl>(wrappedVar))
@@ -9023,7 +9023,7 @@ ExprWalker::rewriteTarget(SolutionApplicationTarget target) {
     return target;
   } else if (auto *wrappedVar = target.getAsUninitializedWrappedVar()) {
     // Get the outermost wrapper type from the solution
-    auto outermostWrapper = wrappedVar->getAttachedPropertyWrappers().front();
+    auto outermostWrapper = wrappedVar->getOutermostAttachedPropertyWrapper();
     auto backingType = solution.simplifyType(
         solution.getType(outermostWrapper->getTypeExpr()));
 
@@ -9033,12 +9033,21 @@ ExprWalker::rewriteTarget(SolutionApplicationTarget target) {
 
     return target;
   } else if (auto *pattern = target.getAsUninitializedVar()) {
+    TypeResolutionOptions options(TypeResolverContext::PatternBindingDecl);
+
     auto contextualPattern = target.getContextualPattern();
     auto patternType = target.getTypeOfUninitializedVar();
+    auto *PB = target.getPatternBindingOfUninitializedVar();
+
+    // If this is a placeholder variable, let's override its type with
+    // inferred one.
+    if (isPlaceholderVar(PB)) {
+      patternType = solution.getResolvedType(PB->getSingleVar());
+      options |= TypeResolutionFlags::OverrideType;
+    }
 
     if (auto coercedPattern = TypeChecker::coercePatternToType(
-            contextualPattern, patternType,
-            TypeResolverContext::PatternBindingDecl)) {
+            contextualPattern, patternType, options)) {
       auto resultTarget = target;
       resultTarget.setPattern(coercedPattern);
       return resultTarget;
@@ -9090,17 +9099,35 @@ ExprWalker::rewriteTarget(SolutionApplicationTarget target) {
     // If we're supposed to convert the expression to some particular type,
     // do so now.
     if (shouldCoerceToContextualType()) {
+      ConstraintLocator *locator = nullptr;
+
+      auto contextualTypePurpose = target.getExprContextualTypePurpose();
+      // Bodies of single-expression closures use a special locator
+      // for contextual type conversion to make sure that result is
+      // convertible to `Void` when `return` is not used explicitly.
+      if (contextualTypePurpose == CTP_ClosureResult) {
+        auto *closure = cast<ClosureExpr>(target.getDeclContext());
+        auto *returnStmt =
+            castToStmt<ReturnStmt>(closure->getBody()->getLastElement());
+
+        locator = cs.getConstraintLocator(
+            closure, LocatorPathElt::ClosureBody(
+                         /*hasReturn=*/!returnStmt->isImplicit()));
+      } else {
+        locator = cs.getConstraintLocator(
+            expr, LocatorPathElt::ContextualType(contextualTypePurpose));
+      }
+
+      assert(locator);
+
       resultExpr = Rewriter.coerceToType(
-          resultExpr, solution.simplifyType(convertType),
-          cs.getConstraintLocator(resultExpr,
-                                  LocatorPathElt::ContextualType(
-                                      target.getExprContextualTypePurpose())));
+          resultExpr, solution.simplifyType(convertType), locator);
     } else if (cs.getType(resultExpr)->hasLValueType() &&
                !target.isDiscardedExpr()) {
       // We referenced an lvalue. Load it.
       resultExpr = Rewriter.coerceToType(
           resultExpr, cs.getType(resultExpr)->getRValueType(),
-          cs.getConstraintLocator(resultExpr,
+          cs.getConstraintLocator(expr,
                                   LocatorPathElt::ContextualType(
                                       target.getExprContextualTypePurpose())));
     }
@@ -9141,9 +9168,9 @@ ExprWalker::rewriteTarget(SolutionApplicationTarget target) {
       
       auto &log = llvm::errs();
       if (isPartial) {
-        log << "---Partially type-checked expression---\n";
+        log << "\n---Partially type-checked expression---\n";
       } else {
-        log << "---Type-checked expression---\n";
+        log << "\n---Type-checked expression---\n";
       }
       resultExpr->dump(log);
       log << "\n";
@@ -9221,7 +9248,7 @@ Optional<SolutionApplicationTarget> ConstraintSystem::applySolution(
     auto node = target.getAsASTNode();
     if (node && needsPostProcessing) {
       auto &log = llvm::errs();
-      log << "---Fully type-checked target---\n";
+      log << "\n---Fully type-checked target---\n";
       node.dump(log);
       log << "\n";
     }

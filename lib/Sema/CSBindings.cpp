@@ -109,6 +109,16 @@ bool BindingSet::isDelayed() const {
     if (locator->directlyAt<NilLiteralExpr>())
       return true;
 
+    // When inferring the type of a variable in a pattern, delay its resolution
+    // so that we resolve type variables inside the expression as placeholders
+    // instead of marking the type of the variable itself as a placeholder. This
+    // allows us to produce more specific errors because the type variable in
+    // the expression that introduced the placeholder might be diagnosable using
+    // fixForHole.
+    if (locator->isLastElement<LocatorPathElt::PatternDecl>()) {
+      return true;
+    }
+
     // It's possible that type of member couldn't be determined,
     // and if so it would be beneficial to bind member to a hole
     // early to propagate that information down to arguments,
@@ -626,8 +636,6 @@ void BindingSet::determineLiteralCoverage() {
   if (Literals.empty())
     return;
 
-  SmallVector<PotentialBinding, 4> adjustedBindings;
-
   bool allowsNil = canBeNil();
 
   for (auto &entry : Literals) {
@@ -638,7 +646,6 @@ void BindingSet::determineLiteralCoverage() {
 
     for (auto binding = Bindings.begin(); binding != Bindings.end();
          ++binding) {
-
       bool isCovered = false;
       Type adjustedTy;
 
@@ -731,11 +738,12 @@ BindingSet::BindingScore BindingSet::formBindingScore(const BindingSet &b) {
   return std::make_tuple(b.isHole(), numNonDefaultableBindings == 0,
                          b.isDelayed(), b.isSubtypeOfExistentialType(),
                          b.involvesTypeVariables(),
-                         static_cast<unsigned char>(b.getLiteralKind()),
+                         static_cast<unsigned char>(b.getLiteralForScore()),
                          -numNonDefaultableBindings);
 }
 
-Optional<BindingSet> ConstraintSystem::determineBestBindings() {
+Optional<BindingSet> ConstraintSystem::determineBestBindings(
+    llvm::function_ref<void(const BindingSet &)> onCandidate) {
   // Look for potential type variable bindings.
   Optional<BindingSet> bestBindings;
   llvm::SmallDenseMap<TypeVariableType *, BindingSet> cache;
@@ -797,9 +805,7 @@ Optional<BindingSet> ConstraintSystem::determineBestBindings() {
     if (!bindings || !isViable)
       continue;
 
-    if (isDebugMode()) {
-      bindings.dump(typeVar, llvm::errs(), solverState->depth * 2);
-    }
+    onCandidate(bindings);
 
     // If these are the first bindings, or they are better than what
     // we saw before, use them instead.
@@ -1567,9 +1573,8 @@ void PotentialBindings::retract(Constraint *constraint) {
   EquivalentTo.remove_if(hasMatchingSource);
 }
 
-LiteralBindingKind BindingSet::getLiteralKind() const {
-  LiteralBindingKind kind = LiteralBindingKind::None;
-
+void BindingSet::forEachLiteralRequirement(
+    llvm::function_ref<void(KnownProtocolKind)> callback) const {
   for (const auto &literal : Literals) {
     auto *protocol = literal.first;
     const auto &info = literal.second;
@@ -1577,8 +1582,17 @@ LiteralBindingKind BindingSet::getLiteralKind() const {
     // Only uncovered defaultable literal protocols participate.
     if (!info.viableAsBinding())
       continue;
+    
+    if (auto protocolKind = protocol->getKnownProtocolKind())
+      callback(*protocolKind);
+  }
+}
 
-    switch (*protocol->getKnownProtocolKind()) {
+LiteralBindingKind BindingSet::getLiteralForScore() const {
+  LiteralBindingKind kind = LiteralBindingKind::None;
+
+  forEachLiteralRequirement([&](KnownProtocolKind protocolKind) {
+    switch (protocolKind) {
     case KnownProtocolKind::ExpressibleByDictionaryLiteral:
     case KnownProtocolKind::ExpressibleByArrayLiteral:
     case KnownProtocolKind::ExpressibleByStringInterpolation:
@@ -1594,8 +1608,7 @@ LiteralBindingKind BindingSet::getLiteralKind() const {
         kind = LiteralBindingKind::Atom;
       break;
     }
-  }
-
+  });
   return kind;
 }
 
@@ -1605,14 +1618,37 @@ unsigned BindingSet::getNumViableLiteralBindings() const {
   });
 }
 
-void BindingSet::dump(TypeVariableType *typeVar, llvm::raw_ostream &out,
-                      unsigned indent) const {
-  out.indent(indent);
-  out << "(";
-  if (typeVar)
-    out << "$T" << typeVar->getImpl().getID();
-  dump(out, 1);
-  out << ")\n";
+/// Return string for atomic literal kinds (integer, string, & boolean) for
+/// printing in debug output.
+static std::string getAtomLiteralAsString(ExprKind EK) {
+#define ENTRY(Kind, String)                                                    \
+  case ExprKind::Kind:                                                         \
+    return String
+  switch (EK) {
+    ENTRY(IntegerLiteral, "integer");
+    ENTRY(StringLiteral, "string");
+    ENTRY(BooleanLiteral, "boolean");
+    ENTRY(NilLiteral, "nil");
+  default:
+    return "";
+  }
+#undef ENTRY
+}
+
+/// Return string for collection literal kinds (interpolated string, array,
+/// dictionary) for printing in debug output.
+static std::string getCollectionLiteralAsString(KnownProtocolKind KPK) {
+#define ENTRY(Kind, String)                                                    \
+  case KnownProtocolKind::Kind:                                                \
+    return String
+  switch (KPK) {
+    ENTRY(ExpressibleByDictionaryLiteral, "dictionary");
+    ENTRY(ExpressibleByArrayLiteral, "array");
+    ENTRY(ExpressibleByStringInterpolation, "interpolated string");
+  default:
+    return "";
+  }
+#undef ENTRY
 }
 
 void BindingSet::dump(llvm::raw_ostream &out, unsigned indent) const {
@@ -1620,6 +1656,10 @@ void BindingSet::dump(llvm::raw_ostream &out, unsigned indent) const {
   PO.PrintTypesForDebugging = true;
 
   out.indent(indent);
+  out << "(";
+  if (auto typeVar = getTypeVariable())
+    out << "$T" << typeVar->getImpl().getID() << " ";
+  
   std::vector<std::string> attributes;
   if (isDirectHole())
     attributes.push_back("hole");
@@ -1629,17 +1669,49 @@ void BindingSet::dump(llvm::raw_ostream &out, unsigned indent) const {
     attributes.push_back("delayed");
   if (isSubtypeOfExistentialType())
     attributes.push_back("subtype_of_existential");
-  auto literalKind = getLiteralKind();
-  if (literalKind != LiteralBindingKind::None) {
-    auto literalAttrStr = ("[literal: " + getLiteralBindingKind(literalKind)
-                        + "]").str();
-    attributes.push_back(literalAttrStr);
-  }
   if (!attributes.empty()) {
     out << "[attributes: ";
     interleave(attributes, out, ", ");
-    out << "] ";
   }
+  
+  auto literalKind = getLiteralForScore();
+  if (literalKind != LiteralBindingKind::None) {
+    if (!attributes.empty()) {
+      out << ", ";
+    } else {
+      out << "[attributes: ";
+    }
+    out << "[literal: ";
+    switch (literalKind) {
+    case LiteralBindingKind::Atom: {
+      if (auto atomKind = TypeVar->getImpl().getAtomicLiteralKind()) {
+        out << getAtomLiteralAsString(*atomKind);
+      }
+      break;
+    }
+    case LiteralBindingKind::Collection: {
+      std::vector<std::string> collectionLiterals;
+      forEachLiteralRequirement([&](KnownProtocolKind protocolKind) {
+        collectionLiterals.push_back(
+            getCollectionLiteralAsString(protocolKind));
+      });
+      interleave(collectionLiterals, out, ", ");
+      break;
+    }
+    case LiteralBindingKind::Float:
+    case LiteralBindingKind::None:
+      out << getLiteralBindingKind(literalKind).str();
+      break;
+    }
+    if (attributes.empty()) {
+      out << "]] ";
+    } else {
+      out << "]";
+    }
+  }
+  if (!attributes.empty())
+    out << "] ";
+
   if (involvesTypeVariables()) {
     out << "[involves_type_vars: ";
     interleave(AdjacentVars,
@@ -1673,8 +1745,20 @@ void BindingSet::dump(llvm::raw_ostream &out, unsigned indent) const {
 
   out << "[with possible bindings: ";
   interleave(Bindings, printBinding, [&]() { out << "; "; });
-  if (Bindings.empty())
+  if (!Literals.empty()) {
+    std::vector<std::string> defaultLiterals;
+    for (const auto &literal : Literals) {
+      if (literal.second.viableAsBinding()) {
+        auto defaultWithType = "(default type of literal) " +
+                               literal.second.getDefaultType().getString(PO);
+        defaultLiterals.push_back(defaultWithType);
+      }
+    }
+    interleave(defaultLiterals, out, ", ");
+  }
+  if (Bindings.empty() && Literals.empty()) {
     out << "<empty>";
+  }
   out << "]";
 
   if (!Defaults.empty()) {
@@ -1687,6 +1771,7 @@ void BindingSet::dump(llvm::raw_ostream &out, unsigned indent) const {
     }
     out << "] ";
   }
+  out << ")\n";
 }
 
 // Given a possibly-Optional type, return the direct superclass of the
@@ -1977,6 +2062,20 @@ TypeVariableBinding::fixForHole(ConstraintSystem &cs) const {
     // no contextual information to resolve type of `nil`.
     ConstraintFix *fix = SpecifyContextualTypeForNil::create(cs, dstLocator);
     return std::make_pair(fix, /*impact=*/(unsigned)10);
+  }
+
+  if (auto pattern = getAsPattern(dstLocator->getAnchor())) {
+    if (dstLocator->getPath().size() == 1 &&
+        dstLocator->isLastElement<LocatorPathElt::PatternDecl>()) {
+      // Not being able to infer the type of a variable in a pattern binding
+      // decl is more dramatic than anything that could happen inside the
+      // expression because we want to preferrably point the diagnostic to a
+      // part of the expression that caused us to be unable to infer the
+      // variable's type.
+      ConstraintFix *fix =
+          IgnoreUnresolvedPatternVar::create(cs, pattern, dstLocator);
+      return std::make_pair(fix, /*impact=*/(unsigned)100);
+    }
   }
 
   return None;

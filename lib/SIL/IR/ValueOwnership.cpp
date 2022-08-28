@@ -75,7 +75,6 @@ CONSTANT_OWNERSHIP_INST(Owned, CopyBlockWithoutEscaping)
 CONSTANT_OWNERSHIP_INST(Owned, CopyValue)
 CONSTANT_OWNERSHIP_INST(Owned, ExplicitCopyValue)
 CONSTANT_OWNERSHIP_INST(Owned, MoveValue)
-CONSTANT_OWNERSHIP_INST(Owned, CopyableToMoveOnlyWrapperValue)
 CONSTANT_OWNERSHIP_INST(Owned, EndCOWMutation)
 CONSTANT_OWNERSHIP_INST(Owned, KeyPath)
 CONSTANT_OWNERSHIP_INST(Owned, InitExistentialValue)
@@ -225,7 +224,7 @@ ValueOwnershipKindClassifier::visitForwardingInst(SILInstruction *i,
       ops, [&i](const Operand &op) -> Optional<ValueOwnershipKind> {
         if (i->isTypeDependentOperand(op))
           return None;
-        return op.get().getOwnershipKind();
+        return op.get()->getOwnershipKind();
       }));
 
   if (!mergedValue) {
@@ -277,6 +276,7 @@ FORWARDING_OWNERSHIP_INST(DifferentiableFunction)
 FORWARDING_OWNERSHIP_INST(LinearFunction)
 FORWARDING_OWNERSHIP_INST(MarkMustCheck)
 FORWARDING_OWNERSHIP_INST(MoveOnlyWrapperToCopyableValue)
+FORWARDING_OWNERSHIP_INST(CopyableToMoveOnlyWrapperValue)
 #undef FORWARDING_OWNERSHIP_INST
 
 ValueOwnershipKind
@@ -386,7 +386,6 @@ struct ValueOwnershipKindBuiltinVisitor
 // This returns a value at +1 that is destroyed strictly /after/ the
 // UnsafeGuaranteedEnd. This provides the guarantee that we want.
 CONSTANT_OWNERSHIP_BUILTIN(Owned, COWBufferForReading)
-CONSTANT_OWNERSHIP_BUILTIN(Owned, UnsafeGuaranteed)
 CONSTANT_OWNERSHIP_BUILTIN(None, AShr)
 CONSTANT_OWNERSHIP_BUILTIN(None, GenericAShr)
 CONSTANT_OWNERSHIP_BUILTIN(None, Add)
@@ -507,7 +506,6 @@ CONSTANT_OWNERSHIP_BUILTIN(None, Unreachable)
 CONSTANT_OWNERSHIP_BUILTIN(None, AtomicRMW)
 
 CONSTANT_OWNERSHIP_BUILTIN(None, CondUnreachable)
-CONSTANT_OWNERSHIP_BUILTIN(None, UnsafeGuaranteedEnd)
 CONSTANT_OWNERSHIP_BUILTIN(None, GetObjCTypeEncoding)
 CONSTANT_OWNERSHIP_BUILTIN(None, CanBeObjCClass)
 CONSTANT_OWNERSHIP_BUILTIN(None, WillThrow)

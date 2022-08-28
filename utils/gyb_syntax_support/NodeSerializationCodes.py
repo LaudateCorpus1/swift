@@ -1,4 +1,4 @@
-from .Node import error
+from .Utils import error
 
 
 SYNTAX_NODE_SERIALIZATION_CODES = {
@@ -98,7 +98,7 @@ SYNTAX_NODE_SERIALIZATION_CODES = {
     'CodeBlock': 93,
     'DeclNameArgument': 94,
     'DeclNameArguments': 95,
-    # removed: 'FunctionCallArgument': 96,
+    'ActorDecl': 96,
     'TupleExprElement': 97,
     'ArrayElement': 98,
     'DictionaryElement': 99,
@@ -166,7 +166,7 @@ SYNTAX_NODE_SERIALIZATION_CODES = {
     'AvailabilityVersionRestriction': 161,
     'VersionTuple': 162,
     'CodeBlockItemList': 163,
-    # removed: 'FunctionCallArgumentList': 164,
+    'LayoutRequirement': 164,
     'TupleExprElementList': 165,
     'ArrayElementList': 166,
     'DictionaryElementList': 167,
@@ -240,7 +240,7 @@ SYNTAX_NODE_SERIALIZATION_CODES = {
     'DifferentiabilityParams': 235,
     'DifferentiabilityParamList': 236,
     'DifferentiabilityParam': 237,
-    # removed: 'DifferentiableAttributeFuncSpecifier': 238,
+    'DeclModifierDetail': 238,
     'FunctionDeclName': 239,
     'PoundFilePathExpr': 240,
     'DerivativeRegistrationAttributeArguments': 241,
@@ -261,6 +261,19 @@ SYNTAX_NODE_SERIALIZATION_CODES = {
     'BackDeployAttributeSpecList' : 257,
     'BackDeployVersionList' : 258,
     'BackDeployVersionArgument' : 259,
+    'Missing': 260,
+    'MissingDecl': 261,
+    'MissingExpr': 262,
+    'MissingStmt': 263,
+    'MissingType': 264,
+    'MissingPattern': 265,
+    'UnexpectedNodes' : 266,
+    'LabeledStmt': 267,
+    'InfixOperatorExpr': 268,
+    'MoveExpr': 269,
+    'UnresolvedTernaryExpr': 270,
+    'UnresolvedIsExpr': 271,
+    'UnresolvedAsExpr': 272,
 }
 
 

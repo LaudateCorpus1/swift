@@ -1130,13 +1130,6 @@ public:
           Out << elt->getType() << "\n";
           abort();
         }
-        if (!field.getParameterFlags().isNone()) {
-          Out << "TupleExpr has non-empty parameter flags?\n";
-          Out << "sub expr: \n";
-          elt->dump(Out);
-          Out << "\n";
-          abort();
-        }
       });
       verifyCheckedBase(E);
     }
@@ -1982,10 +1975,6 @@ public:
         Out << "ParenExpr not of ParenType\n";
         abort();
       }
-      if (!ty->getParameterFlags().isNone()) {
-        Out << "ParenExpr has non-empty parameter flags?\n";
-        abort();
-      }
       verifyCheckedBase(E);
     }
 
@@ -2349,11 +2338,11 @@ public:
       verifyCheckedBase(VD);
     }
 
-    bool shouldWalkIntoLazyInitializers() override {
+    LazyInitializerWalking getLazyInitializerWalkingBehavior() override {
       // We don't want to walk into lazy initializers because they should
       // have been reparented to their synthesized getter, which will
       // invalidate various invariants.
-      return false;
+      return LazyInitializerWalking::None;
     }
 
     void verifyChecked(PatternBindingDecl *binding) {
@@ -2716,21 +2705,6 @@ public:
             abort();
           }
 
-          // Check the witness substitutions.
-          const auto &witness = normal->getWitnessUncached(req);
-
-          if (auto *genericEnv = witness.getSyntheticEnvironment())
-            Generics.push_back(genericEnv->getGenericSignature());
-
-          verifyChecked(witness.getRequirementToSyntheticSubs());
-          verifyChecked(witness.getSubstitutions());
-
-          if (auto *genericEnv = witness.getSyntheticEnvironment()) {
-            assert(Generics.back().get<GenericSignature>().getPointer()
-                   == genericEnv->getGenericSignature().getPointer());
-            Generics.pop_back();
-          }
-
           continue;
         }
       }
@@ -2868,6 +2842,11 @@ public:
         verifyConformance(ext, conformance);
       }
 
+      // Make sure extension binding succeeded.
+      if (!ext->hasBeenBound()) {
+        Out << "ExtensionDecl was not bound\n";
+        abort();
+      }
       verifyCheckedBase(ext);
     }
 

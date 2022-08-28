@@ -340,6 +340,10 @@ def remark_loading_module : Flag<["-"], "Rmodule-loading">,
   Flags<[FrontendOption, DoesNotAffectIncrementalBuild]>,
   HelpText<"Emit a remark and file path of each loaded module">;
 
+def remark_skip_explicit_interface_build : Flag<["-"], "Rskip-explicit-interface-build">,
+  Flags<[FrontendOption, DoesNotAffectIncrementalBuild]>,
+  HelpText<"Emit a remark if an explicit module interface invocation has an early exit because the expected output is up-to-date">;
+
 def emit_tbd : Flag<["-"], "emit-tbd">,
   HelpText<"Emit a TBD file">,
   Flags<[FrontendOption, NoInteractiveOption, SupplementaryOutput]>;
@@ -524,6 +528,14 @@ def emit_parseable_module_interface_path :
   Flags<[FrontendOption, NoInteractiveOption, HelpHidden, ArgumentIsPath,
          SupplementaryOutput]>;
 
+def emit_const_values :
+  Flag<["-"], "emit-const-values">,
+  Flags<[NoInteractiveOption, SupplementaryOutput]>;
+def emit_const_values_path : Separate<["-"], "emit-const-values-path">,
+  Flags<[FrontendOption, NoInteractiveOption, ArgumentIsPath,
+         SupplementaryOutput]>,
+  MetaVarName<"<path>">, HelpText<"Emit the extracted compile-time known values to <path>">;
+
 def emit_objc_header : Flag<["-"], "emit-objc-header">,
   Flags<[FrontendOption, NoInteractiveOption, SupplementaryOutput]>,
   HelpText<"Emit an Objective-C header file">;
@@ -604,8 +616,14 @@ def enable_experimental_concise_pound_file : Flag<["-"],
   Flags<[FrontendOption, ModuleInterfaceOption]>,
   HelpText<"Enable experimental concise '#file' identifier">;
 
+def enable_experimental_cxx_interop :
+  Flag<["-"], "enable-experimental-cxx-interop">,
+  Flags<[FrontendOption, HelpHidden]>,
+  HelpText<"Enable experimental C++ interop code generation and config directives">;
+
 def experimental_cxx_stdlib :
   Separate<["-"], "experimental-cxx-stdlib">,
+  Flags<[HelpHidden]>,
   HelpText<"C++ standard library to use; forwarded to Clang's -stdlib flag">;
 
 def experimental_emit_module_separately:
@@ -695,6 +713,11 @@ def enable_experimental_feature :
   Separate<["-"], "enable-experimental-feature">,
   Flags<[FrontendOption]>,
   HelpText<"Enable an experimental feature">;
+
+def enable_upcoming_feature : Separate<["-"], "enable-upcoming-feature">,
+  Flags<[FrontendOption]>,
+  HelpText<"Enable a feature that will be introduced in an upcoming language "
+           "version">;
 
 def Rpass_EQ : Joined<["-"], "Rpass=">,
   Flags<[FrontendOption]>,

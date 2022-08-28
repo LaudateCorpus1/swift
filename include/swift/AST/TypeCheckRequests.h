@@ -18,6 +18,7 @@
 
 #include "swift/AST/ActorIsolation.h"
 #include "swift/AST/AnyFunctionRef.h"
+#include "swift/AST/ConstTypeInfo.h"
 #include "swift/AST/ASTNode.h"
 #include "swift/AST/ASTTypeIDs.h"
 #include "swift/AST/Effects.h"
@@ -395,6 +396,26 @@ public:
   void cacheResult(bool value) const;
 };
 
+/// Determine whether the given declaration is 'moveOnly'.
+class IsMoveOnlyRequest
+    : public SimpleRequest<IsMoveOnlyRequest, bool(ValueDecl *),
+                           RequestFlags::SeparatelyCached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  bool evaluate(Evaluator &evaluator, ValueDecl *decl) const;
+
+public:
+  // Separate caching.
+  bool isCached() const { return true; }
+  Optional<bool> getCachedResult() const;
+  void cacheResult(bool value) const;
+};
+
 /// Determine whether the given declaration is 'dynamic''.
 class IsDynamicRequest :
     public SimpleRequest<IsDynamicRequest,
@@ -686,6 +707,26 @@ private:
 
   // Evaluation.
   PropertyWrapperTypeInfo
+  evaluate(Evaluator &eval, NominalTypeDecl *nominal) const;
+
+public:
+  // Caching
+  bool isCached() const { return true; }
+};
+
+/// Retrieve information about compile-time-known
+class ConstantValueInfoRequest
+  : public SimpleRequest<ConstantValueInfoRequest,
+                         ConstValueTypeInfo(NominalTypeDecl *),
+                         RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  ConstValueTypeInfo
   evaluate(Evaluator &eval, NominalTypeDecl *nominal) const;
 
 public:
@@ -2772,25 +2813,6 @@ public:
   void cacheResult(Expr *expr) const;
 };
 
-/// Computes whether this is a type that supports being called through the
-/// implementation of a \c callAsFunction method.
-class IsCallableNominalTypeRequest
-    : public SimpleRequest<IsCallableNominalTypeRequest,
-                           bool(CanType, DeclContext *), RequestFlags::Cached> {
-public:
-  using SimpleRequest::SimpleRequest;
-
-private:
-  friend SimpleRequest;
-
-  // Evaluation.
-  bool evaluate(Evaluator &evaluator, CanType ty, DeclContext *dc) const;
-
-public:
-  // Cached.
-  bool isCached() const { return true; }
-};
-
 class DynamicallyReplacedDeclRequest
     : public SimpleRequest<DynamicallyReplacedDeclRequest,
                            ValueDecl *(ValueDecl *), RequestFlags::Cached> {
@@ -2870,52 +2892,6 @@ public:
   // Incremental dependencies.
   evaluator::DependencySource
   readDependencySource(const evaluator::DependencyRecorder &) const;
-};
-
-/// Computes whether the specified type or a super-class/super-protocol has the
-/// @dynamicMemberLookup attribute on it.
-class HasDynamicMemberLookupAttributeRequest
-    : public SimpleRequest<HasDynamicMemberLookupAttributeRequest,
-                           bool(CanType), RequestFlags::Cached> {
-public:
-  using SimpleRequest::SimpleRequest;
-
-private:
-  friend SimpleRequest;
-
-  // Evaluation.
-  bool evaluate(Evaluator &evaluator, CanType ty) const;
-
-public:
-  bool isCached() const {
-    // Don't cache types containing type variables, as they must not outlive
-    // the constraint system that created them.
-    auto ty = std::get<0>(getStorage());
-    return !ty->hasTypeVariable();
-  }
-};
-
-/// Computes whether the specified type or a super-class/super-protocol has the
-/// @dynamicCallable attribute on it.
-class HasDynamicCallableAttributeRequest
-    : public SimpleRequest<HasDynamicCallableAttributeRequest,
-                           bool(CanType), RequestFlags::Cached> {
-public:
-  using SimpleRequest::SimpleRequest;
-
-private:
-  friend SimpleRequest;
-
-  // Evaluation.
-  bool evaluate(Evaluator &evaluator, CanType ty) const;
-
-public:
-  bool isCached() const {
-    // Don't cache types containing type variables, as they must not outlive
-    // the constraint system that created them.
-    auto ty = std::get<0>(getStorage());
-    return !ty->hasTypeVariable();
-  }
 };
 
 /// Determines the type of a given pattern.
@@ -3226,21 +3202,24 @@ public:
   bool isCached() const { return true; }
 };
 
-/// Checks whether a file performs an implementation-only import.
-class HasImplementationOnlyImportsRequest
-    : public SimpleRequest<HasImplementationOnlyImportsRequest,
-                           bool(SourceFile *), RequestFlags::Cached> {
+/// Checks whether a file contains any import declarations with the given flag.
+class HasImportsMatchingFlagRequest
+    : public SimpleRequest<HasImportsMatchingFlagRequest,
+                           bool(SourceFile *, ImportFlags),
+                           RequestFlags::SeparatelyCached> {
 public:
   using SimpleRequest::SimpleRequest;
 
 private:
   friend SimpleRequest;
 
-  bool evaluate(Evaluator &evaluator, SourceFile *SF) const;
+  bool evaluate(Evaluator &evaluator, SourceFile *SF, ImportFlags flag) const;
 
 public:
   // Cached.
   bool isCached() const { return true; }
+  Optional<bool> getCachedResult() const;
+  void cacheResult(bool value) const;
 };
 
 /// Get the library level of a module.
@@ -3284,7 +3263,7 @@ private:
 void simple_display(llvm::raw_ostream &out, const TypeResolution *resolution);
 SourceLoc extractNearestSourceLoc(const TypeRepr *repr);
 
-/// Checks to see if any of the imports in a module use `@_implementationOnly`
+/// Checks to see if any of the imports in a module use \c @_implementationOnly
 /// in one file and not in another.
 ///
 /// Like redeclaration checking, but for imports.
@@ -3292,9 +3271,35 @@ SourceLoc extractNearestSourceLoc(const TypeRepr *repr);
 /// This is a request purely to ensure that we don't need to perform the same
 /// checking for each file we resolve imports for.
 /// FIXME: Once import resolution operates at module-level, this checking can
-/// integrated into it.
+/// be integrated into it.
 class CheckInconsistentImplementationOnlyImportsRequest
     : public SimpleRequest<CheckInconsistentImplementationOnlyImportsRequest,
+                           evaluator::SideEffect(ModuleDecl *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  evaluator::SideEffect evaluate(Evaluator &evaluator, ModuleDecl *mod) const;
+
+public:
+  // Cached.
+  bool isCached() const { return true; }
+};
+
+/// Checks to see if any of the imports in a module use \c @_weakLinked
+/// in one file and not in another.
+///
+/// Like redeclaration checking, but for imports.
+///
+/// This is a request purely to ensure that we don't need to perform the same
+/// checking for each file we resolve imports for.
+/// FIXME: Once import resolution operates at module-level, this checking can
+/// be integrated into it.
+class CheckInconsistentWeakLinkedImportsRequest
+    : public SimpleRequest<CheckInconsistentWeakLinkedImportsRequest,
                            evaluator::SideEffect(ModuleDecl *),
                            RequestFlags::Cached> {
 public:

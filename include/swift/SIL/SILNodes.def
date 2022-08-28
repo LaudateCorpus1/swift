@@ -341,9 +341,9 @@ ABSTRACT_VALUE_AND_INST(SingleValueInstruction, ValueBase, SILInstruction)
   ABSTRACT_SINGLE_VALUE_INST(LiteralInst, SingleValueInstruction)
     BRIDGED_SINGLE_VALUE_INST(FunctionRefInst, function_ref,
                       LiteralInst, None, DoesNotRelease)
-    SINGLE_VALUE_INST(DynamicFunctionRefInst, dynamic_function_ref,
+    BRIDGED_SINGLE_VALUE_INST(DynamicFunctionRefInst, dynamic_function_ref,
                       LiteralInst, None, DoesNotRelease)
-    SINGLE_VALUE_INST(PreviousDynamicFunctionRefInst, prev_dynamic_function_ref,
+    BRIDGED_SINGLE_VALUE_INST(PreviousDynamicFunctionRefInst, prev_dynamic_function_ref,
                       LiteralInst, None, DoesNotRelease)
     BRIDGED_SINGLE_VALUE_INST(GlobalAddrInst, global_addr,
                       LiteralInst, None, DoesNotRelease)
@@ -474,7 +474,9 @@ ABSTRACT_VALUE_AND_INST(SingleValueInstruction, ValueBase, SILInstruction)
   SINGLE_VALUE_INST(MarkMustCheckInst, mark_must_check,
                     SingleValueInstruction, None, DoesNotRelease)
   // Convert a $T to $@moveOnly T. This is the method that one uses to convert a
-  // trivial value to a non-trivial move only value.
+  // trivial value to a non-trivial move only value. Ownership is fixed at construction by
+  // frontend to express specific semantics: guaranteed for guaranteed function arguments
+  // and owned for assignment/owned function arguments.
   SINGLE_VALUE_INST(CopyableToMoveOnlyWrapperValueInst, copyable_to_moveonlywrapper,
                     SingleValueInstruction, None, DoesNotRelease)
   // Convert a $@moveOnly T to $T. Ownership is fixed at construction by
@@ -642,7 +644,7 @@ ABSTRACT_VALUE_AND_INST(SingleValueInstruction, ValueBase, SILInstruction)
   // Key paths
   // TODO: The only "side effect" is potentially retaining the returned key path
   // object; is there a more specific effect?
-  SINGLE_VALUE_INST(KeyPathInst, keypath,
+  BRIDGED_SINGLE_VALUE_INST(KeyPathInst, keypath,
                     SingleValueInstruction, MayHaveSideEffects, DoesNotRelease)
 
   // BindMemory and RebindMemory have no physical side effect. Semantically they
@@ -778,6 +780,8 @@ BRIDGED_NON_VALUE_INST(DebugValueInst, debug_value,
                  SILInstruction, MayWrite, DoesNotRelease)
 #include "swift/AST/ReferenceStorage.def"
 BRIDGED_NON_VALUE_INST(CopyAddrInst, copy_addr,
+               SILInstruction, MayHaveSideEffects, MayRelease)
+BRIDGED_NON_VALUE_INST(ExplicitCopyAddrInst, explicit_copy_addr,
                SILInstruction, MayHaveSideEffects, MayRelease)
 BRIDGED_NON_VALUE_INST(DestroyAddrInst, destroy_addr,
                SILInstruction, MayHaveSideEffects, MayRelease)

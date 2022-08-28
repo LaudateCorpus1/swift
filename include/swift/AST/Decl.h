@@ -29,13 +29,13 @@
 #include "swift/AST/GenericParamKey.h"
 #include "swift/AST/IfConfigClause.h"
 #include "swift/AST/LayoutConstraint.h"
+#include "swift/AST/LifetimeAnnotation.h"
 #include "swift/AST/ReferenceCounting.h"
 #include "swift/AST/RequirementSignature.h"
 #include "swift/AST/StorageImpl.h"
 #include "swift/AST/TypeAlignments.h"
 #include "swift/AST/TypeWalker.h"
 #include "swift/AST/Types.h"
-#include "swift/AST/Witness.h"
 #include "swift/Basic/ArrayRefView.h"
 #include "swift/Basic/Compiler.h"
 #include "swift/Basic/Debug.h"
@@ -105,6 +105,7 @@ namespace swift {
   class ValueDecl;
   class VarDecl;
   class OpaqueReturnTypeRepr;
+  class Witness;
 
   namespace ast_scope {
   class AbstractPatternEntryScope;
@@ -1416,10 +1417,6 @@ public:
 
   bool hasValidParent() const;
 
-  /// Determine whether this extension has already been bound to a nominal
-  /// type declaration.
-  bool alreadyBoundToNominal() const { return NextExtension.getInt(); }
-
   /// Retrieve the extended type definition as written in the source, if it exists.
   ///
   /// Repr would not be available if the extension was been loaded
@@ -2262,12 +2259,19 @@ class ValueDecl : public Decl {
     /// Whether this declaration produces an implicitly unwrapped
     /// optional result.
     unsigned isIUO : 1;
+
+    /// Whether the "isMoveOnly" bit has been computed yet.
+    unsigned isMoveOnlyComputed : 1;
+
+    /// Whether this declaration can not be copied and thus is move only.
+    unsigned isMoveOnly : 1;
   } LazySemanticInfo = { };
 
   friend class DynamicallyReplacedDeclRequest;
   friend class OverriddenDeclsRequest;
   friend class IsObjCRequest;
   friend class IsFinalRequest;
+  friend class IsMoveOnlyRequest;
   friend class IsDynamicRequest;
   friend class IsImplicitlyUnwrappedOptionalRequest;
   friend class InterfaceTypeRequest;
@@ -2542,6 +2546,9 @@ public:
   /// Is this declaration 'final'?
   bool isFinal() const;
 
+  /// Is this declaration 'moveOnly'?
+  bool isMoveOnly() const;
+
   /// Is this declaration marked with 'dynamic'?
   bool isDynamic() const;
 
@@ -2707,6 +2714,15 @@ public:
   /// 'func foo(Int) -> () -> Self?'.
   GenericParameterReferenceInfo findExistentialSelfReferences(
       Type baseTy, bool treatNonResultCovariantSelfAsInvariant) const;
+
+  LifetimeAnnotation getLifetimeAnnotation() const {
+    auto &attrs = getAttrs();
+    if (attrs.hasAttribute<EagerMoveAttr>())
+      return LifetimeAnnotation::EagerMove;
+    if (attrs.hasAttribute<LexicalAttr>())
+      return LifetimeAnnotation::Lexical;
+    return LifetimeAnnotation::None;
+  }
 };
 
 /// This is a common base class for declarations which declare a type.
@@ -2952,9 +2968,12 @@ public:
     return false;
   }
 
+  using AvailabilityCondition = std::pair<VersionRange, bool>;
+
   class ConditionallyAvailableSubstitutions final
-      : private llvm::TrailingObjects<ConditionallyAvailableSubstitutions,
-                                      VersionRange> {
+      : private llvm::TrailingObjects<
+            ConditionallyAvailableSubstitutions,
+            AvailabilityCondition> {
     friend TrailingObjects;
 
     unsigned NumAvailabilityConditions;
@@ -2964,25 +2983,25 @@ public:
     /// A type with limited availability described by the provided set
     /// of availability conditions (with `and` relationship).
     ConditionallyAvailableSubstitutions(
-        ArrayRef<VersionRange> availabilityContext,
+        ArrayRef<AvailabilityCondition> availabilityContext,
         SubstitutionMap substitutions)
         : NumAvailabilityConditions(availabilityContext.size()),
           Substitutions(substitutions) {
       assert(!availabilityContext.empty());
       std::uninitialized_copy(availabilityContext.begin(),
                               availabilityContext.end(),
-                              getTrailingObjects<VersionRange>());
+                              getTrailingObjects<AvailabilityCondition>());
     }
 
   public:
-    ArrayRef<VersionRange> getAvailability() const {
-      return {getTrailingObjects<VersionRange>(), NumAvailabilityConditions};
+    ArrayRef<AvailabilityCondition> getAvailability() const {
+      return {getTrailingObjects<AvailabilityCondition>(), NumAvailabilityConditions};
     }
 
     SubstitutionMap getSubstitutions() const { return Substitutions; }
 
     static ConditionallyAvailableSubstitutions *
-    get(ASTContext &ctx, ArrayRef<VersionRange> availabilityContext,
+    get(ASTContext &ctx, ArrayRef<AvailabilityCondition> availabilityContext,
         SubstitutionMap substitutions);
   };
 };
@@ -4228,15 +4247,7 @@ public:
 
   /// Whether the class uses the ObjC object model (reference counting,
   /// allocation, etc.), the Swift model, or has no reference counting at all.
-  ReferenceCounting getObjectModel() const {
-    if (isForeignReferenceType())
-      return ReferenceCounting::None;
-
-    if (checkAncestry(AncestryFlags::ObjCObjectModel))
-      return ReferenceCounting::ObjC;
-
-    return ReferenceCounting::Native;
-  }
+  ReferenceCounting getObjectModel() const;
 
   LayoutConstraintKind getLayoutConstraintKind() const {
     if (getObjectModel() == ReferenceCounting::ObjC)
@@ -4350,6 +4361,8 @@ public:
   /// non-reference-counted swift reference type that was imported from a C++
   /// record.
   bool isForeignReferenceType() const;
+
+  bool hasRefCountingAnnotations() const;
 };
 
 /// The set of known protocols for which derived conformances are supported.
@@ -5440,6 +5453,20 @@ public:
   /// is provided first.
   llvm::TinyPtrVector<CustomAttr *> getAttachedPropertyWrappers() const;
 
+  /// Retrieve the outermost property wrapper attribute associated with
+  /// this declaration. For example:
+  ///
+  /// \code
+  /// @A @B @C var <name>: Bool = ...
+  /// \endcode
+  ///
+  /// The outermost attribute in this case is `@A` and it has
+  /// complete wrapper type `A<B<C<Bool>>>`.
+  CustomAttr *getOutermostAttachedPropertyWrapper() const {
+    auto wrappers = getAttachedPropertyWrappers();
+    return wrappers.empty() ? nullptr : wrappers.front();
+  }
+
   /// Whether this property has any attached property wrappers.
   bool hasAttachedPropertyWrapper() const;
 
@@ -6277,11 +6304,9 @@ private:
   DerivativeFunctionConfigurationList *DerivativeFunctionConfigs = nullptr;
 
 public:
-  /// Get all derivative function configurations. If `lookInNonPrimarySources`
-  /// is true then lookup is done in non-primary sources as well. Note that
-  /// such lookup might end in cycles if done during sema stages.
+  /// Get all derivative function configurations.
   ArrayRef<AutoDiffConfig>
-  getDerivativeFunctionConfigurations(bool lookInNonPrimarySources = true);
+  getDerivativeFunctionConfigurations();
 
   /// Add the given derivative function configuration.
   void addDerivativeFunctionConfiguration(const AutoDiffConfig &config);

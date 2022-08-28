@@ -11,7 +11,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "ClangSyntaxPrinter.h"
+#include "swift/ABI/MetadataValues.h"
+#include "swift/AST/Decl.h"
 #include "swift/AST/Module.h"
+#include "swift/AST/SwiftNameTranslation.h"
 
 using namespace swift;
 using namespace cxx_synthesis;
@@ -50,7 +53,7 @@ void ClangSyntaxPrinter::printIdentifier(StringRef name) {
 
 void ClangSyntaxPrinter::printBaseName(const ValueDecl *decl) {
   assert(decl->getName().isSimpleName());
-  printIdentifier(decl->getBaseIdentifier().str());
+  printIdentifier(cxx_translation::getNameForCxx(decl));
 }
 
 void ClangSyntaxPrinter::printModuleNameCPrefix(const ModuleDecl &mod) {
@@ -95,8 +98,21 @@ void ClangSyntaxPrinter::printExternC(
   os << "#endif\n";
 }
 
+void ClangSyntaxPrinter::printObjCBlock(
+    llvm::function_ref<void(raw_ostream &OS)> bodyPrinter) const {
+  os << "#if defined(__OBJC__)\n";
+  bodyPrinter(os);
+  os << "\n#endif\n";
+}
+
 void ClangSyntaxPrinter::printSwiftImplQualifier() const {
   os << "swift::" << cxx_synthesis::getCxxImplNamespaceName() << "::";
+}
+
+void ClangSyntaxPrinter::printInlineForThunk() const {
+  // FIXME: make a macro and add 'nodebug', and
+  // migrate all other 'inline' uses.
+  os << "inline __attribute__((always_inline)) ";
 }
 
 void ClangSyntaxPrinter::printNullability(
@@ -145,9 +161,36 @@ void ClangSyntaxPrinter::printSwiftTypeMetadataAccessFunctionCall(
   os << name << "(0)";
 }
 
-void ClangSyntaxPrinter::printValueWitnessTableAccessFromTypeMetadata(
-    StringRef metadataVariable) {
-  os << "*(reinterpret_cast<";
+void ClangSyntaxPrinter::printValueWitnessTableAccessSequenceFromTypeMetadata(
+    StringRef metadataVariable, StringRef vwTableVariable, int indent) {
+  os << std::string(indent, ' ');
+  os << "auto *vwTableAddr = ";
+  os << "reinterpret_cast<";
   printSwiftImplQualifier();
-  os << "ValueWitnessTable **>(" << metadataVariable << "._0) - 1)";
+  os << "ValueWitnessTable **>(" << metadataVariable << "._0) - 1;\n";
+  os << "#ifdef __arm64e__\n";
+  os << std::string(indent, ' ');
+  os << "auto *" << vwTableVariable << " = ";
+  os << "reinterpret_cast<";
+  printSwiftImplQualifier();
+  os << "ValueWitnessTable *>(ptrauth_auth_data(";
+  os << "reinterpret_cast<void *>(*vwTableAddr), "
+        "ptrauth_key_process_independent_data, ";
+  os << "ptrauth_blend_discriminator(vwTableAddr, "
+     << SpecialPointerAuthDiscriminators::ValueWitnessTable << ")));\n";
+  os << "#else\n";
+  os << std::string(indent, ' ');
+  os << "auto *" << vwTableVariable << " = *vwTableAddr;\n";
+  os << "#endif\n";
+}
+
+void ClangSyntaxPrinter::printCTypeMetadataTypeFunction(
+    const NominalTypeDecl *typeDecl, StringRef typeMetadataFuncName) {
+  os << "// Type metadata accessor for " << typeDecl->getNameStr() << "\n";
+  os << "SWIFT_EXTERN ";
+  printSwiftImplQualifier();
+  os << "MetadataResponseTy " << typeMetadataFuncName << '(';
+  printSwiftImplQualifier();
+  os << "MetadataRequestTy)";
+  os << " SWIFT_NOEXCEPT SWIFT_CALL;\n\n";
 }

@@ -615,11 +615,15 @@ public:
 
   /// Keep track of cxx function names, params etc in order to
   /// allow for de-duping functions that differ strictly on "constness".
-  llvm::DenseMap<llvm::StringRef,
+  llvm::DenseMap<const clang::DeclContext *, llvm::DenseMap<llvm::StringRef,
                  std::pair<
                      llvm::DenseSet<clang::FunctionDecl *>,
-                     llvm::DenseSet<clang::FunctionDecl *>>>
+                     llvm::DenseSet<clang::FunctionDecl *>>>>
       cxxMethods;
+
+  // Keep track of the decls that were already cloned for this specific class.
+  llvm::DenseMap<std::pair<ValueDecl *, DeclContext *>, ValueDecl *>
+      clonedBaseMembers;
 
   // Cache for already-specialized function templates and any thunks they may
   // have.
@@ -765,7 +769,7 @@ public:
   /// Tracks macro definitions from the bridging header.
   std::vector<clang::IdentifierInfo *> BridgeHeaderMacros;
   /// Tracks included headers from the bridging header.
-  llvm::DenseSet<const clang::FileEntry *> BridgeHeaderFiles;
+  llvm::DenseSet<clang::FileEntryRef> BridgeHeaderFiles;
 
   void addBridgeHeaderTopLevelDecls(clang::Decl *D);
   bool shouldIgnoreBridgeHeaderTopLevelDecl(clang::Decl *D);
@@ -939,7 +943,7 @@ public:
 
   void addImportDiagnostic(
       ImportDiagnosticTarget target, Diagnostic &&diag,
-      const clang::SourceLocation &loc = clang::SourceLocation());
+      clang::SourceLocation loc);
 
   /// Import the given Clang identifier into Swift.
   ///
@@ -1724,7 +1728,7 @@ class ImportDiagnosticAdder {
 public:
   ImportDiagnosticAdder(
       ClangImporter::Implementation &impl, ImportDiagnosticTarget target,
-      const clang::SourceLocation &loc = clang::SourceLocation())
+      clang::SourceLocation loc)
       : impl(impl), target(target), loc(loc) {}
 
   void operator () (Diagnostic &&diag) {
@@ -1859,6 +1863,22 @@ inline Optional<const clang::EnumDecl *> findAnonymousEnumForTypedef(
     return cast<clang::EnumDecl>(found->get<clang::NamedDecl *>());
 
   return None;
+}
+
+inline bool requiresCPlusPlus(const clang::Module *module) {
+  // The libc++ modulemap doesn't currently declare the requirement.
+  if (module->getTopLevelModuleName() == "std")
+    return true;
+
+  // Modulemaps often declare the requirement for the top-level module only.
+  if (auto parent = module->Parent) {
+    if (requiresCPlusPlus(parent))
+      return true;
+  }
+
+  return llvm::any_of(module->Requirements, [](clang::Module::Requirement req) {
+    return req.first == "cplusplus";
+  });
 }
 
 }

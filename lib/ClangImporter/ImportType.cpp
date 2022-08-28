@@ -391,37 +391,42 @@ namespace {
       llvm_unreachable("Invalid BuiltinType.");
     }
 
-    ImportResult VisitExtIntType(const clang::ExtIntType *type) {
+    ImportResult VisitBitIntType(const clang::BitIntType *type) {
       Impl.addImportDiagnostic(type, Diagnostic(diag::unsupported_builtin_type,
-                                                type->getTypeClassName()));
-      // ExtInt is not supported in Swift.
+                                                type->getTypeClassName()),
+                               clang::SourceLocation());
+      // BitInt is not supported in Swift.
       return Type();
     }
 
     ImportResult VisitPipeType(const clang::PipeType *type) {
       Impl.addImportDiagnostic(type, Diagnostic(diag::unsupported_builtin_type,
-                                                type->getTypeClassName()));
+                                                type->getTypeClassName()),
+                               clang::SourceLocation());
       // OpenCL types are not supported in Swift.
       return Type();
     }
 
     ImportResult VisitMatrixType(const clang::MatrixType *ty) {
       Impl.addImportDiagnostic(ty, Diagnostic(diag::unsupported_builtin_type,
-                                              ty->getTypeClassName()));
+                                              ty->getTypeClassName()),
+                               clang::SourceLocation());
       // Matrix types are not supported in Swift.
       return Type();
     }
 
     ImportResult VisitComplexType(const clang::ComplexType *type) {
       Impl.addImportDiagnostic(type, Diagnostic(diag::unsupported_builtin_type,
-                                                type->getTypeClassName()));
+                                                type->getTypeClassName()),
+                               clang::SourceLocation());
       // FIXME: Implement once Complex is in the library.
       return Type();
     }
 
     ImportResult VisitAtomicType(const clang::AtomicType *type) {
       Impl.addImportDiagnostic(type, Diagnostic(diag::unsupported_builtin_type,
-                                                type->getTypeClassName()));
+                                                type->getTypeClassName()),
+                               clang::SourceLocation());
       // FIXME: handle pointers and fields of atomic type
       return Type();
     }
@@ -614,6 +619,9 @@ namespace {
       if (size > 4096)
         return Type();
       
+      if (size == 1)
+        return ParenType::get(elementType->getASTContext(), elementType);
+
       SmallVector<TupleTypeElt, 8> elts{static_cast<size_t>(size), elementType};
       return TupleType::get(elts, elementType->getASTContext());
     }
@@ -930,6 +938,8 @@ namespace {
     SUGAR_TYPE(Adjusted)
     SUGAR_TYPE(SubstTemplateTypeParm)
     SUGAR_TYPE(Elaborated)
+    SUGAR_TYPE(Using)
+    SUGAR_TYPE(BTFTagAttributed)
 
     ImportResult VisitDecayedType(const clang::DecayedType *type) {
       clang::ASTContext &clangCtx = Impl.getClangASTContext();
@@ -1028,7 +1038,8 @@ namespace {
              ++cp) {
           if (!(*cp)->hasDefinition())
             Impl.addImportDiagnostic(
-                type, Diagnostic(diag::incomplete_protocol, *cp));
+                type, Diagnostic(diag::incomplete_protocol, *cp),
+                clang::SourceLocation());
         }
       }
 
@@ -1039,7 +1050,8 @@ namespace {
             Impl.importDecl(objcClass, Impl.CurrentVersion));
         if (!imported && !objcClass->hasDefinition())
           Impl.addImportDiagnostic(
-              type, Diagnostic(diag::incomplete_interface, objcClass));
+              type, Diagnostic(diag::incomplete_interface, objcClass),
+              clang::SourceLocation());
 
         if (!imported)
           return nullptr;
@@ -2091,6 +2103,20 @@ ImportedType ClangImporter::Implementation::importFunctionReturnType(
           ->isTemplateTypeParmType())
     OptionalityOfReturn = OTK_None;
 
+  if (auto typedefType = dyn_cast<clang::TypedefType>(clangDecl->getReturnType().getTypePtr())) {
+    if (isUnavailableInSwift(typedefType->getDecl())) {
+      if (auto clangEnum = findAnonymousEnumForTypedef(SwiftContext, typedefType)) {
+        // If this fails, it means that we need a stronger predicate for
+        // determining the relationship between an enum and typedef.
+        assert(clangEnum.getValue()->getIntegerType()->getCanonicalTypeInternal() ==
+               typedefType->getCanonicalTypeInternal());
+        if (auto swiftEnum = importDecl(*clangEnum, CurrentVersion)) {
+          return {cast<NominalTypeDecl>(swiftEnum)->getDeclaredType(), false};
+        }
+      }
+    }
+  }
+
   // Import the result type.
   return importType(clangDecl->getReturnType(),
                     (isAuditedResult ? ImportTypeKind::AuditedResult
@@ -2921,6 +2947,9 @@ ImportedType ClangImporter::Implementation::importMethodParamsAndReturnType(
             asyncInfo->completionHandlerErrorParamIndex();
       }
 
+      bool sendableByDefault = paramIsCompletionHandler &&
+        SwiftContext.LangOpts.hasFeature(Feature::SendableCompletionHandlers);
+
       // If this is the throws error parameter, we don't need to convert any
       // NSError** arguments to the sugared NSErrorPointer typealias form,
       // because all that is done with it is retrieving the canonical
@@ -2933,7 +2962,7 @@ ImportedType ClangImporter::Implementation::importMethodParamsAndReturnType(
           importType(paramTy, importKind, paramAddDiag,
                      allowNSUIntegerAsIntInParam, Bridgeability::Full,
                      getImportTypeAttrs(param, /*isParam=*/true,
-                  /*sendableByDefault=*/paramIsCompletionHandler),
+                                        sendableByDefault),
                      optionalityOfParam,
                      /*resugarNSErrorPointer=*/!paramIsError,
                      completionHandlerErrorParamIndex);

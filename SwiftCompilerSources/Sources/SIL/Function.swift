@@ -13,7 +13,7 @@
 import Basic
 import SILBridging
 
-final public class Function : CustomStringConvertible, HasShortDescription {
+final public class Function : CustomStringConvertible, HasShortDescription, Hashable {
   public private(set) var effects = FunctionEffects()
 
   public var name: StringRef {
@@ -27,6 +27,10 @@ final public class Function : CustomStringConvertible, HasShortDescription {
 
   public var shortDescription: String { name.string }
 
+  public func hash(into hasher: inout Hasher) {
+    hasher.combine(ObjectIdentifier(self))
+  }
+
   public var hasOwnership: Bool { SILFunction_hasOwnership(bridged) != 0 }
 
   public var entryBlock: BasicBlock {
@@ -39,6 +43,11 @@ final public class Function : CustomStringConvertible, HasShortDescription {
 
   public var arguments: LazyMapSequence<ArgumentArray, FunctionArgument> {
     entryBlock.arguments.lazy.map { $0 as! FunctionArgument }
+  }
+
+  /// All instructions of all blocks.
+  public var instructions: LazySequence<FlattenSequence<LazyMapSequence<List<BasicBlock>, List<Instruction>>>> {
+    blocks.lazy.flatMap { $0.instructions }
   }
 
   public var numIndirectResultArguments: Int {
@@ -65,9 +74,25 @@ final public class Function : CustomStringConvertible, HasShortDescription {
     return nil
   }
 
+  /// True, if the linkage of the function indicates that it is visible outside the current
+  /// compilation unit and therefore not all of its uses are known.
+  ///
+  /// For example, `public` linkage.
+  public var isPossiblyUsedExternally: Bool {
+    return SILFunction_isPossiblyUsedExternally(bridged) != 0
+  }
+
+  /// True, if the linkage of the function indicates that it has a definition outside the
+  /// current compilation unit.
+  ///
+  /// For example, `public_external` linkage.
+  public var isAvailableExternally: Bool {
+    return SILFunction_isAvailableExternally(bridged) != 0
+  }
+
   public func hasSemanticsAttribute(_ attr: StaticString) -> Bool {
     attr.withUTF8Buffer { (buffer: UnsafeBufferPointer<UInt8>) in
-      SILFunction_hasSemanticsAttr(bridged, BridgedStringRef(data: buffer.baseAddress!, length: buffer.count)) != 0
+      SILFunction_hasSemanticsAttr(bridged, llvm.StringRef(buffer.baseAddress!, buffer.count)) != 0
     }
   }
 
@@ -105,18 +130,18 @@ final public class Function : CustomStringConvertible, HasShortDescription {
       // writeFn
       { (f: BridgedFunction, os: BridgedOStream, idx: Int) in
         let s = f.function.effects.argumentEffects[idx].description
-        s.withBridgedStringRef { OStream_write(os, $0) }
+        s._withStringRef { OStream_write(os, $0) }
       },
       // parseFn:
-      { (f: BridgedFunction, str: BridgedStringRef, fromSIL: Int, isDerived: Int, paramNames: BridgedArrayRef) -> BridgedParsingError in
+      { (f: BridgedFunction, str: llvm.StringRef, fromSIL: Int, isDerived: Int, paramNames: BridgedArrayRef) -> BridgedParsingError in
         do {
           var parser = StringParser(str.string)
           let effect: ArgumentEffect
           if fromSIL != 0 {
             effect = try parser.parseEffectFromSIL(for: f.function, isDerived: isDerived != 0)
           } else {
-            let paramToIdx = paramNames.withElements(ofType: BridgedStringRef.self) {
-                (buffer: UnsafeBufferPointer<BridgedStringRef>) -> Dictionary<String, Int> in
+            let paramToIdx = paramNames.withElements(ofType: llvm.StringRef.self) {
+                (buffer: UnsafeBufferPointer<llvm.StringRef>) -> Dictionary<String, Int> in
               let keyValPairs = buffer.enumerated().lazy.map { ($0.1.string, $0.0) }
               return Dictionary(uniqueKeysWithValues: keyValPairs)
             }

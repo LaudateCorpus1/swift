@@ -21,6 +21,7 @@
 namespace swift {
 
 class ModuleDecl;
+class NominalTypeDecl;
 
 namespace cxx_synthesis {
 
@@ -69,6 +70,10 @@ public:
   void
   printExternC(llvm::function_ref<void(raw_ostream &OS)> bodyPrinter) const;
 
+  /// Print an #ifdef __OBJC__ block.
+  void
+  printObjCBlock(llvm::function_ref<void(raw_ostream &OS)> bodyPrinter) const;
+
   /// Print the `swift::_impl::` namespace qualifier.
   void printSwiftImplQualifier() const;
 
@@ -78,6 +83,8 @@ public:
     After,
     ContextSensitive,
   };
+
+  void printInlineForThunk() const;
 
   void printNullability(
       Optional<OptionalTypeKind> kind,
@@ -90,9 +97,14 @@ public:
   /// Print the call expression to the Swift type metadata access function.
   void printSwiftTypeMetadataAccessFunctionCall(StringRef name);
 
-  /// Print the expression to access the value witness table pointer from the
-  /// given type metadata variable.
-  void printValueWitnessTableAccessFromTypeMetadata(StringRef metadataVariable);
+  /// Print the set of statements to access the value witness table pointer
+  /// ('vwTable') from the given type metadata variable.
+  void printValueWitnessTableAccessSequenceFromTypeMetadata(
+      StringRef metadataVariable, StringRef vwTableVariable, int indent);
+
+  /// Print the metadata accessor function for the given type declaration.
+  void printCTypeMetadataTypeFunction(const NominalTypeDecl *typeDecl,
+                                      StringRef typeMetadataFuncName);
 
 protected:
   raw_ostream &os;

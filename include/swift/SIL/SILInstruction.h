@@ -1315,6 +1315,7 @@ FirstArgOwnershipForwardingSingleValueInst::classof(SILInstructionKind kind) {
   case SILInstructionKind::InitExistentialRefInst:
   case SILInstructionKind::MarkDependenceInst:
   case SILInstructionKind::MoveOnlyWrapperToCopyableValueInst:
+  case SILInstructionKind::CopyableToMoveOnlyWrapperValueInst:
     return true;
   default:
     return false;
@@ -4999,6 +5000,48 @@ public:
   MutableArrayRef<Operand> getAllOperands() { return Operands.asArray(); }
 };
 
+/// ExplicitCopyAddrInst - A copy_addr that should not be optimized and should
+/// be viewed
+class ExplicitCopyAddrInst
+    : public InstructionBase<SILInstructionKind::ExplicitCopyAddrInst,
+                             NonValueInstruction>,
+      public CopyLikeInstruction {
+  friend SILBuilder;
+
+private:
+  FixedOperandList<2> Operands;
+  USE_SHARED_UINT8;
+
+  ExplicitCopyAddrInst(SILDebugLocation DebugLoc, SILValue Src, SILValue Dest,
+                       IsTake_t isTakeOfSrc,
+                       IsInitialization_t isInitializationOfDest);
+
+public:
+  SILValue getSrc() const { return Operands[Src].get(); }
+  SILValue getDest() const { return Operands[Dest].get(); }
+
+  void setSrc(SILValue V) { Operands[Src].set(V); }
+  void setDest(SILValue V) { Operands[Dest].set(V); }
+
+  IsTake_t isTakeOfSrc() const {
+    return IsTake_t(sharedUInt8().ExplicitCopyAddrInst.isTakeOfSrc);
+  }
+  IsInitialization_t isInitializationOfDest() const {
+    return IsInitialization_t(
+        sharedUInt8().ExplicitCopyAddrInst.isInitializationOfDest);
+  }
+
+  void setIsTakeOfSrc(IsTake_t T) {
+    sharedUInt8().ExplicitCopyAddrInst.isTakeOfSrc = (bool)T;
+  }
+  void setIsInitializationOfDest(IsInitialization_t I) {
+    sharedUInt8().ExplicitCopyAddrInst.isInitializationOfDest = (bool)I;
+  }
+
+  ArrayRef<Operand> getAllOperands() const { return Operands.asArray(); }
+  MutableArrayRef<Operand> getAllOperands() { return Operands.asArray(); }
+};
+
 /// "%token = bind_memory %0 : $Builtin.RawPointer, %1 : $Builtin.Word to $T"
 ///
 /// Binds memory at the raw pointer %0 to type $T with enough capacity
@@ -7565,7 +7608,16 @@ class MarkMustCheckInst
 public:
   enum class CheckKind : unsigned {
     Invalid = 0,
+
+    // A signal to the move only checker to perform no implicit copy checking on
+    // the result of this instruction. This implies that the result can be
+    // consumed at most once.
     NoImplicitCopy,
+
+    // A signal to the move only checker ot perform no copy checking. This
+    // forces the result of this instruction owned value to never be consumed
+    // (still allowing for non-consuming uses of course).
+    NoCopy,
   };
 
 private:
@@ -7577,26 +7629,68 @@ private:
         OwnershipForwardingMixin(SILInstructionKind::MarkMustCheckInst,
                                  operand->getOwnershipKind()),
         kind(checkKind) {
-    assert(operand->getType().isMoveOnlyWrapped() &&
-           "mark_must_check can only take a move only wrapped value");
+    assert(operand->getType().isMoveOnly() &&
+           "mark_must_check can only take a move only typed value");
   }
 
 public:
   CheckKind getCheckKind() const { return kind; }
 
-  bool isNoImplicitCopy() const { return kind == CheckKind::NoImplicitCopy; }
+  bool hasMoveCheckerKind() const {
+    switch (kind) {
+    case CheckKind::Invalid:
+      return false;
+    case CheckKind::NoImplicitCopy:
+    case CheckKind::NoCopy:
+      return true;
+    }
+  }
 };
 
+/// Convert from a non-trivial copyable type to an `@moveOnly` wrapper type.
+///
+/// IMPORTANT: Unlike other forwarding instructions, the ownership of
+/// copyable_to_moveonly is not decided by the operand passed in on
+/// construction. Instead in SILBuilder one must select the specific type of
+/// ownership one wishes by using the following APIs:
+///
+/// * SILBuilder::createOwnedCopyableToMoveOnlyWrapperValueInst
+/// * SILBuilder::createGuaranteedCopyableToMoveOnlyWrapperInst
+///
+/// The reason why this instruction was designed in this manner is that a
+/// frontend chooses the ownership form of this instruction based off of the
+/// semantic place that the value is used. Specifically:
+///
+/// 1. When creating a moveOnly wrapped value for an owned argument or a value,
+/// we use the owned variant.
+///
+/// 2. When creating a moveOnly wrapped value from a guaranteed argument, we use
+/// the guaranteed variant.
 class CopyableToMoveOnlyWrapperValueInst
     : public UnaryInstructionBase<
           SILInstructionKind::CopyableToMoveOnlyWrapperValueInst,
-          SingleValueInstruction> {
+          FirstArgOwnershipForwardingSingleValueInst> {
+public:
+  enum InitialKind {
+    Guaranteed,
+    Owned,
+  };
+
+private:
   friend class SILBuilder;
 
+  InitialKind initialKind;
+
   CopyableToMoveOnlyWrapperValueInst(SILDebugLocation DebugLoc,
-                                     SILValue operand)
-      : UnaryInstructionBase(DebugLoc, operand,
-                             operand->getType().addingMoveOnlyWrapper()) {}
+                                     SILValue operand, InitialKind kind)
+      : UnaryInstructionBase(
+            DebugLoc, operand, operand->getType().addingMoveOnlyWrapper(),
+            kind == InitialKind::Guaranteed ? OwnershipKind::Guaranteed
+                                            : OwnershipKind::Owned),
+        initialKind(kind) {}
+
+public:
+  InitialKind getInitialKind() const { return initialKind; }
 };
 
 /// Convert from an @moveOnly wrapper type to the underlying copyable type. Can
@@ -9823,6 +9917,8 @@ OwnershipForwardingMixin::get(SILInstruction *inst) {
   if (auto *result = dyn_cast<MarkMustCheckInst>(inst))
     return result;
   if (auto *result = dyn_cast<MoveOnlyWrapperToCopyableValueInst>(inst))
+    return result;
+  if (auto *result = dyn_cast<CopyableToMoveOnlyWrapperValueInst>(inst))
     return result;
   return nullptr;
 }

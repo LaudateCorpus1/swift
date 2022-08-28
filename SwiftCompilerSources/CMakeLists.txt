@@ -165,6 +165,7 @@ function(add_swift_compiler_modules_library name)
     add_custom_command_target(dep_target OUTPUT ${module_obj_file}
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
       DEPENDS ${sources} ${deps} ${ALS_DEPENDS}
+        importedHeaderDependencies
       COMMAND ${ALS_SWIFT_EXEC} "-c" "-o" ${module_obj_file}
               ${sdk_option}
               "-target" ${target}
@@ -179,7 +180,7 @@ function(add_swift_compiler_modules_library name)
               # Bridging modules and headers.
               "-Xcc" "-I" "-Xcc" "${SWIFT_SOURCE_DIR}/include"
               # Generated C headers.
-              "-Xcc" "-I" "-Xcc" "${CMAKE_BINARY_DIR}/include"
+              "-Xcc" "-I" "-Xcc" "${CMAKE_CURRENT_BINARY_DIR}/../include"
               # Generated swift modules.
               "-I" "${build_dir}"
       COMMENT "Building swift module ${module}")
@@ -228,6 +229,34 @@ else()
   project(SwiftInTheCompiler LANGUAGES C CXX)
 
   add_subdirectory(Sources)
+
+  # TODO: generate this dynamically through the modulemap; this cannot use `sed`
+  # as that is not available on all paltforms (e.g. Windows).
+  #
+  # step 1: generate a dummy source file, which just includes all headers
+  # defined in include/swift/module.modulemap
+  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/HeaderDependencies.cpp"
+       "
+#include \"Basic/BridgedSwiftObject.h\"
+#include \"Basic/BasicBridging.h\"
+#include \"Basic/SourceLoc.h\"
+
+#include \"AST/ASTBridging.h\"
+#include \"AST/DiagnosticEngine.h\"
+#include \"AST/DiagnosticConsumer.h\"
+
+#include \"SIL/SILBridging.h\"
+
+#include \"SILOptimizer/OptimizerBridging.h\"
+
+#include \"Parse/RegexParserBridging.h\"
+")
+
+  # step 2: build a library containing that source file. This library depends on all the included header files.
+  #         The swift modules can now depend on that target.
+  #         Note that this library is unused, i.e. not linked to anything.   
+  add_library(importedHeaderDependencies "${CMAKE_CURRENT_BINARY_DIR}/HeaderDependencies.cpp")
+  target_include_directories(importedHeaderDependencies PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../include/swift")
 
   if(${BOOTSTRAPPING_MODE} MATCHES "HOSTTOOLS|CROSSCOMPILE")
 

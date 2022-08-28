@@ -14,40 +14,41 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "TypeCheckDecl.h"
 #include "CodeSynthesis.h"
 #include "DerivedConformances.h"
-#include "TypeChecker.h"
+#include "MiscDiagnostics.h"
 #include "TypeCheckAccess.h"
 #include "TypeCheckAvailability.h"
 #include "TypeCheckConcurrency.h"
-#include "TypeCheckDecl.h"
 #include "TypeCheckObjC.h"
 #include "TypeCheckType.h"
-#include "MiscDiagnostics.h"
-#include "swift/AST/AccessScope.h"
+#include "TypeChecker.h"
 #include "swift/AST/ASTPrinter.h"
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/ASTWalker.h"
+#include "swift/AST/AccessScope.h"
+#include "swift/AST/Attr.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/Initializer.h"
 #include "swift/AST/NameLookup.h"
+#include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/OperatorNameLookup.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/PropertyWrappers.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SourceFile.h"
+#include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeWalker.h"
+#include "swift/Basic/Defer.h"
 #include "swift/Parse/Lexer.h"
 #include "swift/Parse/Parser.h"
 #include "swift/Sema/IDETypeChecking.h"
 #include "swift/Serialization/SerializedModuleLoader.h"
 #include "swift/Strings.h"
-#include "swift/AST/NameLookupRequests.h"
-#include "swift/AST/TypeCheckRequests.h"
-#include "swift/Basic/Defer.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/APSInt.h"
@@ -707,6 +708,10 @@ ExistentialConformsToSelfRequest::evaluate(Evaluator &evaluator,
 bool
 ExistentialRequiresAnyRequest::evaluate(Evaluator &evaluator,
                                         ProtocolDecl *decl) const {
+  auto &ctx = decl->getASTContext();
+  if (ctx.LangOpts.hasFeature(Feature::ExistentialAny))
+    return true;
+
   // ObjC protocols do not require `any`.
   if (decl->isObjC())
     return false;
@@ -895,6 +900,13 @@ IsFinalRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
   if (decl->getAttrs().hasAttribute<FinalAttr>())
     return true;
 
+  return false;
+}
+
+bool IsMoveOnlyRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
+  // For now only do this for nominal type decls.
+  if (isa<NominalTypeDecl>(decl))
+    return decl->getAttrs().hasAttribute<MoveOnlyAttr>();
   return false;
 }
 
@@ -1814,6 +1826,8 @@ UnderlyingTypeRequest::evaluate(Evaluator &evaluator,
   TypeResolutionOptions options((typeAlias->getGenericParams()
                                      ? TypeResolverContext::GenericTypeAliasDecl
                                      : TypeResolverContext::TypeAliasDecl));
+  if (typeAlias->preconcurrency())
+    options |= TypeResolutionFlags::Preconcurrency;
 
   // This can happen when code completion is attempted inside
   // of typealias underlying type e.g. `typealias F = () -> Int#^TOK^#`
@@ -1934,25 +1948,10 @@ FunctionOperatorRequest::evaluate(Evaluator &evaluator, FuncDecl *FD) const {
   }
 
   if (!op) {
-    SourceLoc insertionLoc;
-    if (isa<SourceFile>(FD->getParent())) {
-      // Parent context is SourceFile, insertion location is start of func
-      // declaration or unary operator
-      if (FD->isUnaryOperator()) {
-        insertionLoc = FD->getAttrs().getStartLoc();
-      } else {
-        insertionLoc = FD->getStartLoc();
-      }
-    } else {
-      // Find the topmost non-file decl context and insert there.
-      for (DeclContext *CurContext = FD->getLocalContext();
-           !isa<SourceFile>(CurContext);
-           CurContext = CurContext->getParent()) {
-        // Skip over non-decl contexts (e.g. closure expressions)
-        if (auto *D = CurContext->getAsDecl())
-            insertionLoc = D->getStartLoc();
-      }
-    }
+    // We want to insert at the start of the top-most declaration, taking
+    // attributes into consideration.
+    auto *insertionDecl = FD->getTopmostDeclarationDeclContext();
+    auto insertionLoc = insertionDecl->getSourceRangeIncludingAttrs().Start;
 
     SmallString<128> insertion;
     {
@@ -2094,8 +2093,11 @@ ResultTypeRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
             : ErrorType::get(ctx));
   }
 
-  const auto options =
+  auto options =
       TypeResolutionOptions(TypeResolverContext::FunctionResult);
+  if (decl->preconcurrency())
+    options |= TypeResolutionFlags::Preconcurrency;
+
   auto *const dc = decl->getInnermostDeclContext();
   return TypeResolution::forInterface(dc, options,
                                       /*unboundTyOpener*/ nullptr,
@@ -2196,6 +2198,13 @@ static Type validateParameterType(ParamDecl *decl) {
     options = TypeResolutionOptions(TypeResolverContext::EnumElementDecl);
   }
 
+  // Set the "preconcurrency" flag if this is a parameter of a preconcurrency
+  // declaration.
+  if (auto decl = dc->getAsDecl()) {
+    if (decl->preconcurrency())
+      options |= TypeResolutionFlags::Preconcurrency;
+  }
+
   // If the element is a variadic parameter, resolve the parameter type as if
   // it were in non-parameter position, since we want functions to be
   // @escaping in this case.
@@ -2218,10 +2227,14 @@ static Type validateParameterType(ParamDecl *decl) {
   }
 
   if (decl->isVariadic()) {
+    // Find the first type sequence parameter and use that as the count type.
+    SmallVector<Type, 2> rootTypeSequenceParams;
+    Ty->getTypeSequenceParameters(rootTypeSequenceParams);
+
     // Handle the monovariadic/polyvariadic interface type split.
-    if (Ty->hasTypeSequence()) {
+    if (!rootTypeSequenceParams.empty()) {
       // Polyvariadic types (T...) for <T...> resolve to pack expansions.
-      Ty = PackExpansionType::get(Ty);
+      Ty = PackExpansionType::get(Ty, rootTypeSequenceParams[0]);
     } else {
       // Monovariadic types (T...) for <T> resolve to [T].
       Ty = VariadicSequenceType::get(Ty);

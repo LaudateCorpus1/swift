@@ -94,6 +94,8 @@ enum class ReflectionMetadataMode : unsigned {
   Runtime,      ///< Make reflection metadata fully available.
 };
 
+enum class StackProtectorMode : bool { NoStackProtector, StackProtector };
+
 using clang::PointerAuthSchema;
 
 struct PointerAuthOptions : clang::PointerAuthOptions {
@@ -193,6 +195,9 @@ struct PointerAuthOptions : clang::PointerAuthOptions {
   /// Extended existential type shapes in flight.
   PointerAuthSchema ExtendedExistentialTypeShape;
 
+  // The c type descriminator for TaskContinuationFunction*.
+  PointerAuthSchema ClangTypeTaskContinuationFunction;
+
   /// Non-unique extended existential type shapes in flight.
   PointerAuthSchema NonUniqueExtendedExistentialTypeShape;
 };
@@ -237,6 +242,9 @@ public:
   /// well-formed?
   unsigned Verify : 1;
 
+  /// Should we use the legacy pass manager.
+  unsigned LegacyPassManager : 1;
+
   OptimizationMode OptMode;
 
   /// Which sanitizer is turned on.
@@ -276,6 +284,8 @@ public:
 
   /// Whether we should run swift specific LLVM optimizations after IRGen.
   unsigned DisableSwiftSpecificLLVMOptzns : 1;
+
+  unsigned EnableStackProtector : 1;
 
   /// Special codegen for playgrounds.
   unsigned Playground : 1;
@@ -398,6 +408,9 @@ public:
   /// Internalize symbols (static library) - do not export any public symbols.
   unsigned InternalizeSymbols : 1;
 
+  /// Emit a section with references to class_ro_t* in generic class patterns.
+  unsigned EmitGenericRODatas : 1;
+
   /// Whether to avoid emitting zerofill globals as preallocated type metadata
   /// and protocol conformance caches.
   unsigned NoPreallocatedInstantiationCaches : 1;
@@ -443,7 +456,7 @@ public:
   IRGenOptions()
       : DWARFVersion(2),
         OutputKind(IRGenOutputKind::LLVMAssemblyAfterOptimization),
-        Verify(true), OptMode(OptimizationMode::NotSet),
+        Verify(true), LegacyPassManager(0), OptMode(OptimizationMode::NotSet),
         Sanitizers(OptionSet<SanitizerKind>()),
         SanitizersWithRecoveryInstrumentation(OptionSet<SanitizerKind>()),
         SanitizeAddressUseODRIndicator(false),
@@ -451,10 +464,10 @@ public:
         DebugInfoFormat(IRGenDebugInfoFormat::None),
         DisableClangModuleSkeletonCUs(false), UseJIT(false),
         DisableLLVMOptzns(false), DisableSwiftSpecificLLVMOptzns(false),
-        Playground(false), EmitStackPromotionChecks(false),
-        UseSingleModuleLLVMEmission(false), FunctionSections(false),
-        PrintInlineTree(false), EmbedMode(IRGenEmbedMode::None),
-        LLVMLTOKind(IRGenLLVMLTOKind::None),
+        EnableStackProtector(false), Playground(false),
+        EmitStackPromotionChecks(false), UseSingleModuleLLVMEmission(false),
+        FunctionSections(false), PrintInlineTree(false),
+        EmbedMode(IRGenEmbedMode::None), LLVMLTOKind(IRGenLLVMLTOKind::None),
         SwiftAsyncFramePointer(SwiftAsyncFramePointerKind::Auto),
         HasValueNamesSetting(false), ValueNames(false),
         ReflectionMetadata(ReflectionMetadataMode::Runtime),
@@ -472,7 +485,7 @@ public:
         EnableGlobalISel(false), VirtualFunctionElimination(false),
         WitnessMethodElimination(false), ConditionalRuntimeRecords(false),
         InternalizeAtLink(false), InternalizeSymbols(false),
-        NoPreallocatedInstantiationCaches(false),
+        EmitGenericRODatas(false), NoPreallocatedInstantiationCaches(false),
         DisableReadonlyStaticObjects(false), CmdArgs(),
         SanitizeCoverage(llvm::SanitizerCoverageOptions()),
         TypeInfoFilter(TypeInfoDumpFilter::All) {
@@ -537,6 +550,9 @@ public:
   bool hasMultipleIRGenThreads() const { return !UseSingleModuleLLVMEmission && NumThreads > 1; }
   bool shouldPerformIRGenerationInParallel() const { return !UseSingleModuleLLVMEmission && NumThreads != 0; }
   bool hasMultipleIGMs() const { return hasMultipleIRGenThreads(); }
+  StackProtectorMode getStackProtectorMode() const {
+    return StackProtectorMode(EnableStackProtector);
+  }
 };
 
 } // end namespace swift

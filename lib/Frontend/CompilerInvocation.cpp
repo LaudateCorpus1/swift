@@ -15,6 +15,7 @@
 
 #include "ArgsToFrontendOptionsConverter.h"
 #include "swift/AST/DiagnosticsFrontend.h"
+#include "swift/Basic/Feature.h"
 #include "swift/Basic/Platform.h"
 #include "swift/Option/Options.h"
 #include "swift/Option/SanitizerOptions.h"
@@ -44,6 +45,17 @@ static constexpr const char *const localeCodes[] = {
 
 swift::CompilerInvocation::CompilerInvocation() {
   setTargetTriple(llvm::sys::getDefaultTargetTriple());
+}
+
+/// Converts a llvm::Triple to a llvm::VersionTuple.
+static llvm::VersionTuple
+getVersionTuple(const llvm::Triple &triple) {
+  if (triple.isMacOSX()) {
+    llvm::VersionTuple OSVersion;
+    triple.getMacOSXVersion(OSVersion);
+    return OSVersion;
+  }
+  return triple.getOSVersion();
 }
 
 void CompilerInvocation::computeRuntimeResourcePathFromExecutablePath(
@@ -361,6 +373,8 @@ static void ParseModuleInterfaceArgs(ModuleInterfaceOptions &Opts,
     Args.hasArg(OPT_experimental_spi_imports);
   Opts.DebugPrintInvalidSyntax |=
     Args.hasArg(OPT_debug_emit_invalid_swiftinterface_syntax);
+  Opts.PrintMissingImports =
+    !Args.hasArg(OPT_disable_print_missing_imports_in_module_interface);
 
   if (const Arg *A = Args.getLastArg(OPT_library_level)) {
     StringRef contents = A->getValue();
@@ -485,8 +499,7 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
       Args.hasArg(OPT_disable_availability_checking);
   Opts.CheckAPIAvailabilityOnly |=
       Args.hasArg(OPT_check_api_availability_only);
-  Opts.EnableAdHocAvailability |=
-      Args.hasArg(OPT_enable_ad_hoc_availability);
+  Opts.WeakLinkAtTarget |= Args.hasArg(OPT_weak_link_at_target);
 
   if (auto A = Args.getLastArg(OPT_enable_conformance_availability_errors,
                                OPT_disable_conformance_availability_errors)) {
@@ -604,7 +617,7 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   // Determine whether string processing is enabled
   Opts.EnableExperimentalStringProcessing =
     Args.hasFlag(OPT_enable_experimental_string_processing,
-                 OPT_disable_experimental_string_processing);
+                 OPT_disable_experimental_string_processing, /*Default=*/true);
 
   // Add a future feature if it is not already implied by the language version.
   auto addFutureFeatureIfNotImplied = [&](Feature feature) {
@@ -637,6 +650,26 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
     }
   }
 
+  // Map historical flags over to future features.
+  for (const Arg *A : Args.filtered(OPT_enable_upcoming_feature)) {
+    // Ignore unknown features.
+    auto feature = getUpcomingFeature(A->getValue());
+    if (!feature)
+      continue;
+
+    // Check if this feature was introduced already in this language version.
+    if (auto firstVersion = getFeatureLanguageVersion(*feature)) {
+      if (Opts.isSwiftVersionAtLeast(*firstVersion)) {
+        Diags.diagnose(SourceLoc(), diag::error_upcoming_feature_on_by_default,
+                       A->getValue(), *firstVersion);
+        continue;
+      }
+    }
+
+    // Add the feature.
+    Opts.Features.insert(*feature);
+  }
+
   // Map historical flags over to experimental features. We do this for all
   // compilers because that's how existing experimental feature flags work.
   if (Args.hasArg(OPT_enable_experimental_variadic_generics))
@@ -657,6 +690,9 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
     Opts.Features.insert(Feature::ForwardModeDifferentiation);
   if (Args.hasArg(OPT_enable_experimental_additive_arithmetic_derivation))
     Opts.Features.insert(Feature::AdditiveArithmeticDerivedConformances);
+  
+  if (Args.hasArg(OPT_enable_experimental_opaque_type_erasure))
+    Opts.Features.insert(Feature::OpaqueTypeErasure);
 
   Opts.EnableAppExtensionRestrictions |= Args.hasArg(OPT_enable_app_extension);
 
@@ -763,6 +799,8 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
 
   Opts.EnableModuleLoadingRemarks = Args.hasArg(OPT_remark_loading_module);
 
+  Opts.EnableSkipExplicitInterfaceModuleBuildRemarks = Args.hasArg(OPT_remark_skip_explicit_interface_build);
+  
   llvm::Triple Target = Opts.Target;
   StringRef TargetArg;
   std::string TargetArgScratch;
@@ -841,24 +879,19 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   // First, set up default minimum inlining target versions.
   auto getDefaultMinimumInliningTargetVersion =
       [&](const llvm::Triple &triple) -> llvm::VersionTuple {
-    // FIXME: Re-enable with rdar://91387029
-#if SWIFT_DEFAULT_API_TARGET_MIN_INLINING_VERSION_TO_MIN
+    const auto targetVersion = getVersionTuple(triple);
+    
     // In API modules, default to the version when Swift first became available.
-    if (Opts.LibraryLevel == LibraryLevel::API)
-      if (auto minTriple = minimumAvailableOSVersionForTriple(triple))
-        return *minTriple;
-#endif
+    if (Opts.LibraryLevel == LibraryLevel::API) {
+      if (auto minVersion = minimumAvailableOSVersionForTriple(triple))
+        return *minVersion;
+    }
 
     // In other modules, assume that availability is used less consistently
     // and that library clients will generally raise deployment targets as the
     // library evolves so the min inlining version should be the deployment
     // target by default.
-    unsigned major, minor, patch;
-    if (triple.isMacOSX())
-      triple.getMacOSXVersion(major, minor, patch);
-    else
-      triple.getOSVersion(major, minor, patch);
-    return llvm::VersionTuple(major, minor, patch);
+    return targetVersion;
   };
 
   Opts.MinimumInliningTargetVersion =
@@ -1329,6 +1362,9 @@ static bool ParseSearchPathArgs(SearchPathOptions &Opts,
   if (const Arg *A = Args.getLastArg(OPT_batch_scan_input_file))
     Opts.BatchScanInputFilePath = A->getValue();
 
+  if (const Arg *A = Args.getLastArg(OPT_const_gather_protocols_file))
+    Opts.ConstGatherProtocolListFilePath = A->getValue();
+
   for (auto A : Args.getAllArgValues(options::OPT_serialized_path_obfuscate)) {
     auto SplitMap = StringRef(A).split('=');
     Opts.DeserializedPathRecoverer.addMapping(SplitMap.first, SplitMap.second);
@@ -1418,7 +1454,7 @@ static bool ParseDiagnosticArgs(DiagnosticOptions &Opts, ArgList &Args,
       // for the specified locale code.
       llvm::SmallString<128> localizationPath(A->getValue());
       llvm::sys::path::append(localizationPath, Opts.LocalizationCode);
-      llvm::sys::path::replace_extension(localizationPath, ".yaml");
+      llvm::sys::path::replace_extension(localizationPath, ".strings");
       if (!llvm::sys::fs::exists(localizationPath)) {
         Diags.diagnose(SourceLoc(), diag::warning_cannot_find_locale_file,
                        Opts.LocalizationCode, localizationPath);
@@ -2359,11 +2395,24 @@ static bool ParseIRGenArgs(IRGenOptions &Opts, ArgList &Args,
     // silently override "auto" to "never" when back-deploying. This approach
     // sacrifices async backtraces when back-deploying but prevents crashes in
     // older tools that cannot handle the async frame bit in the frame pointer.
-    unsigned major, minor, micro;
-    Triple.getWatchOSVersion(major, minor, micro);
-    if (major < 8)
+    llvm::VersionTuple OSVersion = Triple.getWatchOSVersion();
+    if (OSVersion.getMajor() < 8)
       Opts.SwiftAsyncFramePointer = SwiftAsyncFramePointerKind::Never;
   }
+
+  Opts.EmitGenericRODatas =
+      Args.hasFlag(OPT_enable_emit_generic_class_ro_t_list,
+                   OPT_disable_emit_generic_class_ro_t_list,
+                   Opts.EmitGenericRODatas);
+
+  Opts.LegacyPassManager =
+      Args.hasFlag(OPT_disable_new_llvm_pass_manager,
+                   OPT_enable_new_llvm_pass_manager,
+                   Opts.LegacyPassManager);
+
+  Opts.EnableStackProtector =
+      Args.hasFlag(OPT_enable_stack_protector, OPT_disable_stack_protector,
+                   Opts.EnableStackProtector);
 
   return false;
 }
