@@ -119,6 +119,7 @@ SHOULD_NEVER_VISIT_INST(ReleaseValue)
 SHOULD_NEVER_VISIT_INST(ReleaseValueAddr)
 SHOULD_NEVER_VISIT_INST(StrongRelease)
 SHOULD_NEVER_VISIT_INST(GetAsyncContinuation)
+SHOULD_NEVER_VISIT_INST(IncrementProfilerCounter)
 
 #define ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...)            \
   SHOULD_NEVER_VISIT_INST(StrongRetain##Name)                                  \
@@ -237,9 +238,31 @@ OPERAND_OWNERSHIP(PointerEscape, ProjectExistentialBox)
 OPERAND_OWNERSHIP(PointerEscape, UncheckedOwnershipConversion)
 OPERAND_OWNERSHIP(PointerEscape, ConvertEscapeToNoEscape)
 
+// UncheckedBitwiseCast ownership behaves like RefToUnowned. It produces an
+// Unowned value from a non-trivial value, without consuming or borrowing the
+// non-trivial value. Unlike RefToUnowned, a bitwise cast works on a compound
+// value and may truncate the value. The resulting value is still Unowned and
+// should be immediately copied to produce an owned value. These happen for two
+// reasons:
+//
+// (1) A Builtin.reinterpretCast is used on a nontrivial type. If the result is
+// non-trivial, then, as part of emitting the cast, SILGen emits a copy_value
+// immediately after the unchecked_bitwise_cast for all uses of the cast.
+//
+// (2) SILGen emits special conversions using SILGenBuilder's
+// createUncheckedBitCast utility. For non-trivial types, this emits an
+// unchecked_bitwise_cast immediately followed by a copy.
+//
+// The only thing protecting the lifetime of the Unowned value is the cast
+// operand's PointerEscape ownership, which prevents OSSA analysis and blocks
+// most optimization of the incoming value.
+//
+// TODO: Verify that Unowned values are only used by copies and that the cast
+// operand's lifetime exceeds the copies.
+OPERAND_OWNERSHIP(PointerEscape, UncheckedBitwiseCast)
+
 // Instructions that escape reference bits with unenforced lifetime.
 // TODO: verify that BitwiseEscape results always have a trivial type.
-OPERAND_OWNERSHIP(BitwiseEscape, UncheckedBitwiseCast)
 OPERAND_OWNERSHIP(BitwiseEscape, ValueToBridgeObject)
 OPERAND_OWNERSHIP(BitwiseEscape, RefToRawPointer)
 OPERAND_OWNERSHIP(BitwiseEscape, UncheckedTrivialBitCast)
@@ -794,8 +817,6 @@ BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, PoundAssert)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, GlobalStringTablePointer)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, TypePtrAuthDiscriminator)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, TargetOSVersionAtLeast)
-BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, IntInstrprofIncrement)
-BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, Move)
 BUILTIN_OPERAND_OWNERSHIP(UnownedInstantaneousUse, Copy)
 BUILTIN_OPERAND_OWNERSHIP(DestroyingConsume, StartAsyncLet)
 BUILTIN_OPERAND_OWNERSHIP(DestroyingConsume, EndAsyncLet)

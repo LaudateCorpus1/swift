@@ -25,6 +25,64 @@
 
 using namespace swift;
 
+bool swift::hasPointerEscape(BorrowedValue value) {
+  assert(value.kind == BorrowedValueKind::BeginBorrow ||
+         value.kind == BorrowedValueKind::LoadBorrow);
+  GraphNodeWorklist<Operand *, 8> worklist;
+  for (Operand *use : value->getUses()) {
+    if (use->getOperandOwnership() != OperandOwnership::NonUse)
+      worklist.insert(use);
+  }
+
+  while (Operand *op = worklist.pop()) {
+    switch (op->getOperandOwnership()) {
+    case OperandOwnership::NonUse:
+    case OperandOwnership::TrivialUse:
+    case OperandOwnership::ForwardingConsume:
+    case OperandOwnership::DestroyingConsume:
+      llvm_unreachable("this operand cannot handle an inner guaranteed use");
+
+    case OperandOwnership::ForwardingUnowned:
+    case OperandOwnership::PointerEscape:
+      return true;
+
+    case OperandOwnership::Borrow:
+    case OperandOwnership::EndBorrow:
+    case OperandOwnership::InstantaneousUse:
+    case OperandOwnership::UnownedInstantaneousUse:
+    case OperandOwnership::InteriorPointer:
+    case OperandOwnership::BitwiseEscape:
+      break;
+
+    case OperandOwnership::Reborrow: {
+      SILArgument *phi = cast<BranchInst>(op->getUser())
+                             ->getDestBB()
+                             ->getArgument(op->getOperandNumber());
+      for (auto *use : phi->getUses()) {
+        if (use->getOperandOwnership() != OperandOwnership::NonUse)
+          worklist.insert(use);
+      }
+      break;
+    }
+    case OperandOwnership::ForwardingBorrow: {
+      ForwardingOperand(op).visitForwardedValues([&](SILValue result) {
+        // Do not include transitive uses with 'none' ownership
+        if (result->getOwnershipKind() == OwnershipKind::None)
+          return true;
+        for (auto *resultUse : result->getUses()) {
+          if (resultUse->getOperandOwnership() != OperandOwnership::NonUse) {
+            worklist.insert(resultUse);
+          }
+        }
+        return true;
+      });
+      break;
+    }
+    }
+  }
+  return false;
+}
+
 bool swift::isValueAddressOrTrivial(SILValue v) {
   return v->getType().isAddress() ||
          v->getOwnershipKind() == OwnershipKind::None;
@@ -319,19 +377,26 @@ bool swift::findExtendedUsesOfSimpleBorrowedValue(
   return true;
 }
 
+// TODO: refactor this with SSAPrunedLiveness::computeLiveness.
 bool swift::findUsesOfSimpleValue(SILValue value,
                                   SmallVectorImpl<Operand *> *usePoints) {
   for (auto *use : value->getUses()) {
-    if (use->getOperandOwnership() == OperandOwnership::Borrow) {
+    switch (use->getOperandOwnership()) {
+    case OperandOwnership::PointerEscape:
+      return false;
+    case OperandOwnership::Borrow:
       if (!BorrowingOperand(use).visitScopeEndingUses([&](Operand *end) {
-            if (end->getOperandOwnership() == OperandOwnership::Reborrow) {
-              return false;
-            }
-            usePoints->push_back(end);
-            return true;
-          })) {
+        if (end->getOperandOwnership() == OperandOwnership::Reborrow) {
+          return false;
+        }
+        usePoints->push_back(end);
+        return true;
+      })) {
         return false;
       }
+      break;
+    default:
+      break;
     }
     usePoints->push_back(use);
   }
@@ -688,22 +753,23 @@ llvm::raw_ostream &swift::operator<<(llvm::raw_ostream &os,
 }
 
 /// Add this scopes live blocks into the PrunedLiveness result.
-void BorrowedValue::computeLiveness(PrunedLiveness &liveness) const {
-  liveness.initializeDefBlock(value->getParentBlock());
+void BorrowedValue::
+computeTransitiveLiveness(MultiDefPrunedLiveness &liveness) const {
+  liveness.initializeDef(value);
   visitTransitiveLifetimeEndingUses([&](Operand *endOp) {
     if (endOp->getOperandOwnership() == OperandOwnership::EndBorrow) {
       liveness.updateForUse(endOp->getUser(), /*lifetimeEnding*/ true);
       return true;
     }
     assert(endOp->getOperandOwnership() == OperandOwnership::Reborrow);
-    auto *succBlock = cast<BranchInst>(endOp->getUser())->getDestBB();
-    liveness.initializeDefBlock(succBlock);
+    PhiOperand phiOper(endOp);
+    liveness.initializeDef(phiOper.getValue());
     liveness.updateForUse(endOp->getUser(), /*lifetimeEnding*/ false);
     return true;
   });
 }
 
-bool BorrowedValue::areUsesWithinTransitiveScope(
+bool BorrowedValue::areUsesWithinExtendedScope(
     ArrayRef<Operand *> uses, DeadEndBlocks *deadEndBlocks) const {
   // First make sure that we actually have a local scope. If we have a non-local
   // scope, then we have something (like a SILFunctionArgument) where a larger
@@ -714,8 +780,8 @@ bool BorrowedValue::areUsesWithinTransitiveScope(
     return true;
 
   // Compute the local scope's liveness.
-  PrunedLiveness liveness;
-  computeLiveness(liveness);
+  MultiDefPrunedLiveness liveness(value->getFunction());
+  computeTransitiveLiveness(liveness);
   return liveness.areUsesWithinBoundary(uses, deadEndBlocks);
 }
 
@@ -857,6 +923,10 @@ bool BorrowedValue::visitInteriorPointerOperandHelper(
   return true;
 }
 
+// FIXME: This does not yet assume complete lifetimes. Therefore, it currently
+// recursively looks through scoped uses, such as load_borrow. We should
+// separate the logic for lifetime completion from the logic that can assume
+// complete lifetimes.
 AddressUseKind
 swift::findTransitiveUsesForAddress(SILValue projectedAddress,
                                     SmallVectorImpl<Operand *> *foundUses,
@@ -936,7 +1006,7 @@ swift::findTransitiveUsesForAddress(SILValue projectedAddress,
         isa<InitExistentialAddrInst>(user) || isa<InitEnumDataAddrInst>(user) ||
         isa<BeginAccessInst>(user) || isa<TailAddrInst>(user) ||
         isa<IndexAddrInst>(user) || isa<StoreBorrowInst>(user) ||
-        isa<UncheckedAddrCastInst>(user)) {
+        isa<UncheckedAddrCastInst>(user) || isa<MarkMustCheckInst>(user)) {
       transitiveResultUses(op);
       continue;
     }
@@ -953,10 +1023,12 @@ swift::findTransitiveUsesForAddress(SILValue projectedAddress,
     // If we have a load_borrow, add it's end scope to the liveness requirement.
     if (auto *lbi = dyn_cast<LoadBorrowInst>(user)) {
       if (foundUses) {
-        for (Operand *use : lbi->getUses()) {
-          if (use->endsLocalBorrowScope()) {
-            leafUse(use);
-          }
+        // FIXME: if we can assume complete lifetimes, then this should be
+        // as simple as:
+        //   for (Operand *use : lbi->getUses()) {
+        //     if (use->endsLocalBorrowScope()) {
+        if (!findInnerTransitiveGuaranteedUses(lbi, foundUses)) {
+          result = meet(result, AddressUseKind::PointerEscape);
         }
       }
       continue;
@@ -998,7 +1070,7 @@ swift::findTransitiveUsesForAddress(SILValue projectedAddress,
     if (onError) {
       (*onError)(op);
     }
-    result = AddressUseKind::Unknown;
+    result = meet(result, AddressUseKind::Unknown);
   }
   return result;
 }
@@ -1015,13 +1087,21 @@ bool AddressOwnership::areUsesWithinLifetime(
   SILValue root = base.getOwnershipReferenceRoot();
   BorrowedValue borrow(root);
   if (borrow)
-    return borrow.areUsesWithinTransitiveScope(uses, &deadEndBlocks);
+    return borrow.areUsesWithinExtendedScope(uses, &deadEndBlocks);
 
-  // --- A reference no borrow scope. Currently happens for project_box.
+  // --- A reference with no borrow scope! Currently happens for project_box.
 
   // Compute the reference value's liveness.
-  PrunedLiveness liveness;
-  liveness.computeSSALiveness(root);
+  SSAPrunedLiveness liveness;
+  liveness.initializeDef(root);
+  SimpleLiveRangeSummary summary = liveness.computeSimple();
+  // Conservatively ignore InnerBorrowKind::Reborrowed and
+  // AddressUseKind::PointerEscape and Reborrowed. The resulting liveness at
+  // least covers the known uses.
+  (void)summary;
+
+  // FIXME (implicit borrow): handle reborrows transitively just like above so
+  // we don't bail out if a uses is within the reborrowed scope.
   return liveness.areUsesWithinBoundary(uses, &deadEndBlocks);
 }
 

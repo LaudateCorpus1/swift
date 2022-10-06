@@ -12,12 +12,12 @@
 
 import SILBridging
 
-public struct VTable : CustomStringConvertible, CustomReflectable {
+public struct VTable : CustomStringConvertible, NoReflectionChildren {
   let bridged: BridgedVTable
 
   public init(bridged: BridgedVTable) { self.bridged = bridged }
 
-  public struct Entry : CustomStringConvertible, CustomReflectable {
+  public struct Entry : CustomStringConvertible, NoReflectionChildren {
     fileprivate let bridged: BridgedVTableEntry
     
     public var function: Function { SILVTableEntry_getFunction(bridged).function }
@@ -26,8 +26,6 @@ public struct VTable : CustomStringConvertible, CustomReflectable {
       let stdString = SILVTableEntry_debugDescription(bridged)
       return String(_cxxString: stdString)
     }
-
-    public var customMirror: Mirror { Mirror(self, children: []) }
   }
 
   public struct EntryArray : BridgedRandomAccessCollection {
@@ -37,7 +35,7 @@ public struct VTable : CustomStringConvertible, CustomReflectable {
     public var endIndex: Int { return Int(bridgedArray.numElements) }
     
     public subscript(_ index: Int) -> Entry {
-      precondition(index >= 0 && index < endIndex)
+      assert(index >= 0 && index < endIndex)
       return Entry(bridged: BridgedVTableEntry(ptr: bridgedArray.data! + index &* BridgedVTableEntrySize))
     }
   }
@@ -50,6 +48,4 @@ public struct VTable : CustomStringConvertible, CustomReflectable {
     let stdString = SILVTable_debugDescription(bridged)
     return String(_cxxString: stdString)
   }
-
-  public var customMirror: Mirror { Mirror(self, children: []) }
 }

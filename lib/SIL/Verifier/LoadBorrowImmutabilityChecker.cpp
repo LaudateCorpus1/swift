@@ -169,6 +169,17 @@ bool GatherWritesVisitor::visitUse(Operand *op, AccessUseType useTy) {
     }
     return true;
 
+  case SILInstructionKind::ExplicitCopyAddrInst:
+    if (cast<ExplicitCopyAddrInst>(user)->getDest() == op->get()) {
+      writeAccumulator.push_back(op);
+      return true;
+    }
+    // This operand is the copy source. Check if it is taken.
+    if (cast<ExplicitCopyAddrInst>(user)->isTakeOfSrc()) {
+      writeAccumulator.push_back(op);
+    }
+    return true;
+
   case SILInstructionKind::MarkUnresolvedMoveAddrInst:
     if (cast<MarkUnresolvedMoveAddrInst>(user)->getDest() == op->get()) {
       writeAccumulator.push_back(op);
@@ -318,8 +329,8 @@ bool LoadBorrowImmutabilityAnalysis::isImmutableInScope(
                            : SILValue();
 
   BorrowedValue borrowedValue(lbi);
-  PrunedLiveness borrowLiveness;
-  borrowedValue.computeLiveness(borrowLiveness);
+  MultiDefPrunedLiveness borrowLiveness(lbi->getFunction());
+  borrowedValue.computeTransitiveLiveness(borrowLiveness);
 
   // Then for each write...
   for (auto *op : *writes) {
@@ -335,7 +346,7 @@ bool LoadBorrowImmutabilityAnalysis::isImmutableInScope(
         continue;
     }
 
-    if (borrowLiveness.isWithinBoundaryOfDef(write, lbi)) {
+    if (borrowLiveness.isWithinBoundary(write)) {
       llvm::errs() << "Write: " << *write;
       return false;
     }

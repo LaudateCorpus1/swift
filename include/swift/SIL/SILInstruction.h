@@ -3858,7 +3858,53 @@ public:
     return OperandValueArrayRef(getAllOperands());
   }
 };
-  
+
+/// Increments a given profiler counter for a given PGO function name. This is
+/// lowered to the \c llvm.instrprof.increment LLVM intrinsic.
+class IncrementProfilerCounterInst final
+    : public InstructionBase<SILInstructionKind::IncrementProfilerCounterInst,
+                             NonValueInstruction>,
+      private llvm::TrailingObjects<IncrementProfilerCounterInst, char> {
+  friend TrailingObjects;
+  friend SILBuilder;
+
+  unsigned CounterIdx;
+  unsigned PGOFuncNameLength;
+  unsigned NumCounters;
+  uint64_t PGOFuncHash;
+
+  IncrementProfilerCounterInst(SILDebugLocation Loc, unsigned CounterIdx,
+                               unsigned PGOFuncNameLength, unsigned NumCounters,
+                               uint64_t PGOFuncHash)
+      : InstructionBase(Loc), CounterIdx(CounterIdx),
+        PGOFuncNameLength(PGOFuncNameLength), NumCounters(NumCounters),
+        PGOFuncHash(PGOFuncHash) {}
+
+  static IncrementProfilerCounterInst *
+  create(SILDebugLocation Loc, unsigned CounterIdx, StringRef PGOFuncName,
+         unsigned NumCounters, uint64_t PGOFuncHash, SILModule &M);
+
+public:
+  /// The index of the counter to be incremented.
+  unsigned getCounterIndex() const { return CounterIdx; }
+
+  /// The PGO function name for the function in which the counter resides.
+  StringRef getPGOFuncName() const {
+    return StringRef(getTrailingObjects<char>(), PGOFuncNameLength);
+  }
+
+  /// The total number of counters within the function.
+  unsigned getNumCounters() const { return NumCounters; }
+
+  /// A hash value for the function used to determine whether the profile is
+  /// outdated.
+  /// FIXME: This is currently always 0.
+  uint64_t getPGOFuncHash() const { return PGOFuncHash; }
+
+  ArrayRef<Operand> getAllOperands() const { return {}; }
+  MutableArrayRef<Operand> getAllOperands() { return {}; }
+};
+
 /// Initializes a SIL global variable. Only valid once, before any
 /// usages of the global via GlobalAddrInst.
 class AllocGlobalInst
@@ -4631,6 +4677,9 @@ class AssignByWrapperInst
   USE_SHARED_UINT8;
 
 public:
+  /// The kind of a wrapper that is being applied.
+  enum class Originator : uint8_t { TypeWrapper, PropertyWrapper };
+
   enum Mode {
     /// The mode is not decided yet (by DefiniteInitialization).
     Unknown,
@@ -4650,12 +4699,17 @@ public:
   };
 
 private:
-  AssignByWrapperInst(SILDebugLocation DebugLoc, SILValue Src, SILValue Dest,
-                       SILValue Initializer, SILValue Setter, Mode mode);
+  Originator originator;
+
+  AssignByWrapperInst(SILDebugLocation DebugLoc, Originator origin,
+                      SILValue Src, SILValue Dest, SILValue Initializer,
+                      SILValue Setter, Mode mode);
 
 public:
   SILValue getInitializer() { return Operands[2].get(); }
   SILValue getSetter() { return  Operands[3].get(); }
+
+  Originator getOriginator() const { return originator; }
 
   Mode getMode() const {
     return Mode(sharedUInt8().AssignByWrapperInst.mode);
@@ -4786,13 +4840,15 @@ class DebugValueInst final
   USE_SHARED_UINT8;
 
   DebugValueInst(SILDebugLocation DebugLoc, SILValue Operand,
-                 SILDebugVariable Var, bool poisonRefs, bool operandWasMoved);
+                 SILDebugVariable Var, bool poisonRefs, bool operandWasMoved,
+                 bool trace);
   static DebugValueInst *create(SILDebugLocation DebugLoc, SILValue Operand,
                                 SILModule &M, SILDebugVariable Var,
-                                bool poisonRefs, bool operandWasMoved);
+                                bool poisonRefs, bool operandWasMoved,
+                                bool trace);
   static DebugValueInst *createAddr(SILDebugLocation DebugLoc, SILValue Operand,
                                     SILModule &M, SILDebugVariable Var,
-                                    bool operandWasMoved);
+                                    bool operandWasMoved, bool trace);
 
   SIL_DEBUG_VAR_SUPPLEMENT_TRAILING_OBJS_IMPL()
 
@@ -4868,6 +4924,12 @@ public:
 
   void setPoisonRefs(bool poisonRefs = true) {
     sharedUInt8().DebugValueInst.poisonRefs = poisonRefs;
+  }
+
+  bool hasTrace() const { return sharedUInt8().DebugValueInst.trace; }
+
+  void setTrace(bool trace = true) {
+    sharedUInt8().DebugValueInst.trace = trace;
   }
 };
 
@@ -5048,7 +5110,14 @@ public:
 /// to hold %1 values.
 ///
 /// %token is an opaque word representing the previously bound types of this
-/// memory region, before binding it to a contiguous region of type $T.
+/// memory region, before binding it to a contiguous region of type $T. This
+/// token has no purpose unless it is consumed be a rebind_memory instruction.
+///
+/// Semantics: changes the type information assocated with a memory region. This
+/// affects all memory operations that alias with the given region of memory,
+/// regardless of their type or address provenance. For optimizations that query
+/// side effects, this is equivalent to writing and immediately reading an
+/// unknown value to memory at `%0` of `%1` bytes.
 class BindMemoryInst final : public InstructionBaseWithTrailingOperands<
                                  SILInstructionKind::BindMemoryInst,
                                  BindMemoryInst, SingleValueInstruction> {
@@ -5096,6 +5165,9 @@ public:
 ///
 /// %out_token represents the previously bound types of this memory region,
 /// before binding it to %in_token.
+///
+/// This has the same semantics as bind_memory except that the size of memory
+/// affected must be derived from `%in_token`.
 class RebindMemoryInst final : public SingleValueInstruction {
   FixedOperandList<2> Operands;
 
@@ -5294,9 +5366,18 @@ class AddressToPointerInst
                                 ConversionInst>
 {
   friend SILBuilder;
+  USE_SHARED_UINT8;
 
-  AddressToPointerInst(SILDebugLocation DebugLoc, SILValue Operand, SILType Ty)
-      : UnaryInstructionBase(DebugLoc, Operand, Ty) {}
+  AddressToPointerInst(SILDebugLocation DebugLoc, SILValue Operand, SILType Ty,
+                       bool needsStackProtection)
+      : UnaryInstructionBase(DebugLoc, Operand, Ty) {
+        sharedUInt8().AddressToPointerInst.needsStackProtection = needsStackProtection;
+      }
+
+public:
+  bool needsStackProtection() const {
+    return sharedUInt8().AddressToPointerInst.needsStackProtection;
+  }
 };
 
 /// PointerToAddressInst - Convert a Builtin.RawPointer value to a SIL address.
@@ -8076,11 +8157,20 @@ class IndexAddrInst
     : public InstructionBase<SILInstructionKind::IndexAddrInst,
                              IndexingInst> {
   friend SILBuilder;
+  USE_SHARED_UINT8;
 
   enum { Base, Index };
 
-  IndexAddrInst(SILDebugLocation DebugLoc, SILValue Operand, SILValue Index)
-      : InstructionBase(DebugLoc, Operand->getType(), Operand, Index) {}
+  IndexAddrInst(SILDebugLocation DebugLoc, SILValue Operand, SILValue Index,
+                bool needsStackProtection)
+      : InstructionBase(DebugLoc, Operand->getType(), Operand, Index) {
+    sharedUInt8().IndexAddrInst.needsStackProtection = needsStackProtection;
+  }
+
+public:
+  bool needsStackProtection() const {
+    return sharedUInt8().IndexAddrInst.needsStackProtection;
+  }
 };
 
 /// TailAddrInst - like IndexingInst, but aligns-up the resulting address to a
@@ -9518,6 +9608,34 @@ public:
     }
     llvm_unreachable("invalid derivative kind");
   }
+
+  
+  /// Returns true iff the operand corresponding to the given extractee kind
+  /// exists.
+  bool hasExtractee(NormalDifferentiableFunctionTypeComponent extractee) const {
+    switch (extractee) {
+    case NormalDifferentiableFunctionTypeComponent::Original:
+      return true;
+    case NormalDifferentiableFunctionTypeComponent::JVP:
+    case NormalDifferentiableFunctionTypeComponent::VJP:
+      return hasDerivativeFunctions();
+    }
+    llvm_unreachable("invalid extractee kind");
+  }
+
+  /// Returns the operand corresponding to the given extractee kind.
+  SILValue
+  getExtractee(NormalDifferentiableFunctionTypeComponent extractee) const {
+    switch (extractee) {
+    case NormalDifferentiableFunctionTypeComponent::Original:
+      return getOriginalFunction();
+    case NormalDifferentiableFunctionTypeComponent::JVP:
+      return getJVPFunction();
+    case NormalDifferentiableFunctionTypeComponent::VJP:
+      return getVJPFunction();
+    }
+    llvm_unreachable("invalid extractee kind");
+  }
 };
 
 /// LinearFunctionInst - given a function, its derivative and transpose functions,
@@ -9557,6 +9675,31 @@ public:
   SILValue getTransposeFunction() const {
     assert(HasTransposeFunction);
     return getOperand(1);
+  }
+
+  
+  /// Returns true iff the operand corresponding to the given extractee kind
+  /// exists.
+  bool hasExtractee(LinearDifferentiableFunctionTypeComponent extractee) const {
+    switch (extractee) {
+    case LinearDifferentiableFunctionTypeComponent::Original:
+      return true;
+    case LinearDifferentiableFunctionTypeComponent::Transpose:
+      return hasTransposeFunction();
+    }
+    llvm_unreachable("invalid extractee kind");
+  }
+
+  /// Returns the operand corresponding to the given extractee kind.
+  SILValue
+  getExtractee(LinearDifferentiableFunctionTypeComponent extractee) const {
+    switch (extractee) {
+    case LinearDifferentiableFunctionTypeComponent::Original:
+      return getOriginalFunction();
+    case LinearDifferentiableFunctionTypeComponent::Transpose:
+      return getTransposeFunction();
+    }
+    llvm_unreachable("invalid extractee kind");
   }
 };
 

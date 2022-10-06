@@ -1,6 +1,6 @@
 // RUN: %empty-directory(%t)
 
-// RUN: %target-swift-frontend %S/swift-functions-errors.swift -typecheck -module-name Functions -clang-header-expose-public-decls -emit-clang-header-path %t/functions.h
+// RUN: %target-swift-frontend %S/swift-functions-errors.swift -typecheck -module-name Functions -clang-header-expose-decls=all-public -emit-clang-header-path %t/functions.h
 
 // RUN: %target-interop-build-clangxx -c %s -I %t -o %t/swift-functions-errors-execution.o
 // RUN: %target-interop-build-swift %S/swift-functions-errors.swift -o %t/swift-functions-errors-execution -Xlinker %t/swift-functions-errors-execution.o -module-name Functions -Xfrontend -entry-point-function-name -Xfrontend swiftMain
@@ -21,19 +21,22 @@ int main() {
 
   try {
     Functions::emptyThrowFunction();
-  } catch (swift::_impl::NaiveException& e) {
-    printf("%s\n", e.getMessage());
+  } catch (swift::Error& e) {
+    printf("Exception\n");
   }
   try {
     Functions::throwFunction();
-  } catch (swift::_impl::NaiveException& e) {
-    printf("%s\n", e.getMessage());
+  } catch (swift::Error& e) {
+     printf("Exception\n");
   }
   try {
     Functions::throwFunctionWithReturn();
-  } catch (swift::_impl::NaiveException& e) {
-    printf("%s\n", e.getMessage());
+  } catch (swift::Error& e) {
+     printf("Exception\n");
   }
+  try {
+    Functions::testDestroyedError();
+  } catch(const swift::Error &e) { }
 
   return 0;
 }
@@ -43,3 +46,4 @@ int main() {
 // CHECK-NEXT: Exception
 // CHECK-NEXT: passThrowFunctionWithReturn
 // CHECK-NEXT: Exception
+// CHECK-NEXT: Test destroyed

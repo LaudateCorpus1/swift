@@ -315,3 +315,30 @@ do {
     }
   }
 }
+
+// rdar://99282938
+func test_implicit_conversion_clash_with_partial_application_check() {
+  class C {
+    var duration: CGFloat { 0.3 }
+
+    var use: Double {
+      duration // Ok
+    }
+
+    func transitionDuration() -> TimeInterval {
+      duration // Ok
+    }
+  }
+}
+
+// rdar://99352676
+func test_init_validation() {
+  class Foo {
+    static let bar = 100.0
+
+    func getBar() -> CGFloat? {
+      return Self.bar
+      // CHECK: function_ref @$s12CoreGraphics7CGFloatVyACSdcfC : $@convention(method) (Double, @thin CGFloat.Type) -> CGFloat
+    }
+  }
+}

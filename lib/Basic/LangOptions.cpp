@@ -29,6 +29,13 @@
 
 using namespace swift;
 
+LangOptions::LangOptions() {
+  // Note: Introduce default-on language options here.
+#ifndef NDEBUG
+  Features.insert(Feature::ParserRoundTrip);
+#endif
+}
+
 struct SupportedConditionalValue {
   StringRef value;
 

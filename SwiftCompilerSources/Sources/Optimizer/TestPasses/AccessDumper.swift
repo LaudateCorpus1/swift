@@ -48,47 +48,40 @@ let accessDumper = FunctionPass(name: "dump-access", {
   print("End accesses for \(function.name)")
 })
 
-private struct AccessStoragePathVisitor : AccessStoragePathWalker {
+private struct AccessStoragePathVisitor : ValueUseDefWalker {
   var walkUpCache = WalkerCache<Path>()
-  mutating func visit(access: AccessStoragePath) {
-    print("    Storage: \(access.storage)")
-    print("    Path: \"\(access.path)\"")
+  mutating func rootDef(value: Value, path: SmallProjectionPath) -> WalkResult {
+    print("    Storage: \(value)")
+    print("    Path: \"\(path)\"")
+    return .continueWalk
   }
 }
 
 private func printAccessInfo(address: Value) {
   print("Value: \(address)")
 
-  var apw = AccessPathWalker()
-  let (ap, scope) = apw.getAccessPathWithScope(of: address)
-  if let scope = scope {
-    switch scope {
-    case let .scope(ba):
-      print("  Scope: \(ba)")
-    case .base(_):
-      print("  Scope: base")
-    }
+  let (ap, scope) = address.accessPathWithScope
+  if let beginAccess = scope {
+    print("  Scope: \(beginAccess)")
+  } else {
+    print("  Scope: base")
   }
 
-  if let ap = ap {
-    print("  Base: \(ap.base)")
-    print("  Path: \"\(ap.projectionPath)\"")
+  print("  Base: \(ap.base)")
+  print("  Path: \"\(ap.projectionPath)\"")
 
-    var arw = AccessStoragePathVisitor()
-    if !arw.visitAccessStorageRoots(of: ap) {
-      print("   no Storage paths")
-    }
+  var arw = AccessStoragePathVisitor()
+  if !arw.visitAccessStorageRoots(of: ap) {
+    print("   no Storage paths")
   }
 }
 
 private func checkAliasInfo(forArgumentsOf apply: ApplyInst, expectDistinct: Bool) {
   let address1 = apply.arguments[0]
   let address2 = apply.arguments[1]
-  var apw = AccessPathWalker()
-  guard let path1 = apw.getAccessPath(of: address1),
-        let path2 = apw.getAccessPath(of: address2) else {
-    return
-  }
+  let path1 = address1.accessPath
+  let path2 = address2.accessPath
+
   if path1.isDistinct(from: path2) != expectDistinct {
     print("wrong isDistinct result of \(apply)")
   } else if path2.isDistinct(from: path1) != expectDistinct {

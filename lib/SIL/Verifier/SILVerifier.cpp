@@ -985,24 +985,6 @@ public:
     return InstNumbers[a] < InstNumbers[b];
   }
 
-  // FIXME: For sanity, address-type phis should be prohibited at all SIL
-  // stages. However, the optimizer currently breaks the invariant in three
-  // places:
-  // 1. Normal Simplify CFG during conditional branch simplification
-  //    (sneaky jump threading).
-  // 2. Simplify CFG via Jump Threading.
-  // 3. Loop Rotation.
-  //
-  // BasicBlockCloner::canCloneInstruction and sinkAddressProjections is
-  // designed to avoid this issue, we just need to make sure all passes use it
-  // correctly.
-  //
-  // Minimally, we must prevent address-type phis as long as access markers are
-  // preserved. A goal is to preserve access markers in OSSA.
-  bool prohibitAddressPhis() {
-    return F.hasOwnership();
-  }
-
   void visitSILPhiArgument(SILPhiArgument *arg) {
     // Verify that the `isPhiArgument` property is sound:
     // - Phi arguments come from branches.
@@ -1026,7 +1008,7 @@ public:
                 "All phi argument inputs must be from branches.");
       }
     }
-    if (arg->isPhi() && prohibitAddressPhis()) {
+    if (arg->isPhi()) {
       // As a property of well-formed SIL, we disallow address-type
       // phis. Supporting them would prevent reliably reasoning about the
       // underlying storage of memory access. This reasoning is important for
@@ -2017,22 +1999,6 @@ public:
       return;
     }
 
-    if (builtinKind == BuiltinValueKind::Move) {
-      // We expect that this builtin will be specialized during transparent
-      // inlining into move_value if we inline into a non-generic context. If
-      // the builtin still remains and is not in the specific move semantic
-      // function (which is the only function marked with
-      // semantics::LIFETIMEMANAGEMENT_MOVE), then we know that we did
-      // transparent inlining into a function that did not result in the Builtin
-      // being specialized out which is user error.
-      //
-      // NOTE: Once we have opaque values, this restriction will go away. This
-      // is just so we can call Builtin.move outside of the stdlib.
-      auto semanticName = semantics::LIFETIMEMANAGEMENT_MOVE;
-      require(BI->getFunction()->hasSemanticsAttr(semanticName),
-              "_move used within a generic context");
-    }
-
     if (builtinKind == BuiltinValueKind::Copy) {
       // We expect that this builtin will be specialized during transparent
       // inlining into explicit_copy_value if we inline into a non-generic
@@ -2294,7 +2260,7 @@ public:
   }
 
   bool checkScopedAddressUses(ScopedAddressValue scopedAddress,
-                              PrunedLiveness *scopedAddressLiveness,
+                              SSAPrunedLiveness *scopedAddressLiveness,
                               DeadEndBlocks *deadEndBlocks) {
     SmallVector<Operand *, 4> uses;
     findTransitiveUsesForAddress(scopedAddress.value, &uses);
@@ -2478,9 +2444,22 @@ public:
     require(isa<AllocStackInst>(SI->getDest()),
             "store_borrow destination can only be an alloc_stack");
 
-    PrunedLiveness scopedAddressLiveness;
+    SSAPrunedLiveness scopedAddressLiveness;
     ScopedAddressValue scopedAddress(SI);
-    bool success = scopedAddress.computeLiveness(scopedAddressLiveness);
+    // FIXME: Reenable @test_load_borrow_store_borrow_nested in
+    // store_borrow_verify_errors once computeLivess can successfully handle a
+    // store_borrow within a load_borrow. This can be fixed in two ways
+    //
+    // (1) With complete lifetimes, this no longer needs to perform transitive
+    // liveness at all.
+    //
+    // (2) findInnerTransitiveGuaranteedUses, which ends up being called on the
+    // load_borrow to compute liveness, can be taught to transitively process
+    // InteriorPointer uses instead of returning PointerEscape. We need to make
+    // sure all uses of the utility need to handle this first.
+    AddressUseKind useKind =
+        scopedAddress.computeTransitiveLiveness(scopedAddressLiveness);
+    bool success = useKind == AddressUseKind::NonEscaping;
 
     require(!success || checkScopedAddressUses(
                             scopedAddress, &scopedAddressLiveness, &DEBlocks),
@@ -2544,11 +2523,13 @@ public:
             "assign instruction can only exist in raw SIL");
     require(Dest->getType().isAddress(), "Must store to an address dest");
 
-    SILValue initFn = AI->getInitializer();
-    CanSILFunctionType initTy = initFn->getType().castTo<SILFunctionType>();
-    SILFunctionConventions initConv(initTy, AI->getModule());
-    checkAssignByWrapperArgs(Src->getType(), initConv);
-    switch (initConv.getNumIndirectSILResults()) {
+    if (AI->getOriginator() ==
+        AssignByWrapperInst::Originator::PropertyWrapper) {
+      SILValue initFn = AI->getInitializer();
+      CanSILFunctionType initTy = initFn->getType().castTo<SILFunctionType>();
+      SILFunctionConventions initConv(initTy, AI->getModule());
+      checkAssignByWrapperArgs(Src->getType(), initConv);
+      switch (initConv.getNumIndirectSILResults()) {
       case 0:
         require(initConv.getNumDirectSILResults() == 1,
                 "wrong number of init function results");
@@ -2569,6 +2550,13 @@ public:
         break;
       default:
         require(false, "wrong number of indirect init function results");
+      }
+    } else {
+      require(AI->getOriginator() ==
+                  AssignByWrapperInst::Originator::TypeWrapper,
+              "wrong originator");
+      require(isa<SILUndef>(AI->getInitializer()),
+              "assignment via type wrapper does not have initializer");
     }
 
     SILValue setterFn = AI->getSetter();
@@ -4760,8 +4748,18 @@ public:
         if (F.getModule().getStage() != SILStage::Lowered) {
           // During the lowered stage, a function type might have different
           // signature
-          require(eltArgTy == bbArgTy,
-                  "switch_enum destination bbarg must match case arg type");
+          //
+          // We allow for move only wrapped enums to have trivial payloads that
+          // are not move only wrapped. This occurs since we want to lower
+          // trivial move only wrapped types earlier in the pipeline than
+          // non-trivial types.
+          if (bbArgTy.isTrivial(F)) {
+            require(eltArgTy == bbArgTy.copyingMoveOnlyWrapper(eltArgTy),
+                    "switch_enum destination bbarg must match case arg type");
+          } else {
+            require(eltArgTy == bbArgTy,
+                    "switch_enum destination bbarg must match case arg type");
+          }
         }
         require(!dest->getArguments()[0]->getType().isAddress(),
                 "switch_enum destination bbarg type must not be an address");

@@ -16,6 +16,7 @@
 #include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsFrontend.h"
+#include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/DiagnosticsDriver.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/ModuleDependencies.h"
@@ -177,7 +178,8 @@ resolveDirectDependencies(CompilerInstance &instance, ModuleDependencyID module,
     // Figure out what kind of module we need.
     bool onlyClangModule = !isSwift || module.first == dependsOn;
     if (auto found = ctx.getModuleDependencies(dependsOn, onlyClangModule,
-                                               cache, ASTDelegate, cacheOnly)) {
+                                               cache, ASTDelegate, cacheOnly,
+                                               module)) {
       result.insert({dependsOn, found->getKind()});
     }
   }
@@ -1108,8 +1110,10 @@ forEachBatchEntry(CompilerInstance &invocationInstance,
       }
       newGlobalCache->configureForTriple(
           newInstance->getInvocation().getLangOptions().Target.str());
+      
+      auto mainModuleName = newInstance->getMainModule()->getNameStr();
       auto newLocalCache = std::make_unique<ModuleDependenciesCache>(
-          *newGlobalCache, newInstance->getMainModule()->getNameStr());
+          *newGlobalCache, mainModuleName);
       pInstance = newInstance.get();
       pCache = newLocalCache.get();
       subInstanceMap->insert(

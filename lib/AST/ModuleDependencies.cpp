@@ -225,6 +225,15 @@ void ModuleDependencies::addBridgingModuleDependency(
   }
 }
 
+GlobalModuleDependenciesCache::GlobalModuleDependenciesCache()
+  : clangScanningService(
+                         clang::tooling::dependencies::ScanningMode::DependencyDirectivesScan,
+                         clang::tooling::dependencies::ScanningOutputFormat::Full,
+                         clang::CASOptions(),
+                         /* Cache */ nullptr,
+                         /* SharedFS */ nullptr,
+                         /* ReuseFileManager */ false,
+                         /* OptimizeArgs */ false) {}
 GlobalModuleDependenciesCache::TargetSpecificGlobalCacheState *
 GlobalModuleDependenciesCache::getCurrentCache() const {
   assert(CurrentTriple.hasValue() &&
@@ -388,6 +397,9 @@ GlobalModuleDependenciesCache::findSourceModuleDependency(
 
 bool GlobalModuleDependenciesCache::hasDependencies(
     StringRef moduleName, ModuleLookupSpecifics details) const {
+  assert(details.kind != ModuleDependenciesKind::Clang &&
+         "Attempting to query Clang dependency in persistent Dependency "
+         "Scanner Cache.");
   return findDependencies(moduleName, details).hasValue();
 }
 
@@ -397,6 +409,9 @@ GlobalModuleDependenciesCache::findAllDependenciesIrrespectiveOfSearchPaths(
   if (!kind) {
     for (auto kind = ModuleDependenciesKind::FirstKind;
          kind != ModuleDependenciesKind::LastKind; ++kind) {
+      if (kind == ModuleDependenciesKind::Clang)
+        continue;
+
       auto deps =
           findAllDependenciesIrrespectiveOfSearchPaths(moduleName, kind);
       if (deps.hasValue())
@@ -446,6 +461,10 @@ static std::string modulePathForVerification(const ModuleDependencies &module) {
 const ModuleDependencies *GlobalModuleDependenciesCache::recordDependencies(
     StringRef moduleName, ModuleDependencies dependencies) {
   auto kind = dependencies.getKind();
+  assert(kind != ModuleDependenciesKind::Clang &&
+         "Attempting to cache Clang dependency in persistent Dependency "
+         "Scanner Cache.");
+
   // Source-based dependencies are recorded independently of the invocation's
   // target triple.
   if (kind == swift::ModuleDependenciesKind::SwiftSource) {
@@ -482,6 +501,10 @@ const ModuleDependencies *GlobalModuleDependenciesCache::recordDependencies(
 const ModuleDependencies *GlobalModuleDependenciesCache::updateDependencies(
     ModuleDependencyID moduleID, ModuleDependencies dependencies) {
   auto kind = dependencies.getKind();
+  assert(kind != ModuleDependenciesKind::Clang &&
+         "Attempting to update Clang dependency in persistent Dependency "
+         "Scanner Cache.");
+
   // Source-based dependencies
   if (kind == swift::ModuleDependenciesKind::SwiftSource) {
     assert(SwiftSourceModuleDependenciesMap.count(moduleID.first) == 1 &&
@@ -518,8 +541,10 @@ ModuleDependenciesCache::getDependencyReferencesMap(
 
 ModuleDependenciesCache::ModuleDependenciesCache(
     GlobalModuleDependenciesCache &globalCache,
-    StringRef mainModuleName)
-    : globalCache(globalCache), mainModuleName(mainModuleName) {
+    StringRef mainScanModuleName)
+    : globalCache(globalCache),
+      mainScanModuleName(mainScanModuleName),
+      clangScanningTool(globalCache.clangScanningService) {
   for (auto kind = ModuleDependenciesKind::FirstKind;
        kind != ModuleDependenciesKind::LastKind; ++kind) {
     ModuleDependenciesMap.insert(
@@ -572,12 +597,29 @@ void ModuleDependenciesCache::recordDependencies(
   // The underlying Clang module needs to be cached in this invocation,
   // but should not make it to the global cache since it will look slightly
   // differently for clients of this module than it does for the module itself.
-  const ModuleDependencies* recordedDependencies;
-  if (moduleName == mainModuleName && dependencies.isClangModule()) {
-    underlyingClangModuleDependency = std::make_unique<ModuleDependencies>(std::move(dependencies));
-    recordedDependencies = underlyingClangModuleDependency.get();
+  const ModuleDependencies *recordedDependencies;
+  if (dependencies.getKind() == ModuleDependenciesKind::Clang) {
+    auto *clangDep = dependencies.getAsClangModule();
+    assert(clangDep && "Unexpected NULL Clang dependency.");
+    // Cache may already have a dependency for this module
+    if (clangModuleDependencies.count(moduleName) != 0) {
+      // Do not record duplicate dependencies.
+      auto newModulePath = clangDep->moduleMapFile;
+      for (auto &existingDeps : clangModuleDependencies[moduleName]) {
+        if (modulePathForVerification(existingDeps) == newModulePath)
+          return;
+      }
+      clangModuleDependencies[moduleName].emplace_back(std::move(dependencies));
+      recordedDependencies = clangModuleDependencies[moduleName].end() - 1;
+    } else {
+      clangModuleDependencies.insert(
+          {moduleName, ModuleDependenciesVector{std::move(dependencies)}});
+      recordedDependencies = &(clangModuleDependencies[moduleName].front());
+    }
+
   } else
-    recordedDependencies = globalCache.recordDependencies(moduleName, dependencies);
+    recordedDependencies =
+        globalCache.recordDependencies(moduleName, dependencies);
 
   auto &map = getDependencyReferencesMap(dependenciesKind);
   assert(map.count(moduleName) == 0 && "Already added to map");

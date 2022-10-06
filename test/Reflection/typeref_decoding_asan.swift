@@ -1,6 +1,6 @@
 // XFAIL: OS=linux-gnu && CPU=aarch64
 
-// Temporarily disable on arm64e (rdar://89754240)
+// rdar://100805115
 // UNSUPPORTED: CPU=arm64e
 
 // REQUIRES: asan_runtime

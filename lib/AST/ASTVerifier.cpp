@@ -110,7 +110,7 @@ struct is_apply_subscript_or_autoclosure_expr
 };
 
 template <typename Verifier, typename Kind>
-std::pair<bool, Expr *> dispatchVisitPreExprHelper(
+ASTWalker::PreWalkResult<Expr *> dispatchVisitPreExprHelper(
     Verifier &V,
     typename std::enable_if<
         is_apply_expr<typename std::remove_pointer<Kind>::type>::value,
@@ -119,14 +119,14 @@ std::pair<bool, Expr *> dispatchVisitPreExprHelper(
     // Record any inout_to_pointer or array_to_pointer that we see in
     // the proper position.
     V.maybeRecordValidPointerConversion(node->getArgs());
-    return {true, node};
+    return ASTWalker::Action::Continue(node);
   }
   V.cleanup(node);
-  return {false, node};
+  return ASTWalker::Action::SkipChildren(node);
 }
 
 template <typename Verifier, typename Kind>
-std::pair<bool, Expr *> dispatchVisitPreExprHelper(
+ASTWalker::PreWalkResult<Expr *> dispatchVisitPreExprHelper(
     Verifier &V,
     typename std::enable_if<
         is_subscript_expr<typename std::remove_pointer<Kind>::type>::value,
@@ -135,14 +135,14 @@ std::pair<bool, Expr *> dispatchVisitPreExprHelper(
     // Record any inout_to_pointer or array_to_pointer that we see in
     // the proper position.
     V.maybeRecordValidPointerConversion(node->getArgs());
-    return {true, node};
+    return ASTWalker::Action::Continue(node);
   }
   V.cleanup(node);
-  return {false, node};
+  return ASTWalker::Action::SkipChildren(node);
 }
 
 template <typename Verifier, typename Kind>
-std::pair<bool, Expr *> dispatchVisitPreExprHelper(
+ASTWalker::PreWalkResult<Expr *> dispatchVisitPreExprHelper(
     Verifier &V,
     typename std::enable_if<
         is_autoclosure_expr<typename std::remove_pointer<Kind>::type>::value,
@@ -151,23 +151,23 @@ std::pair<bool, Expr *> dispatchVisitPreExprHelper(
     // Record any inout_to_pointer or array_to_pointer that we see in
     // the proper position.
     V.maybeRecordValidPointerConversionForArg(node->getSingleExpressionBody());
-    return {true, node};
+    return ASTWalker::Action::Continue(node);
   }
   V.cleanup(node);
-  return {false, node};
+  return ASTWalker::Action::SkipChildren(node);
 }
 
 template <typename Verifier, typename Kind>
-std::pair<bool, Expr *> dispatchVisitPreExprHelper(
+ASTWalker::PreWalkResult<Expr *> dispatchVisitPreExprHelper(
     Verifier &V, typename std::enable_if<
                      !is_apply_subscript_or_autoclosure_expr<
                          typename std::remove_pointer<Kind>::type>::value,
                      Kind>::type node) {
   if (V.shouldVerify(node)) {
-    return {true, node};
+    return ASTWalker::Action::Continue(node);
   }
   V.cleanup(node);
-  return {false, node};
+  return ASTWalker::Action::SkipChildren(node);
 }
 
 namespace {
@@ -240,6 +240,17 @@ class Verifier : public ASTWalker {
     pushScope(DC);
   }
 
+  /// Emit an error message and abort, optionally dumping the expression.
+  /// \param E if non-null, the expression to dump() followed by a new-line.
+  void error(llvm::StringRef msg, Expr *E = nullptr) {
+    Out << msg << "\n";
+    if (E) {
+      E->dump(Out);
+      Out << "\n";
+    }
+    abort();
+  }
+
 public:
   Verifier(ModuleDecl *M, DeclContext *DC)
       : Verifier(PointerUnion<ModuleDecl *, SourceFile *>(M), DC) {}
@@ -253,7 +264,7 @@ public:
     return Verifier(topDC->getParentModule(), DC);
   }
 
-  std::pair<bool, Expr *> walkToExprPre(Expr *E) override {
+  PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
     switch (E->getKind()) {
 #define DISPATCH(ID) return dispatchVisitPreExpr(static_cast<ID##Expr*>(E))
 #define EXPR(ID, PARENT) \
@@ -271,7 +282,7 @@ public:
       llvm_unreachable("not all cases handled!");
     }
 
-    Expr *walkToExprPost(Expr *E) override {
+    PostWalkResult<Expr *> walkToExprPost(Expr *E) override {
       switch (E->getKind()) {
 #define DISPATCH(ID) return dispatchVisitPost(static_cast<ID##Expr*>(E))
 #define EXPR(ID, PARENT) \
@@ -289,7 +300,7 @@ public:
       llvm_unreachable("not all cases handled!");
     }
 
-    std::pair<bool, Stmt *> walkToStmtPre(Stmt *S) override {
+    PreWalkResult<Stmt *> walkToStmtPre(Stmt *S) override {
       switch (S->getKind()) {
 #define DISPATCH(ID) return dispatchVisitPreStmt(static_cast<ID##Stmt*>(S))
 #define STMT(ID, PARENT) \
@@ -301,7 +312,7 @@ public:
       llvm_unreachable("not all cases handled!");
     }
 
-    Stmt *walkToStmtPost(Stmt *S) override {
+  PostWalkResult<Stmt *> walkToStmtPost(Stmt *S) override {
       switch (S->getKind()) {
 #define DISPATCH(ID) return dispatchVisitPost(static_cast<ID##Stmt*>(S))
 #define STMT(ID, PARENT) \
@@ -313,7 +324,7 @@ public:
       llvm_unreachable("not all cases handled!");
     }
 
-    std::pair<bool, Pattern*> walkToPatternPre(Pattern *P) override {
+    PreWalkResult<Pattern *> walkToPatternPre(Pattern *P) override {
       switch (P->getKind()) {
 #define DISPATCH(ID) \
         return dispatchVisitPrePattern(static_cast<ID##Pattern*>(P))
@@ -326,7 +337,7 @@ public:
       llvm_unreachable("not all cases handled!");
     }
 
-    Pattern *walkToPatternPost(Pattern *P) override {
+  PostWalkResult<Pattern *> walkToPatternPost(Pattern *P) override {
       switch (P->getKind()) {
 #define DISPATCH(ID) \
         return dispatchVisitPost(static_cast<ID##Pattern*>(P))
@@ -339,7 +350,7 @@ public:
       llvm_unreachable("not all cases handled!");
     }
 
-    bool walkToDeclPre(Decl *D) override {
+    PreWalkAction walkToDeclPre(Decl *D) override {
       switch (D->getKind()) {
 #define DISPATCH(ID) return dispatchVisitPre(static_cast<ID##Decl*>(D))
 #define DECL(ID, PARENT) \
@@ -351,9 +362,9 @@ public:
       llvm_unreachable("not all cases handled!");
     }
 
-    bool walkToDeclPost(Decl *D) override {
+    PostWalkAction walkToDeclPost(Decl *D) override {
       switch (D->getKind()) {
-#define DISPATCH(ID) return dispatchVisitPost(static_cast<ID##Decl*>(D))
+#define DISPATCH(ID) return dispatchVisitPost(static_cast<ID##Decl*>(D)).Action
 #define DECL(ID, PARENT) \
       case DeclKind::ID: \
         DISPATCH(ID);
@@ -367,44 +378,44 @@ public:
     /// Helper template for dispatching pre-visitation.
     /// If we're visiting in pre-order, don't validate the node yet;
     /// just check whether we should stop further descent.
-    template <class T> bool dispatchVisitPre(T node) {
+    template <class T> PreWalkAction dispatchVisitPre(T node) {
       if (shouldVerify(node))
-        return true;
+        return Action::Continue();
       cleanup(node);
-      return false;
+      return Action::SkipChildren();
     }
 
     /// Helper template for dispatching pre-visitation.
     ///
     /// If we're visiting in pre-order, don't validate the node yet;
     /// just check whether we should stop further descent.
-    template <class T> std::pair<bool, Expr *> dispatchVisitPreExpr(T node) {
+    template <class T> PreWalkResult<Expr *> dispatchVisitPreExpr(T node) {
       return dispatchVisitPreExprHelper<Verifier, T>(*this, node);
     }
 
     /// Helper template for dispatching pre-visitation.
     /// If we're visiting in pre-order, don't validate the node yet;
     /// just check whether we should stop further descent.
-    template <class T> std::pair<bool, Stmt *> dispatchVisitPreStmt(T node) {
+    template <class T> PreWalkResult<Stmt *> dispatchVisitPreStmt(T node) {
       if (shouldVerify(node))
-        return { true, node };
+        return Action::Continue(node);
       cleanup(node);
-      return { false, node };
+      return Action::SkipChildren(node);
     }
 
     /// Helper template for dispatching pre-visitation.
     /// If we're visiting in pre-order, don't validate the node yet;
     /// just check whether we should stop further descent.
     template <class T>
-    std::pair<bool, Pattern *> dispatchVisitPrePattern(T node) {
+  PreWalkResult<Pattern *> dispatchVisitPrePattern(T node) {
       if (shouldVerify(node))
-        return { true, node };
+        return Action::Continue(node);
       cleanup(node);
-      return { false, node };
+      return Action::SkipChildren(node);
     }
 
     /// Helper template for dispatching post-visitation.
-    template <class T> T dispatchVisitPost(T node) {
+    template <class T> PostWalkResult<T> dispatchVisitPost(T node) {
       // Verify source ranges if the AST node was parsed from source.
       auto *SF = M.dyn_cast<SourceFile *>();
       if (SF) {
@@ -432,7 +443,7 @@ public:
       cleanup(node);
 
       // Always continue.
-      return node;
+      return Action::Continue(node);
     }
 
     // Default cases for whether we should verify within the given subtree.
@@ -1019,7 +1030,9 @@ public:
 
     void checkConditionElement(const StmtConditionElement &elt) {
       switch (elt.getKind()) {
-      case StmtConditionElement::CK_Availability: break;
+      case StmtConditionElement::CK_Availability:
+      case StmtConditionElement::CK_HasSymbol:
+        break;
       case StmtConditionElement::CK_Boolean: {
         auto *E = elt.getBoolean();
         if (shouldVerifyChecked(E))
@@ -2076,18 +2089,18 @@ public:
       verifyCheckedBase(E);
     }
 
-    void verifyChecked(IfExpr *E) {
-      PrettyStackTraceExpr debugStack(Ctx, "verifying IfExpr", E);
+    void verifyChecked(TernaryExpr *E) {
+      PrettyStackTraceExpr debugStack(Ctx, "verifying TernaryExpr", E);
 
       auto condTy = E->getCondExpr()->getType();
       if (!condTy->isBool()) {
-        Out << "IfExpr condition is not Bool\n";
+        Out << "TernaryExpr condition is not Bool\n";
         abort();
       }
 
       checkSameType(E->getThenExpr()->getType(),
                     E->getElseExpr()->getType(),
-                    "then and else branches of an if-expr");
+                    "then and else branches of a TernaryExpr");
       verifyCheckedBase(E);
     }
     
@@ -2304,6 +2317,34 @@ public:
       }
 
       verifyCheckedBase(E);
+    }
+
+    void verifyChecked(ABISafeConversionExpr *E) {
+      PrettyStackTraceExpr debugStack(Ctx, "verify ABISafeConversionExpr", E);
+
+      auto toType = E->getType();
+      auto fromType = E->getSubExpr()->getType();
+
+      if (!fromType->hasLValueType())
+        error("conversion source must be an l-value", E);
+
+      if (!toType->hasLValueType())
+        error("conversion result must be an l-value", E);
+
+      {
+        // At the moment, "ABI Safe" means concurrency features can be stripped.
+        // Since we don't know how deeply the stripping is happening, to verify
+        // in a fuzzy way, strip everything to see if they're the same type.
+        auto strippedFrom = fromType->getRValueType()
+                                    ->stripConcurrency(/*recurse*/true,
+                                                       /*dropGlobalActor*/true);
+        auto strippedTo = toType->getRValueType()
+                                ->stripConcurrency(/*recurse*/true,
+                                                   /*dropGlobalActor*/true);
+
+        if (!strippedFrom->isEqual(strippedTo))
+          error("possibly non-ABI safe conversion", E);
+      }
     }
 
     void verifyChecked(ValueDecl *VD) {
@@ -3101,8 +3142,9 @@ public:
       PrettyStackTraceDecl debugStack("verifying DestructorDecl", DD);
 
       auto *ND = DD->getDeclContext()->getSelfNominalTypeDecl();
-      if (!isa<ClassDecl>(ND) && !DD->isInvalid()) {
-        Out << "DestructorDecls outside classes should be marked invalid";
+      if (!isa<ClassDecl>(ND) && !ND->isMoveOnly() && !DD->isInvalid()) {
+        Out << "DestructorDecls outside classes/move only types should be "
+               "marked invalid\n";
         abort();
       }
       verifyCheckedBase(DD);

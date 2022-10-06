@@ -88,6 +88,10 @@ void MapOpaqueArchetypes::replace() {
     SILType mappedType = remapType(origArg->getType());
     auto *NewArg = clonedEntryBlock->createFunctionArgument(
         mappedType, origArg->getDecl(), true);
+    NewArg->setNoImplicitCopy(
+        cast<SILFunctionArgument>(origArg)->isNoImplicitCopy());
+    NewArg->setLifetimeAnnotation(
+        cast<SILFunctionArgument>(origArg)->getLifetimeAnnotation());
     entryArgs.push_back(NewArg);
   }
 
@@ -336,6 +340,7 @@ static bool hasOpaqueArchetype(TypeExpansionContext context,
   case SILInstructionKind::DifferentiabilityWitnessFunctionInst:
   case SILInstructionKind::BeginCOWMutationInst:
   case SILInstructionKind::EndCOWMutationInst:
+  case SILInstructionKind::IncrementProfilerCounterInst:
   case SILInstructionKind::GetAsyncContinuationInst:
   case SILInstructionKind::GetAsyncContinuationAddrInst:
   case SILInstructionKind::AwaitAsyncContinuationInst:

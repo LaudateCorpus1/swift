@@ -395,7 +395,7 @@ static bool isGuaranteedLexicalValue(SILValue src) {
 /// The lifetime cannot be ended during this if we don't have enough information
 /// to end it.  That can occur when the running value associated with a
 /// store_borrow does not have a borrow, because the source already guarantees
-/// lexical lifetime or we have a load which was not preceeded by a store in the
+/// lexical lifetime or we have a load which was not preceded by a store in the
 /// basic block.  In that case, the lifetime end will be added later, when we
 /// have enough information, namely the live in values, to end it.
 static bool canEndLexicalLifetime(LiveValues values) { return values.borrow; }
@@ -420,8 +420,8 @@ beginLexicalLifetimeAfterStore(AllocStackInst *asi, SILInstruction *inst) {
     if (isGuaranteedLexicalValue(sbi->getSrc())) {
       return {{stored, SILValue(), SILValue()}, /*isStorageValid*/ true};
     }
-    auto *borrow = SILBuilderWithScope(sbi).createBeginBorrow(
-        loc, stored, /*isLexical*/ true);
+    auto *borrow = SILBuilderWithScope(sbi->getNextInstruction())
+                       .createBeginBorrow(loc, stored, /*isLexical*/ true);
     return {{stored, borrow, SILValue()}, /*isStorageValid*/ true};
   }
   BeginBorrowInst *bbi = nullptr;
@@ -537,7 +537,7 @@ class StackAllocationPromoter {
   BlockToInstMap<> initializationPoints;
 
   /// The first instruction in each block that deinitializes the storage that is
-  /// not preceeded by an instruction that initializes it.
+  /// not preceded by an instruction that initializes it.
   ///
   /// That includes:
   ///     store
@@ -676,7 +676,7 @@ SILInstruction *StackAllocationPromoter::promoteAllocationInBlock(
             endOwnedLexicalLifetimeBeforeInst(asi, /*beforeInstruction=*/li,
                                               ctx, runningVals->value);
           } else {
-            // If we dont't have enough information, end it endLexicalLifetime.
+            // If we don't have enough information, end it endLexicalLifetime.
             assert(!deinitializationPoints[blockPromotingWithin]);
             deinitializationPoints[blockPromotingWithin] = li;
           }
@@ -794,6 +794,11 @@ SILInstruction *StackAllocationPromoter::promoteAllocationInBlock(
       if (!sbi) {
         continue;
       }
+      if (sbi->getDest() != asi) {
+        continue;
+      }
+      assert(!deinitializationPoints[blockPromotingWithin]);
+      deinitializationPoints[blockPromotingWithin] = inst;
       if (!runningVals.hasValue()) {
         continue;
       }
@@ -802,8 +807,6 @@ SILInstruction *StackAllocationPromoter::promoteAllocationInBlock(
       }
       // Mark storage as invalid and mark end_borrow as a deinit point.
       runningVals->isStorageValid = false;
-      assert(!deinitializationPoints[blockPromotingWithin]);
-      deinitializationPoints[blockPromotingWithin] = inst;
       if (!canEndLexicalLifetime(runningVals->value)) {
         continue;
       }
@@ -1267,7 +1270,7 @@ void StackAllocationPromoter::endLexicalLifetime(BlockSetVector &phiBlocks) {
   // have live-in or live-out values.
   //
   // Visiting the incoming and outgoing edges works as follows in the above
-  // example:  The worklist is initialiized with {(bb1, ::Out), (bb2, ::Out)}.
+  // example:  The worklist is initialized with {(bb1, ::Out), (bb2, ::Out)}.
   // When visiting (bb1, ::Out), we see that bb1 is neither unreachable nor
   // has exactly one successor without live-in values.  So we add (bb2, ::In) to
   // the worklist.  Next, we visit (bb2, ::Out).  We see that it _also_ doesn't
@@ -1821,6 +1824,9 @@ void MemoryToRegisters::removeSingleBlockAllocation(AllocStackInst *asi) {
     if (auto *ebi = dyn_cast<EndBorrowInst>(inst)) {
       auto *sbi = dyn_cast<StoreBorrowInst>(ebi->getOperand());
       if (!sbi) {
+        continue;
+      }
+      if (sbi->getDest() != asi) {
         continue;
       }
       if (!runningVals.hasValue()) {
