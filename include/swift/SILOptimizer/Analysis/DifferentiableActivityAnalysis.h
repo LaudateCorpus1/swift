@@ -83,7 +83,7 @@ public:
   }
 
   virtual bool shouldInvalidate(SILAnalysis::InvalidationKind k) override {
-    return k & InvalidationKind::Everything;
+    return k & InvalidationKind::FunctionBody;
   }
 
   virtual std::unique_ptr<DifferentiableActivityCollection>
@@ -141,7 +141,7 @@ private:
     // Look up conformance in the current module.
     auto lookupConformance =
         LookUpConformanceInModule(getFunction().getModule().getSwiftModule());
-    return type->getAutoDiffTangentSpace(lookupConformance).hasValue();
+    return type->getAutoDiffTangentSpace(lookupConformance).has_value();
   }
 
   /// Perform analysis and populate variedness and usefulness sets.

@@ -17,6 +17,7 @@ import Parse
 @_cdecl("initializeSwiftModules")
 public func initializeSwiftModules() {
   registerSILClasses()
+  registerSwiftAnalyses()
   registerSwiftPasses()
   initializeSwiftParseModules()
 }
@@ -74,4 +75,9 @@ private func registerSwiftPasses() {
   registerPass(deadEndBlockDumper, { deadEndBlockDumper.run($0) })
   registerPass(rangeDumper, { rangeDumper.run($0) })
   registerPass(runUnitTests, { runUnitTests.run($0) })
+  registerPass(testInstructionIteration, { testInstructionIteration.run($0) })
+}
+
+private func registerSwiftAnalyses() {
+  CalleeAnalysis.register()
 }

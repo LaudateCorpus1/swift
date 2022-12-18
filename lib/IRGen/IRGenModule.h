@@ -79,6 +79,7 @@ namespace clang {
   class Decl;
   class GlobalDecl;
   class Type;
+  class ObjCProtocolDecl;
   class PointerAuthSchema;
   namespace CodeGen {
     class CGFunctionInfo;
@@ -95,7 +96,7 @@ namespace swift {
   class BraceStmt;
   class CanType;
   class GeneratedModule;
-  struct GenericRequirement;
+  class GenericRequirement;
   class LinkLibrary;
   class SILFunction;
   class IRGenOptions;
@@ -103,6 +104,7 @@ namespace swift {
   class ProtocolConformance;
   class ProtocolCompositionType;
   class RootProtocolConformance;
+  class SILCoverageMap;
   struct SILDeclRef;
   class SILDefaultWitnessTable;
   class SILDifferentiabilityWitness;
@@ -349,11 +351,7 @@ public:
   void addGenModule(SourceFile *SF, IRGenModule *IGM);
   
   /// Get an IRGenModule for a source file.
-  IRGenModule *getGenModule(SourceFile *SF) {
-    IRGenModule *IGM = GenModules[SF];
-    assert(IGM);
-    return IGM;
-  }
+  IRGenModule *getGenModule(SourceFile *SF);
 
   SourceFile *getSourceFile(IRGenModule *module) {
     for (auto pair : GenModules) {
@@ -1083,6 +1081,9 @@ public:
                                           SILLocation diagLoc);
   llvm::Constant *getAddrOfOpaqueTypeDescriptor(OpaqueTypeDecl *opaqueType,
                                                 ConstantInit forDefinition);
+  llvm::Constant *
+  emitClangProtocolObject(const clang::ObjCProtocolDecl *objcProtocol);
+
   ConstantReference getConstantReferenceForProtocolDescriptor(ProtocolDecl *proto);
 
   ConstantIntegerLiteral getConstantIntegerLiteral(APInt value);
@@ -1477,7 +1478,7 @@ public:
   void maybeEmitOpaqueTypeDecl(OpaqueTypeDecl *D);
 
   void emitSILGlobalVariable(SILGlobalVariable *gv);
-  void emitCoverageMapping();
+  void emitCoverageMaps(ArrayRef<const SILCoverageMap *> Mappings);
   void emitSILFunction(SILFunction *f);
   void emitSILWitnessTable(SILWitnessTable *wt);
   void emitSILProperty(SILProperty *prop);
@@ -1567,6 +1568,8 @@ public:
                                       llvm::Constant *dependsOn);
   void appendLLVMUsedConditionalEntry(llvm::GlobalVariable *var,
                                       const ProtocolConformance *conformance);
+
+  void setColocateMetadataSection(llvm::Function *f);
 
   llvm::Constant *
   getAddrOfTypeMetadata(CanType concreteType,
@@ -1734,6 +1737,14 @@ public:
   ConstantReference
   getAddrOfLLVMVariableOrGOTEquivalent(LinkEntity entity);
 
+  llvm::Constant *getAddrOfLLVMVariable(LinkEntity entity,
+                                        ConstantInit definition,
+                                        DebugTypeInfo debugType,
+                                        llvm::Type *overrideDeclType = nullptr);
+  llvm::Constant *getAddrOfLLVMVariable(LinkEntity entity,
+                                        ForDefinition_t forDefinition,
+                                        DebugTypeInfo debugType);
+
   llvm::Constant *emitRelativeReference(ConstantReference target,
                                         llvm::GlobalValue *base,
                                         ArrayRef<unsigned> baseIndices);
@@ -1786,14 +1797,7 @@ private:
   getAddrOfSharedContextDescriptor(LinkEntity entity,
                                    ConstantInit definition,
                                    llvm::function_ref<void()> emit);
-  
-  llvm::Constant *getAddrOfLLVMVariable(LinkEntity entity,
-                                        ConstantInit definition,
-                                        DebugTypeInfo debugType,
-                                        llvm::Type *overrideDeclType = nullptr);
-  llvm::Constant *getAddrOfLLVMVariable(LinkEntity entity,
-                                        ForDefinition_t forDefinition,
-                                        DebugTypeInfo debugType);
+
   ConstantReference getAddrOfLLVMVariable(LinkEntity entity,
                                         ConstantInit definition,
                                         DebugTypeInfo debugType,
@@ -1822,6 +1826,7 @@ public:
   void emitRuntimeRegistration();
   void emitVTableStubs();
   void emitTypeVerifier();
+  llvm::Function *emitHasSymbolFunction(ValueDecl *decl);
 
   /// Create llvm metadata which encodes the branch weights given by
   /// \p TrueCount and \p FalseCount.

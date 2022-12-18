@@ -156,7 +156,11 @@ namespace {
 
     TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
                                           SILType T) const override {
-      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
+      if (!IGM.getOptions().ForceStructTypeLayouts) {
+        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T);
+      }
+      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T,
+                                                        ScalarKind::POD);
     }
 
     bool mayHaveExtraInhabitants(IRGenModule &IGM) const override {
@@ -223,7 +227,15 @@ namespace {
 
     TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
                                         SILType T) const override {
-      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
+      if (!IGM.getOptions().ForceStructTypeLayouts) {
+        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T);
+      } else if (isPOD(ResilienceExpansion::Maximal)) {
+        return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T,
+                                                           ScalarKind::POD);
+      } else {
+        return IGM.typeLayoutCache.getOrCreateScalarEntry(
+            *this, T, ScalarKind::ThickFunc);
+      }
     }
 
     static Size getFirstElementSize(IRGenModule &IGM) {
@@ -375,7 +387,7 @@ namespace {
       auto mask = BitPatternBuilder(IGM.Triple.isLittleEndian());
       mask.appendSetBits(pointerSize.getValueInBits());
       mask.appendClearBits(pointerSize.getValueInBits());
-      return mask.build().getValue();
+      return mask.build().value();
     }
   };
 
@@ -388,17 +400,20 @@ namespace {
     BlockTypeInfo(CanSILFunctionType ty,
                   llvm::PointerType *storageType,
                   Size size, SpareBitVector spareBits, Alignment align)
-      : HeapTypeInfo(storageType, size, spareBits, align),
-        FuncSignatureInfo(ty)
-    {
-    }
+      : HeapTypeInfo(ReferenceCounting::Block, storageType, size, spareBits,
+                     align),
+        FuncSignatureInfo(ty) {}
 
     ReferenceCounting getReferenceCounting() const {
       return ReferenceCounting::Block;
     }
     TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
                                         SILType T) const override {
-      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
+      if (!IGM.getOptions().ForceStructTypeLayouts) {
+        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T);
+      }
+      return IGM.typeLayoutCache.getOrCreateScalarEntry(
+          *this, T, ScalarKind::BlockReference);
     }
   };
   
@@ -420,7 +435,11 @@ namespace {
     
     TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
                                         SILType T) const override {
-      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
+      if (!IGM.getOptions().ForceStructTypeLayouts) {
+        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T);
+      }
+      return IGM.typeLayoutCache.getOrCreateScalarEntry(
+          *this, T, ScalarKind::BlockStorage);
     }
     // The lowered type should be an LLVM struct comprising the block header
     // (IGM.ObjCBlockStructTy) as its first element and the capture as its
@@ -688,7 +707,6 @@ CanType irgen::getArgumentLoweringType(CanType type, SILParameterInfo paramInfo,
   // closures don't take ownership of their arguments so we just capture the
   // address.
   case ParameterConvention::Indirect_In:
-  case ParameterConvention::Indirect_In_Constant:
   case ParameterConvention::Indirect_In_Guaranteed:
     if (isNoEscape)
       return CanInOutType::get(type);
@@ -1322,7 +1340,6 @@ static llvm::Value *emitPartialApplicationForwarder(IRGenModule &IGM,
   case ParameterConvention::Indirect_Inout:
   case ParameterConvention::Indirect_InoutAliasable:
   case ParameterConvention::Indirect_In:
-  case ParameterConvention::Indirect_In_Constant:
   case ParameterConvention::Indirect_In_Guaranteed:
     llvm_unreachable("indirect callables not supported");
   }
@@ -1431,7 +1448,6 @@ static llvm::Value *emitPartialApplicationForwarder(IRGenModule &IGM,
     auto argConvention = conventions[nextCapturedField++];
     switch (argConvention) {
     case ParameterConvention::Indirect_In:
-    case ParameterConvention::Indirect_In_Constant:
     case ParameterConvention::Direct_Owned:
       if (!consumesContext) subIGF.emitNativeStrongRetain(rawData, subIGF.getDefaultAtomicity());
       break;
@@ -1519,8 +1535,7 @@ static llvm::Value *emitPartialApplicationForwarder(IRGenModule &IGM,
       
       Explosion param;
       switch (fieldConvention) {
-      case ParameterConvention::Indirect_In:
-      case ParameterConvention::Indirect_In_Constant: {
+      case ParameterConvention::Indirect_In: {
 
         auto initStackCopy = [&addressesToDeallocate, &needsAllocas, &param,
                               &subIGF](const TypeInfo &fieldTI, SILType fieldTy,
@@ -2076,7 +2091,6 @@ Optional<StackAddress> irgen::emitFunctionPartialApplication(
       switch (argConventions[i]) {
       // Take indirect value arguments out of memory.
       case ParameterConvention::Indirect_In:
-      case ParameterConvention::Indirect_In_Constant:
       case ParameterConvention::Indirect_In_Guaranteed: {
         if (outType->isNoEscape()) {
           cast<LoadableTypeInfo>(fieldLayout.getType())

@@ -403,7 +403,7 @@ public:
   /// Keeps track of the mapping of source variables to -O0 shadow copy allocas.
   llvm::SmallDenseMap<StackSlotKey, Address, 8> ShadowStackSlots;
   llvm::SmallDenseMap<llvm::Value *, Address, 8> TaskAllocStackSlots;
-  llvm::SmallDenseMap<Decl *, SmallString<4>, 8> AnonymousVariables;
+  llvm::SmallDenseMap<Decl *, Identifier, 8> AnonymousVariables;
   /// To avoid inserting elements into ValueDomPoints twice.
   llvm::SmallDenseSet<llvm::Value *, 8> ValueVariables;
   /// Holds the DominancePoint of values that are storage for a source variable.
@@ -653,15 +653,17 @@ public:
   }
 
   StringRef getOrCreateAnonymousVarName(VarDecl *Decl) {
-    llvm::SmallString<4> &Name = AnonymousVariables[Decl];
+    Identifier &Name = AnonymousVariables[Decl];
     if (Name.empty()) {
       {
-        llvm::raw_svector_ostream S(Name);
+        llvm::SmallString<64> NameBuffer;
+        llvm::raw_svector_ostream S(NameBuffer);
         S << "$_" << NumAnonVars++;
+        Name = IGM.Context.getIdentifier(NameBuffer);
       }
       AnonymousVariables.insert({Decl, Name});
     }
-    return Name;
+    return Name.str();
   }
 
   template <class DebugVarCarryingInst>
@@ -690,7 +692,10 @@ public:
       return;
 
     // Only do this at -Onone.
-    uint64_t Size = *AI->getAllocationSizeInBits(IGM.DataLayout) / 8;
+    auto optAllocationSize = AI->getAllocationSizeInBits(IGM.DataLayout);
+    if (!optAllocationSize)
+      return;
+    uint64_t Size = *optAllocationSize / 8;
     if (IGM.IRGen.Opts.shouldOptimize() || !Size)
       return;
 
@@ -894,7 +899,7 @@ public:
                          SILDebugVariable VarInfo,
                          llvm::Optional<Alignment> _Align, bool Init,
                          bool WasMoved) {
-    auto Align = _Align.getValueOr(IGM.getPointerAlignment());
+    auto Align = _Align.value_or(IGM.getPointerAlignment());
     unsigned ArgNo = VarInfo.ArgNo;
     auto &Alloca = ShadowStackSlots[{ArgNo, {Scope, VarInfo.Name}}];
 
@@ -911,6 +916,10 @@ public:
       if (nonPtrAllocaType != Storage->getType())
         Address = Builder.CreateElementBitCast(Address, Storage->getType());
     }
+
+    // This might happen because of non-loadable types.
+    if (Storage->stripPointerCasts()->getType() == Alloca.getElementType())
+      Storage = Storage->stripPointerCasts();
 
     assert(canAllocaStoreValue(Address, Storage, VarInfo, Scope) &&
            "bad scope?");
@@ -1384,6 +1393,11 @@ public:
   void visitLinearFunctionExtractInst(LinearFunctionExtractInst *i);
   void visitDifferentiabilityWitnessFunctionInst(
       DifferentiabilityWitnessFunctionInst *i);
+  void visitTestSpecificationInst(TestSpecificationInst *i) {
+    llvm_unreachable("test-only instruction in Lowered SIL?!");
+  }
+
+  void visitHasSymbolInst(HasSymbolInst *i);
 
 #define LOADABLE_REF_STORAGE_HELPER(Name)                                      \
   void visitRefTo##Name##Inst(RefTo##Name##Inst *i);                           \
@@ -2602,7 +2616,16 @@ void IRGenSILFunction::visitDifferentiabilityWitnessFunctionInst(
       Builder.CreateBitCast(diffWitness, signature.getType()->getPointerTo());
 
   setLoweredFunctionPointer(
-      i, FunctionPointer::createUnsigned(fnType, diffWitness, signature));
+      i, FunctionPointer::createUnsigned(fnType, diffWitness, signature, true));
+}
+
+void IRGenSILFunction::visitHasSymbolInst(HasSymbolInst *i) {
+  auto fn = IGM.emitHasSymbolFunction(i->getDecl());
+  llvm::CallInst *call = Builder.CreateCall(fn->getFunctionType(), fn, {});
+
+  Explosion e;
+  e.add(call);
+  setLoweredValue(i, e);
 }
 
 FunctionPointer::Kind irgen::classifyFunctionPointerKind(SILFunction *fn) {
@@ -3013,10 +3036,12 @@ Callee LoweredValue::getCallee(IRGenFunction &IGF,
 
     case SILFunctionType::Representation::WitnessMethod:
     case SILFunctionType::Representation::Thin:
-    case SILFunctionType::Representation::Closure:
     case SILFunctionType::Representation::Method:
       return getSwiftFunctionPointerCallee(IGF, functionValue, selfValue,
-                                           std::move(calleeInfo), false);
+                                           std::move(calleeInfo), false, false);
+    case SILFunctionType::Representation::Closure:
+      return getSwiftFunctionPointerCallee(IGF, functionValue, selfValue,
+                                           std::move(calleeInfo), false, true);
 
     case SILFunctionType::Representation::CFunctionPointer:
       assert(!selfValue && "C function pointer has self?");
@@ -3038,7 +3063,7 @@ Callee LoweredValue::getCallee(IRGenFunction &IGF,
     bool castToRefcountedContext = calleeInfo.OrigFnType->isNoEscape();
     return getSwiftFunctionPointerCallee(IGF, functionValue, contextValue,
                                          std::move(calleeInfo),
-                                         castToRefcountedContext);
+                                         castToRefcountedContext, true);
   }
 
   case LoweredValue::Kind::EmptyExplosion:
@@ -3521,7 +3546,6 @@ static bool isSimplePartialApply(IRGenFunction &IGF, PartialApplyInst *i) {
     // direct or indirect.
     switch (appliedParam.getConvention()) {
     case ParameterConvention::Indirect_Inout:
-    case ParameterConvention::Indirect_In_Constant:
     case ParameterConvention::Indirect_In_Guaranteed:
     case ParameterConvention::Indirect_InoutAliasable:
       // Indirect arguments are trivially word sized.
@@ -4853,9 +4877,7 @@ void IRGenSILFunction::emitErrorResultVar(CanSILFunctionType FnTy,
     return;
   auto DbgTy = DebugTypeInfo::getErrorResult(
       ErrorInfo.getReturnValueType(IGM.getSILModule(), FnTy,
-                                   IGM.getMaximalTypeExpansionContext()),
-      ErrorResultSlot->getType(), IGM.getPointerSize(),
-      IGM.getPointerAlignment());
+                                   IGM.getMaximalTypeExpansionContext()),IGM);
   IGM.DebugInfo->emitVariableDeclaration(Builder, Storage, DbgTy,
                                          getDebugScope(), {}, *Var,
                                          IndirectValue, ArtificialValue);
@@ -5245,9 +5267,8 @@ static llvm::Value *emitIsUnique(IRGenSILFunction &IGF, SILValue operand,
   auto &operTI = cast<LoadableTypeInfo>(IGF.getTypeInfo(operand->getType()));
   LoadedRef ref =
     operTI.loadRefcountedPtr(IGF, loc, IGF.getLoweredAddress(operand));
-
   return
-    IGF.emitIsUniqueCall(ref.getValue(), loc, ref.isNonNull());
+    IGF.emitIsUniqueCall(ref.getValue(), ref.getStyle(), loc, ref.isNonNull());
 }
 
 void IRGenSILFunction::visitIsUniqueInst(swift::IsUniqueInst *i) {
@@ -5278,7 +5299,7 @@ void IRGenSILFunction::visitBeginCOWMutationInst(BeginCOWMutationInst *i) {
       llvm::Value *castBuffer =
         Builder.CreateBitCast(buffer, IGM.getReferenceType(style));
 
-      isUnique.add(emitIsUniqueCall(castBuffer, i->getLoc().getSourceLoc(),
+      isUnique.add(emitIsUniqueCall(castBuffer, style, i->getLoc().getSourceLoc(),
                                     /*isNonNull*/ true));
     }
   } else {
@@ -5366,8 +5387,11 @@ void IRGenSILFunction::emitDebugInfoForAllocStack(AllocStackInst *i,
   assert(isa<llvm::AllocaInst>(addr) || isa<llvm::UndefValue>(addr) ||
          isa<llvm::IntrinsicInst>(addr) || isCallToSwiftTaskAlloc(addr));
 
-  auto Indirection =
-      InCoroContext(*CurSILFn, *i) ? CoroDirectValue : DirectValue;
+  auto Indirection = DirectValue;
+  if (InCoroContext(*CurSILFn, *i))
+    Indirection =
+        isCallToSwiftTaskAlloc(addr) ? CoroIndirectValue : CoroDirectValue;
+
   if (!IGM.IRGen.Opts.DisableDebuggerShadowCopies &&
       !IGM.IRGen.Opts.shouldOptimize())
     if (auto *Alloca = dyn_cast<llvm::AllocaInst>(addr))
@@ -5410,24 +5434,6 @@ void IRGenSILFunction::emitDebugInfoForAllocStack(AllocStackInst *i,
                                            IsFragmentType);
   } else
     return;
-
-  // Async functions use the value of the artificial address.
-  auto shadow = addr;
-  if (CurSILFn->isAsync() && emitLifetimeExtendingUse(shadow) &&
-      !isa<llvm::UndefValue>(shadow)) {
-    if (ValueVariables.insert(shadow).second)
-      ValueDomPoints.push_back({shadow, getActiveDominancePoint()});
-    auto shadowInst = cast<llvm::Instruction>(shadow);
-    llvm::IRBuilder<> builder(shadowInst->getNextNode());
-    llvm::Type *shadowTy = IGM.IntPtrTy;
-    if (auto *alloca = dyn_cast<llvm::AllocaInst>(shadow)) {
-      shadowTy = alloca->getAllocatedType();
-    } else if (isCallToSwiftTaskAlloc(shadow)) {
-      shadowTy = IGM.Int8Ty;
-    }
-    assert(shadowTy == shadow->getType()->getPointerElementType());
-    addr = builder.CreateLoad(shadowTy, shadow);
-  }
 
   bindArchetypes(DbgTy.getType());
   if (IGM.DebugInfo) {
@@ -6519,8 +6525,8 @@ void IRGenSILFunction::visitKeyPathInst(swift::KeyPathInst *I) {
     if (!I->getSubstitutions().empty()) {
       emitInitOfGenericRequirementsBuffer(*this, requirements, argsBuf,
         [&](GenericRequirement reqt) -> llvm::Value * {
-          return emitGenericRequirementFromSubstitutions(*this, sig,
-                                                         reqt, subs);
+          return emitGenericRequirementFromSubstitutions(*this, reqt, subs,
+                                                         MetadataState::Complete);
         });
     }
     
@@ -6854,7 +6860,7 @@ void IRGenSILFunction::visitWitnessMethodInst(swift::WitnessMethodInst *i) {
     }
 
     auto sig = IGM.getSignature(fnType);
-    auto fn = FunctionPointer::forDirect(fnType, fnPtr, secondaryValue, sig);
+    auto fn = FunctionPointer::forDirect(fnType, fnPtr, secondaryValue, sig, true);
 
     setLoweredFunctionPointer(i, fn);
     return;
@@ -7087,7 +7093,7 @@ void IRGenSILFunction::visitSuperMethodInst(swift::SuperMethodInst *i) {
     auto authInfo =
       PointerAuthInfo::emit(*this, schema, /*storageAddress=*/nullptr, method);
 
-    auto fn = FunctionPointer::createSigned(methodType, fnPtr, authInfo, sig);
+    auto fn = FunctionPointer::createSigned(methodType, fnPtr, authInfo, sig, true);
 
     setLoweredFunctionPointer(i, fn);
     return;
@@ -7149,8 +7155,10 @@ void IRGenSILFunction::visitClassMethodInst(swift::ClassMethodInst *i) {
       fnPtr = llvm::ConstantExpr::getBitCast(fnPtr, fnPtrType);
     }
 
-    auto sig = IGM.getSignature(methodType);
-    auto fn = FunctionPointer::createUnsigned(methodType, fnPtr, sig);
+    auto fnType = IGM.getSILTypes().getConstantFunctionType(
+      IGM.getMaximalTypeExpansionContext(), method);
+    auto sig = IGM.getSignature(fnType);
+    auto fn = FunctionPointer::createUnsigned(methodType, fnPtr, sig, true);
 
     setLoweredFunctionPointer(i, fn);
     return;

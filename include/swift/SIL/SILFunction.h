@@ -266,7 +266,7 @@ private:
   /// A monotonically increasing ID which is incremented whenever a
   /// BasicBlockBitfield or NodeBitfield is constructed.
   /// For details see SILBitfield::bitfieldID;
-  uint64_t currentBitfieldID = 1;
+  int64_t currentBitfieldID = 1;
 
   /// Unique identifier for vector indexing and deterministic sorting.
   /// May be reused when zombie functions are recovered.
@@ -520,8 +520,6 @@ public:
     return ReplacedFunction;
   }
 
-  static SILFunction *getFunction(SILDeclRef ref, SILModule &M);
-
   void setDynamicallyReplacedFunction(SILFunction *f) {
     assert(ReplacedFunction == nullptr && "already set");
     assert(!hasObjCReplacement());
@@ -576,9 +574,7 @@ public:
     Profiler = InheritedProfiler;
   }
 
-  void createProfiler(ASTNode Root, SILDeclRef Ref);
-
-  void discardProfiler() { Profiler = nullptr; }
+  void createProfiler(SILDeclRef Ref);
 
   ProfileCounter getEntryCount() const { return EntryCount; }
 
@@ -1057,6 +1053,7 @@ public:
   void copyEffects(SILFunction *from);
   bool hasArgumentEffects() const;
   void visitArgEffects(std::function<void(int, int, bool)> c) const;
+  SILInstruction::MemoryBehavior getMemoryBehavior(bool observeRetains);
 
   Purpose getSpecialPurpose() const { return specialPurpose; }
 

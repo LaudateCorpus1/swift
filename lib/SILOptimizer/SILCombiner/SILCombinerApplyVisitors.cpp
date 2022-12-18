@@ -668,7 +668,6 @@ bool SILCombiner::eraseApply(FullApplySite FAS, const UserListTy &Users) {
       auto Arg = FAS.getArgument(i);
       switch (PI.getConvention()) {
         case ParameterConvention::Indirect_In:
-        case ParameterConvention::Indirect_In_Constant:
         case ParameterConvention::Direct_Owned:
           Builder.emitDestroyOperation(FAS.getLoc(), Arg);
           break;
@@ -855,9 +854,9 @@ void SILCombiner::buildConcreteOpenedExistentialInfos(
 
     auto OptionalCOEI =
         buildConcreteOpenedExistentialInfo(Apply.getArgumentOperands()[ArgIdx]);
-    if (!OptionalCOEI.hasValue())
+    if (!OptionalCOEI.has_value())
       continue;
-    auto COEI = OptionalCOEI.getValue();
+    auto COEI = OptionalCOEI.value();
     assert(COEI.isValid());
     COEIs.try_emplace(ArgIdx, COEI);
   }

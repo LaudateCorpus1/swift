@@ -183,10 +183,12 @@ SwiftInt SILFunction_numParameterArguments(BridgedFunction function) {
 }
 
 SwiftInt SILFunction_getSelfArgumentIndex(BridgedFunction function) {
+  SILFunction *f = castToFunction(function);
+  SILFunctionConventions conv(f->getConventionsInContext());
   CanSILFunctionType fTy = castToFunction(function)->getLoweredFunctionType();
   if (!fTy->hasSelfParam())
     return -1;
-  return fTy->getNumParameters() + fTy->getNumIndirectFormalResults() - 1;
+  return conv.getNumParameters() + conv.getNumIndirectSILResults() - 1;
 }
 
 SwiftInt SILFunction_getNumSILArguments(BridgedFunction function) {
@@ -212,8 +214,6 @@ BridgedArgumentConvention SILArgumentConvention_getBridged(SILArgumentConvention
       return ArgumentConvention_Indirect_In_Guaranteed;
     case SILArgumentConvention::Indirect_In:
       return ArgumentConvention_Indirect_In;
-    case SILArgumentConvention::Indirect_In_Constant:
-      return ArgumentConvention_Indirect_In_Constant;
     case SILArgumentConvention::Indirect_Out:
       return ArgumentConvention_Indirect_Out;
     case SILArgumentConvention::Direct_Unowned:
@@ -390,8 +390,6 @@ static BridgedArgumentConvention bridgeArgumentConvention(SILArgumentConvention 
       return ArgumentConvention_Indirect_In_Guaranteed;
     case SILArgumentConvention::Indirect_In:
       return ArgumentConvention_Indirect_In;
-    case SILArgumentConvention::Indirect_In_Constant:
-      return ArgumentConvention_Indirect_In_Constant;
     case SILArgumentConvention::Indirect_Out:
       return ArgumentConvention_Indirect_Out;
     case SILArgumentConvention::Direct_Unowned:
@@ -709,19 +707,9 @@ std::string SILWitnessTableEntry_debugDescription(BridgedWitnessTableEntry entry
   return str;
 }
 
-SILWitnessTableEntryKind SILWitnessTableEntry_getKind(BridgedWitnessTableEntry entry) {
-  switch (castToWitnessTableEntry(entry)->getKind()) {
-    case SILWitnessTable::Invalid:
-      return SILWitnessTableEntry_Invalid;
-    case SILWitnessTable::Method:
-      return SILWitnessTableEntry_Method;
-    case SILWitnessTable::AssociatedType:
-      return SILWitnessTableEntry_AssociatedType;
-    case SILWitnessTable::AssociatedTypeProtocol:
-      return SILWitnessTableEntry_AssociatedTypeProtocol;
-    case SILWitnessTable::BaseProtocol:
-      return SILWitnessTableEntry_BaseProtocol;
-  }
+SILWitnessTable::WitnessKind
+SILWitnessTableEntry_getKind(BridgedWitnessTableEntry entry) {
+  return castToWitnessTableEntry(entry)->getKind();
 }
 
 OptionalBridgedFunction SILWitnessTableEntry_getMethodFunction(BridgedWitnessTableEntry entry) {
@@ -753,6 +741,10 @@ BridgedBasicBlock SILInstruction_getParent(BridgedInstruction inst) {
   assert(!i->isStaticInitializerInst() &&
          "cannot get the parent of a static initializer instruction");
   return {i->getParent()};
+}
+
+bool SILInstruction_isDeleted(BridgedInstruction inst) {
+  return castToInst(inst)->isDeleted();
 }
 
 BridgedArrayRef SILInstruction_getOperands(BridgedInstruction inst) {
@@ -815,8 +807,8 @@ SwiftInt LoadInst_getLoadOwnership(BridgedInstruction load) {
   return (SwiftInt)castToInst<LoadInst>(load)->getOwnershipQualifier();
 }
 
-BridgedBuiltinID BuiltinInst_getID(BridgedInstruction bi) {
-  return (BridgedBuiltinID)castToInst<BuiltinInst>(bi)->getBuiltinInfo().ID;
+BuiltinValueKind BuiltinInst_getID(BridgedInstruction bi) {
+  return castToInst<BuiltinInst>(bi)->getBuiltinInfo().ID;
 }
 
 SwiftInt AddressToPointerInst_needsStackProtection(BridgedInstruction atp) {
@@ -941,18 +933,8 @@ SwiftInt StoreInst_getStoreOwnership(BridgedInstruction store) {
   return (SwiftInt)castToInst<StoreInst>(store)->getOwnershipQualifier();
 }
 
-BridgedAccessKind BeginAccessInst_getAccessKind(BridgedInstruction beginAccess) {
-  auto kind = castToInst<BeginAccessInst>(beginAccess)->getAccessKind();
-  switch (kind) {
-    case SILAccessKind::Init:
-      return BridgedAccessKind::AccessKind_Init;
-    case SILAccessKind::Read:
-      return BridgedAccessKind::AccessKind_Read;
-    case SILAccessKind::Modify:
-      return BridgedAccessKind::AccessKind_Modify;
-    case SILAccessKind::Deinit:
-      return BridgedAccessKind::AccessKind_Deinit;
-  }
+SILAccessKind BeginAccessInst_getAccessKind(BridgedInstruction beginAccess) {
+  return castToInst<BeginAccessInst>(beginAccess)->getAccessKind();
 }
 
 SwiftInt BeginAccessInst_isStatic(BridgedInstruction beginAccess) {
@@ -1016,6 +998,12 @@ ApplySite_getArgumentConvention(BridgedInstruction inst, SwiftInt calleeArgIdx) 
 SwiftInt ApplySite_getNumArguments(BridgedInstruction inst) {
   auto as = ApplySite(castToInst(inst));
   return as.getNumArguments();
+}
+
+SwiftInt FullApplySite_numIndirectResultArguments(BridgedInstruction inst) {
+  auto fas = FullApplySite(castToInst(inst));
+  return fas.getNumIndirectSILResults();
+
 }
 
 //===----------------------------------------------------------------------===//
@@ -1199,4 +1187,10 @@ BridgedInstruction SILBuilder_createBranch(
   return {builder.createBranch(RegularLocation(b.loc.getLocation()),
                                castToBasicBlock(destBlock),
                                getSILValues(arguments, argValues))};
+}
+
+BridgedInstruction SILBuilder_createUnreachable(BridgedBuilder b) {
+  SILBuilder builder(castToInst(b.insertBefore), castToBasicBlock(b.insertAtEnd),
+                     b.loc.getScope());
+  return {builder.createUnreachable(RegularLocation(b.loc.getLocation()))};
 }

@@ -49,7 +49,7 @@ class GatherWritesVisitor : public AccessUseVisitor {
 
 public:
   GatherWritesVisitor(SmallVectorImpl<Operand *> &writes)
-      : AccessUseVisitor(AccessUseType::Overlapping,
+      : AccessUseVisitor(AccessUseType::Exact,
                          NestedAccessType::StopAtAccessBegin),
         writeAccumulator(writes) {}
 
@@ -98,7 +98,6 @@ bool GatherWritesVisitor::visitUse(Operand *op, AccessUseType useTy) {
   case SILInstructionKind::DeallocBoxInst:
   case SILInstructionKind::WitnessMethodInst:
   case SILInstructionKind::ExistentialMetatypeInst:
-  case SILInstructionKind::IsUniqueInst:
   case SILInstructionKind::HopToExecutorInst:
   case SILInstructionKind::ExtractExecutorInst:
   case SILInstructionKind::ValueMetatypeInst:
@@ -115,6 +114,7 @@ bool GatherWritesVisitor::visitUse(Operand *op, AccessUseType useTy) {
   case SILInstructionKind::MarkFunctionEscapeInst:
   case SILInstructionKind::DeallocRefInst:
   case SILInstructionKind::DeallocPartialRefInst:
+  case SILInstructionKind::IsUniqueInst:
     writeAccumulator.push_back(op);
     return true;
 
@@ -324,9 +324,6 @@ bool LoadBorrowImmutabilityAnalysis::isImmutableInScope(
     accessPath.getStorage().print(llvm::errs());
     return false;
   }
-  auto ownershipRoot = accessPath.getStorage().isReference()
-                           ? findOwnershipReferenceRoot(accessPathWithBase.base)
-                           : SILValue();
 
   BorrowedValue borrowedValue(lbi);
   MultiDefPrunedLiveness borrowLiveness(lbi->getFunction());
@@ -338,12 +335,6 @@ bool LoadBorrowImmutabilityAnalysis::isImmutableInScope(
     // First see if the write is a dead end block. In such a case, just skip it.
     if (deadEndBlocks.isDeadEnd(write->getParent())) {
       continue;
-    }
-    // A destroy_value will be a definite write only when the destroy is on the
-    // ownershipRoot
-    if (isa<DestroyValueInst>(write)) {
-      if (op->get() != ownershipRoot)
-        continue;
     }
 
     if (borrowLiveness.isWithinBoundary(write)) {

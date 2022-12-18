@@ -136,14 +136,12 @@ InnerBorrowKind PrunedLiveness::updateForBorrowingOperand(Operand *operand) {
 AddressUseKind PrunedLiveness::checkAndUpdateInteriorPointer(Operand *operand) {
   assert(operand->getOperandOwnership() == OperandOwnership::InteriorPointer);
 
-  if (auto *svi = dyn_cast<SingleValueInstruction>(operand->getUser())) {
-    if (auto scopedAddress = ScopedAddressValue(svi)) {
-      scopedAddress.visitScopeEndingUses([this](Operand *end) {
-        updateForUse(end->getUser(), /*lifetimeEnding*/ false);
-        return true;
-      });
-      return AddressUseKind::NonEscaping;
-    }
+  if (auto scopedAddress = ScopedAddressValue::forUse(operand)) {
+    scopedAddress.visitScopeEndingUses([this](Operand *end) {
+      updateForUse(end->getUser(), /*lifetimeEnding*/ false);
+      return true;
+    });
+    return AddressUseKind::NonEscaping;
   }
   // FIXME: findTransitiveUses should be a visitor so we're not recursively
   // allocating use vectors and potentially merging the use points.
@@ -151,6 +149,10 @@ AddressUseKind PrunedLiveness::checkAndUpdateInteriorPointer(Operand *operand) {
   auto useKind = InteriorPointerOperand(operand).findTransitiveUses(&uses);
   for (auto *use : uses) {
     updateForUse(use->getUser(), /*lifetimeEnding*/ false);
+  }
+  if (uses.empty()) {
+    // Handle a dead address
+    updateForUse(operand->getUser(), /*lifetimeEnding*/ false);
   }
   return useKind;
 }
@@ -230,6 +232,9 @@ void PrunedLivenessBoundary::dump() const {
 void PrunedLivenessBoundary::visitInsertionPoints(
     llvm::function_ref<void(SILBasicBlock::iterator insertPt)> visitor,
     DeadEndBlocks *deBlocks) {
+  // Control flow merge blocks used as insertion points.
+  SmallPtrSet<SILBasicBlock *, 4> mergeBlocks;
+
   for (SILInstruction *user : lastUsers) {
     if (!isa<TermInst>(user)) {
       visitor(std::next(user->getIterator()));
@@ -237,10 +242,17 @@ void PrunedLivenessBoundary::visitInsertionPoints(
     }
     auto *predBB = user->getParent();
     for (SILBasicBlock *succ : predBB->getSuccessors()) {
+      if (!succ->getSinglePredecessorBlock()) {
+        assert(predBB->getSingleSuccessorBlock() == succ);
+        if (!mergeBlocks.insert(succ).second) {
+          continue;
+        }
+      } else {
+        assert(succ->getSinglePredecessorBlock() == predBB);
+      }
       if (deBlocks && deBlocks->isDeadEnd(succ))
         continue;
 
-      assert(succ->getSinglePredecessorBlock() == predBB);
       visitor(succ->begin());
     }
   }
@@ -263,7 +275,8 @@ void PrunedLivenessBoundary::visitInsertionPoints(
 //===----------------------------------------------------------------------===//
 
 template <typename LivenessWithDefs>
-SimpleLiveRangeSummary PrunedLiveRange<LivenessWithDefs>::updateForDef(SILValue def) {
+SimpleLiveRangeSummary
+PrunedLiveRange<LivenessWithDefs>::updateForDef(SILValue def) {
   SimpleLiveRangeSummary summary;
   // Note: Uses with OperandOwnership::NonUse cannot be considered normal uses
   // for liveness. Otherwise, liveness would need to separately track non-uses
@@ -285,7 +298,7 @@ SimpleLiveRangeSummary PrunedLiveRange<LivenessWithDefs>::updateForDef(SILValue 
     case OperandOwnership::InteriorPointer:
       summary.meet(checkAndUpdateInteriorPointer(use));
       break;
-    case OperandOwnership::ForwardingBorrow: {
+    case OperandOwnership::GuaranteedForwarding: {
       ForwardingOperand(use).visitForwardedValues([&](SILValue result) {
         // Do not include transitive uses with 'none' ownership
         if (result->getOwnershipKind() != OwnershipKind::None) {
@@ -293,6 +306,16 @@ SimpleLiveRangeSummary PrunedLiveRange<LivenessWithDefs>::updateForDef(SILValue 
         }
         return true;
       });
+      break;
+    }
+    case OperandOwnership::TrivialUse: {
+      if (auto scopedAddress = ScopedAddressValue::forUse(use)) {
+        scopedAddress.visitScopeEndingUses([this](Operand *end) {
+          updateForUse(end->getUser(), /*lifetimeEnding*/false);
+          return true;
+        });
+      }
+      updateForUse(use->getUser(), /*lifetimeEnding*/false);
       break;
     }
     default:
@@ -442,6 +465,48 @@ template class PrunedLiveRange<MultiDefPrunedLiveness>;
 //                             SSAPrunedLiveness
 //===----------------------------------------------------------------------===//
 
+/// Given live-within (non-live-out) \p block, find the last user.
+void findBoundaryInNonDefBlock(SILBasicBlock *block,
+                               PrunedLivenessBoundary &boundary,
+                               const PrunedLiveness &liveness) {
+  assert(liveness.getBlockLiveness(block) == PrunedLiveBlocks::LiveWithin);
+
+  for (SILInstruction &inst : llvm::reverse(*block)) {
+    if (liveness.isInterestingUser(&inst)) {
+      boundary.lastUsers.push_back(&inst);
+      return;
+    }
+  }
+  llvm_unreachable("live-within block must contain an interesting use");
+}
+
+/// Given a live-within \p block that contains an SSA definition, and knowledge
+/// that all live uses are dominated by that single definition, find either the
+/// last user or a dead def.
+///
+/// A live range with a single definition cannot have any uses above that
+/// definition in the same block. This even holds for unreachable self-loops.
+void findBoundaryInSSADefBlock(SILNode *ssaDef,
+                               PrunedLivenessBoundary &boundary,
+                               const PrunedLiveness &liveness) {
+  // defInst is null for argument defs.
+  SILInstruction *defInst = dyn_cast<SILInstruction>(ssaDef);
+  for (SILInstruction &inst : llvm::reverse(*ssaDef->getParentBlock())) {
+    if (&inst == defInst) {
+      boundary.deadDefs.push_back(cast<SILNode>(&inst));
+      return;
+    }
+    if (liveness.isInterestingUser(&inst)) {
+      boundary.lastUsers.push_back(&inst);
+      return;
+    }
+  }
+  auto *deadArg = dyn_cast<SILArgument>(ssaDef);
+  assert(deadArg
+         && "findBoundariesInBlock must be called on a live block");
+  boundary.deadDefs.push_back(deadArg);
+}
+
 void SSAPrunedLiveness::findBoundariesInBlock(
     SILBasicBlock *block, bool isLiveOut,
     PrunedLivenessBoundary &boundary) const {
@@ -451,21 +516,15 @@ void SSAPrunedLiveness::findBoundariesInBlock(
   if (isLiveOut)
     return;
 
-  bool isDefBlockState = isDefBlock(block);
-  for (SILInstruction &inst : llvm::reverse(*block)) {
-    if (isDefBlockState && isDef(&inst)) {
-      boundary.deadDefs.push_back(cast<SILNode>(&inst));
-      return;
-    }
-    if (isInterestingUser(&inst)) {
-      boundary.lastUsers.push_back(&inst);
-      return;
-    }
+  // Handle live-within block
+  if (!isDefBlock(block)) {
+    findBoundaryInNonDefBlock(block, boundary, *this);
+    return;
   }
-  auto *deadArg = dyn_cast<SILArgument>(def);
-  assert(deadArg && deadArg->getParent() == block
-         && "findBoundariesInBlock must be called on a live block");
-  boundary.deadDefs.push_back(deadArg);
+  // Find either the last user or a dead def
+  auto *defInst = def->getDefiningInstruction();
+  SILNode *defNode = defInst ? cast<SILNode>(defInst) : cast<SILArgument>(def);
+  findBoundaryInSSADefBlock(defNode, boundary, *this);
 }
 
 //===----------------------------------------------------------------------===//
@@ -476,25 +535,45 @@ void MultiDefPrunedLiveness::findBoundariesInBlock(
     SILBasicBlock *block, bool isLiveOut,
     PrunedLivenessBoundary &boundary) const {
   assert(isInitialized());
-  unsigned prevCount = boundary.deadDefs.size() + boundary.lastUsers.size();
 
+  if (!isDefBlock(block)) {
+    // A live-out block with no defs cannot have a boundary.
+    if (!isLiveOut) {
+      findBoundaryInNonDefBlock(block, boundary, *this);
+    }
+    return;
+  }
+  // Handle def blocks...
+  //
+  // First, check for an SSA live range
+  if (++defs.begin() == defs.end()) {
+    // For SSA, a live-out block cannot have a boundary.
+    if (!isLiveOut) {
+      findBoundaryInSSADefBlock(*defs.begin(), boundary, *this);
+    }
+    return;
+  }
+  // Handle a live-out or live-within block with potentially multiple defs
+  unsigned prevCount = boundary.deadDefs.size() + boundary.lastUsers.size();
   bool isLive = isLiveOut;
-  bool isDefBlockState = isDefBlock(block);
   for (auto &inst : llvm::reverse(*block)) {
     // Check if the instruction is a def before checking whether it is a
     // use. The same instruction can be both a dead def and boundary use.
-    if (isDefBlockState && isDef(&inst)) {
+    if (isDef(&inst)) {
       if (!isLive) {
         boundary.deadDefs.push_back(cast<SILNode>(&inst));
       }
       isLive = false;
     }
+    // Note: the same instruction could potentially be both a dead def and last
+    // user. The liveness boundary supports this, although it won't happen in
+    // any context where we care about inserting code on the boundary.
     if (!isLive && isInterestingUser(&inst)) {
       boundary.lastUsers.push_back(&inst);
       isLive = true;
     }
   }
-  if (!isLive && isDefBlockState) {
+  if (!isLive) {
     for (SILArgument *deadArg : block->getArguments()) {
       if (defs.contains(deadArg)) {
         boundary.deadDefs.push_back(deadArg);
@@ -540,285 +619,5 @@ updateForUse(SILInstruction *user, bool lifetimeEnding) {
     if (nonLifetimeEndingUsesInLiveOut)
       nonLifetimeEndingUsesInLiveOut->insert(user);
     return;
-  }
-}
-
-//===----------------------------------------------------------------------===//
-//                       Field Sensitive PrunedLiveness
-//===----------------------------------------------------------------------===//
-
-// We can only analyze components of structs whose storage is fully accessible
-// from Swift.
-static StructDecl *getFullyReferenceableStruct(SILType ktypeTy) {
-  auto structDecl = ktypeTy.getStructOrBoundGenericStruct();
-  if (!structDecl || structDecl->hasUnreferenceableStorage())
-    return nullptr;
-  return structDecl;
-}
-
-TypeSubElementCount::TypeSubElementCount(SILType type, SILModule &mod,
-                                         TypeExpansionContext context)
-    : number(1) {
-  if (auto tupleType = type.getAs<TupleType>()) {
-    unsigned numElements = 0;
-    for (auto index : indices(tupleType.getElementTypes()))
-      numElements +=
-          TypeSubElementCount(type.getTupleElementType(index), mod, context);
-    number = numElements;
-    return;
-  }
-
-  if (auto *structDecl = getFullyReferenceableStruct(type)) {
-    unsigned numElements = 0;
-    for (auto *fieldDecl : structDecl->getStoredProperties())
-      numElements += TypeSubElementCount(
-          type.getFieldType(fieldDecl, mod, context), mod, context);
-    number = numElements;
-    return;
-  }
-
-  // If we have an enum, we add one for tracking if the base enum is set and use
-  // the remaining bits for the max sized payload. This ensures that if we have
-  // a smaller sized payload, we still get all of the bits set, allowing for a
-  // homogeneous representation.
-  if (auto *enumDecl = type.getEnumOrBoundGenericEnum()) {
-    unsigned numElements = 0;
-    for (auto *eltDecl : enumDecl->getAllElements()) {
-      if (!eltDecl->hasAssociatedValues())
-        continue;
-      numElements = std::max(
-          numElements,
-          unsigned(TypeSubElementCount(
-              type.getEnumElementType(eltDecl, mod, context), mod, context)));
-    }
-    number = numElements + 1;
-    return;
-  }
-
-  // If this isn't a tuple, struct, or enum, it is a single element. This was
-  // our default value, so we can just return.
-}
-
-Optional<SubElementNumber>
-SubElementNumber::compute(SILValue projectionDerivedFromRoot,
-                          SILValue rootAddress) {
-  unsigned finalSubElementNumber = 0;
-  SILModule &mod = *rootAddress->getModule();
-
-  while (1) {
-    // If we got to the root, we're done.
-    if (rootAddress == projectionDerivedFromRoot)
-      return {SubElementNumber(finalSubElementNumber)};
-
-    if (auto *pbi = dyn_cast<ProjectBoxInst>(projectionDerivedFromRoot)) {
-      projectionDerivedFromRoot = pbi->getOperand();
-      continue;
-    }
-
-    if (auto *bai = dyn_cast<BeginAccessInst>(projectionDerivedFromRoot)) {
-      projectionDerivedFromRoot = bai->getSource();
-      continue;
-    }
-
-    if (auto *teai =
-            dyn_cast<TupleElementAddrInst>(projectionDerivedFromRoot)) {
-      SILType tupleType = teai->getOperand()->getType();
-
-      // Keep track of what subelement is being referenced.
-      for (unsigned i : range(teai->getFieldIndex())) {
-        finalSubElementNumber += TypeSubElementCount(
-            tupleType.getTupleElementType(i), mod,
-            TypeExpansionContext(*rootAddress->getFunction()));
-      }
-      projectionDerivedFromRoot = teai->getOperand();
-      continue;
-    }
-
-    if (auto *seai =
-            dyn_cast<StructElementAddrInst>(projectionDerivedFromRoot)) {
-      SILType type = seai->getOperand()->getType();
-
-      // Keep track of what subelement is being referenced.
-      StructDecl *structDecl = seai->getStructDecl();
-      for (auto *fieldDecl : structDecl->getStoredProperties()) {
-        if (fieldDecl == seai->getField())
-          break;
-        auto context = TypeExpansionContext(*rootAddress->getFunction());
-        finalSubElementNumber += TypeSubElementCount(
-            type.getFieldType(fieldDecl, mod, context), mod, context);
-      }
-
-      projectionDerivedFromRoot = seai->getOperand();
-      continue;
-    }
-
-    // In the case of enums, we note that our representation is:
-    //
-    //                   ---------|Enum| ---
-    //                  /                   \
-    //                 /                     \
-    //                v                       v
-    //  |Bits for Max Sized Payload|    |Discrim Bit|
-    //
-    // So our payload is always going to start at the current field number since
-    // we are the left most child of our parent enum. So we just need to look
-    // through to our parent enum.
-    if (auto *enumData = dyn_cast<UncheckedTakeEnumDataAddrInst>(
-            projectionDerivedFromRoot)) {
-      projectionDerivedFromRoot = enumData->getOperand();
-      continue;
-    }
-
-    // Init enum data addr is treated like unchecked take enum data addr.
-    if (auto *initData =
-            dyn_cast<InitEnumDataAddrInst>(projectionDerivedFromRoot)) {
-      projectionDerivedFromRoot = initData->getOperand();
-      continue;
-    }
-
-    // If we do not know how to handle this case, just return None.
-    //
-    // NOTE: We use to assert here, but since this is used for diagnostics, we
-    // really do not want to abort. Instead, our caller can choose to abort if
-    // they get back a None. This ensures that we do not abort in cases where we
-    // just want to emit to the user a "I do not understand" error.
-    return None;
-  }
-}
-
-void FieldSensitiveAddressPrunedLiveness::updateForUse(
-    SILInstruction *user, TypeTreeLeafTypeRange range, bool lifetimeEnding) {
-  SmallVector<PrunedLiveBlocks::IsLive, 8> resultingLiveness;
-  liveBlocks.updateForUse(user, range.startEltOffset, range.endEltOffset,
-                          resultingLiveness);
-
-  // Note that a user may use the current value from multiple operands. If any
-  // of the uses are non-lifetime-ending, then we must consider the user
-  // itself non-lifetime-ending; it cannot be a final destroy point because
-  // the value of the non-lifetime-ending operand must be kept alive until the
-  // end of the user. Consider a call that takes the same value using
-  // different conventions:
-  //
-  //   apply %f(%val, %val) : $(@guaranteed, @owned) -> ()
-  //
-  // This call is not considered the end of %val's lifetime. The @owned
-  // argument must be copied.
-  auto iterAndSuccess =
-      users.insert({user, InterestingUser(range, lifetimeEnding)});
-  if (!iterAndSuccess.second)
-    iterAndSuccess.first->second &= lifetimeEnding;
-}
-
-void FieldSensitiveAddressPrunedLiveness::isWithinBoundary(
-    SILInstruction *inst, SmallBitVector &outVector) const {
-  SILBasicBlock *block = inst->getParent();
-
-  SmallVector<PrunedLiveBlocks::IsLive, 8> fieldLiveness;
-  getBlockLiveness(block, fieldLiveness);
-  outVector.resize(fieldLiveness.size());
-
-  for (auto pair : llvm::enumerate(fieldLiveness)) {
-    auto isLive = pair.value();
-    unsigned subEltNumber = pair.index();
-    switch (isLive) {
-    case PrunedLiveBlocks::Dead:
-      outVector[subEltNumber] = false;
-      continue;
-    case PrunedLiveBlocks::LiveOut:
-      outVector[subEltNumber] = true;
-      continue;
-    case PrunedLiveBlocks::LiveWithin:
-      // The boundary is within this block. This instruction is before the
-      // boundary iff any interesting uses occur after it.
-      bool foundValue = false;
-      for (SILInstruction &it :
-           make_range(std::next(inst->getIterator()), block->end())) {
-        auto interestingUser = isInterestingUser(&it);
-        switch (interestingUser.first) {
-        case FieldSensitiveAddressPrunedLiveness::NonUser:
-          break;
-        case FieldSensitiveAddressPrunedLiveness::NonLifetimeEndingUse:
-        case FieldSensitiveAddressPrunedLiveness::LifetimeEndingUse:
-          // Check the overlap in between the sub element number and
-          // interestingUser.second. If we don't overlap, just break. We aren't
-          // effected by this.
-          //
-          // TODO: Hoist this out! We should only be visited blocks like this
-          // once!
-          if (!interestingUser.second->contains(subEltNumber))
-            break;
-          outVector[subEltNumber] = true;
-          foundValue = true;
-          break;
-        }
-      }
-      if (foundValue)
-        continue;
-      outVector[subEltNumber] = false;
-    }
-  }
-}
-
-// Use \p liveness to find the last use in \p bb and add it to \p
-// boundary.lastUsers.
-void FieldSensitiveAddressPrunedLivenessBoundary::findLastUserInBlock(
-    SILBasicBlock *bb, FieldSensitiveAddressPrunedLivenessBoundary &boundary,
-    const FieldSensitiveAddressPrunedLiveness &liveness,
-    unsigned subElementNumber) {
-  // TODO: We should move this loop into the caller and only visit a block once
-  // for each sub-element of a type.
-  for (auto &inst : llvm::reverse(*bb)) {
-    auto pair = liveness.isInterestingUser(&inst);
-    if (pair.first == FieldSensitiveAddressPrunedLiveness::NonUser)
-      continue;
-
-    // Do an intersection in between the range associated with this address and
-    // the sub-element number we are checking for.
-    auto &range = *pair.second;
-    if (!range.contains(subElementNumber))
-      continue;
-    boundary.lastUsers.push_back({&inst, range});
-    return;
-  }
-  llvm_unreachable("No user in LiveWithin block");
-}
-
-void FieldSensitiveAddressPrunedLivenessBoundary::compute(
-    const FieldSensitiveAddressPrunedLiveness &liveness) {
-  using IsLive = PrunedLiveBlocks::IsLive;
-  SmallVector<IsLive, 8> perSubElementblockLivenessInfo;
-  SmallVector<IsLive, 8> boundaryBlockLiveness;
-
-  for (SILBasicBlock *bb : liveness.getDiscoveredBlocks()) {
-    SWIFT_DEFER { perSubElementblockLivenessInfo.clear(); };
-
-    // Process each block that has not been visited and is not LiveOut.
-    liveness.getBlockLiveness(bb, perSubElementblockLivenessInfo);
-
-    // TODO: We should do this for all sub-element LiveWithin at the same time
-    // so that we can avoid iterating over the block multiple times.
-    for (auto pair : llvm::enumerate(perSubElementblockLivenessInfo)) {
-      switch (pair.value()) {
-      case PrunedLiveBlocks::LiveOut:
-        for (SILBasicBlock *succBB : bb->getSuccessors()) {
-          liveness.getBlockLiveness(succBB, boundaryBlockLiveness);
-          if (llvm::all_of(boundaryBlockLiveness, [](IsLive isDead) {
-                return isDead == PrunedLiveBlocks::Dead;
-              })) {
-            boundaryEdges.push_back(succBB);
-          }
-        }
-        break;
-      case PrunedLiveBlocks::LiveWithin: {
-        // The liveness boundary is inside this block. Find the last user. This
-        // is where we would insert a destroy to end the values lifetime for the
-        // specific subelementnumber
-        findLastUserInBlock(bb, *this, liveness, pair.index());
-        break;
-      }
-      case PrunedLiveBlocks::Dead:
-        break;
-      }
-    }
   }
 }

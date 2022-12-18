@@ -16,6 +16,7 @@
 
 #define DEBUG_TYPE "cross-module-serialization-setup"
 #include "swift/AST/Module.h"
+#include "swift/IRGen/TBDGen.h"
 #include "swift/SIL/ApplySite.h"
 #include "swift/SIL/SILCloner.h"
 #include "swift/SIL/SILFunction.h"
@@ -24,7 +25,6 @@
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/InstOptUtils.h"
 #include "swift/SILOptimizer/Utils/SILInliner.h"
-#include "swift/TBDGen/TBDGen.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 
@@ -264,6 +264,11 @@ bool CrossModuleOptimization::canSerializeInstruction(SILInstruction *inst,
       return false;
     }
 
+    // In some project configurations imported C functions are not necessarily
+    // public in their modules.
+    if (conservative && callee->hasClangNode())
+      return false;
+
     // Recursively walk down the call graph.
     if (canSerializeFunction(callee, canSerializeFlags, maxDepth - 1))
       return true;
@@ -284,6 +289,12 @@ bool CrossModuleOptimization::canSerializeInstruction(SILInstruction *inst,
         !hasPublicVisibility(global->getLinkage())) {
       return false;
     }
+
+    // In some project configurations imported C variables are not necessarily
+    // public in their modules.
+    if (conservative && global->hasClangNode())
+      return false;
+
     return true;
   }
   if (auto *KPI = dyn_cast<KeyPathInst>(inst)) {

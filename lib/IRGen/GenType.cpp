@@ -1136,7 +1136,11 @@ namespace {
 
     TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
                                           SILType T) const override {
-      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
+      if (!IGM.getOptions().ForceStructTypeLayouts) {
+        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T);
+      }
+      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T,
+                                                        ScalarKind::POD);
     }
 
     unsigned getExplosionSize() const override {
@@ -1263,7 +1267,11 @@ namespace {
                          IsNotPOD, IsNotBitwiseTakable, IsFixedSize) {}
     TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
                                           SILType T) const override {
-      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
+      if (!IGM.getOptions().ForceStructTypeLayouts) {
+        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T);
+      }
+      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T,
+                                                        ScalarKind::Immovable);
     }
 
     void assignWithCopy(IRGenFunction &IGF, Address dest, Address src,
@@ -2091,7 +2099,7 @@ const TypeInfo *TypeConverter::convertType(CanType ty) {
   case TypeKind::Error: {
     // We might see error types if type checking has failed.
     // Try to do something graceful and return an zero sized type.
-    auto &ctx = ty->getASTContext();
+    auto &ctx = IGM.Context;
     return convertTupleType(cast<TupleType>(ctx.TheEmptyTupleType));
   }
 #define UNCHECKED_TYPE(id, parent) \
@@ -2164,7 +2172,7 @@ const TypeInfo *TypeConverter::convertType(CanType ty) {
   case TypeKind::PrimaryArchetype:
   case TypeKind::OpenedArchetype:
   case TypeKind::OpaqueTypeArchetype:
-  case TypeKind::SequenceArchetype:
+  case TypeKind::ElementArchetype:
     return convertArchetypeType(cast<ArchetypeType>(ty));
   case TypeKind::Class:
   case TypeKind::Enum:
@@ -2204,11 +2212,21 @@ const TypeInfo *TypeConverter::convertType(CanType ty) {
     return convertBlockStorageType(cast<SILBlockStorageType>(ty));
   case TypeKind::SILBox:
     return convertBoxType(cast<SILBoxType>(ty));
+  case TypeKind::Pack:
+    return convertPackType(cast<PackType>(ty));
+  case TypeKind::PackArchetype: {
+    auto archetypeTy = cast<PackArchetypeType>(ty);
+    return convertPackType(archetypeTy->getSingletonPackType());
+  }
+  case TypeKind::PackExpansion: {
+    // FIXME: SIL shouldn't emit values with pack expansion type; they
+    // should always be wrapped in a PackType or be a bare PackArchetypeType
+    SmallVector<Type> elts;
+    elts.push_back(ty);
+    return convertPackType(PackType::get(IGM.Context, elts));
+  }
   case TypeKind::SILToken:
     llvm_unreachable("should not be asking for representation of a SILToken");
-  case TypeKind::Pack:
-  case TypeKind::PackExpansion:
-    llvm_unreachable("Unimplemented!");
   }
   }
   llvm_unreachable("bad type kind");
@@ -2222,6 +2240,12 @@ const TypeInfo *TypeConverter::convertInOutType(InOutType *T) {
   // Just use the reference type as a primitive pointer.
   return createPrimitive(referenceType, IGM.getPointerSize(),
                          IGM.getPointerAlignment());
+}
+
+const TypeInfo *TypeConverter::convertPackType(PackType *pack) {
+  return new RawPointerTypeInfo(IGM.Int8PtrTy,
+                                IGM.getPointerSize(),
+                                IGM.getPointerAlignment());
 }
 
 /// Convert a reference storage type. The implementation here depends on the
@@ -2370,7 +2394,7 @@ public:
 
   TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
                                         SILType T) const override {
-    return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
+    llvm_unreachable("Cannot construct type layout for legacy types");
   }
 
   virtual unsigned getFixedExtraInhabitantCount(IRGenModule &IGM) const override {
@@ -2636,7 +2660,7 @@ void IRGenFunction::setDynamicSelfMetadata(CanType selfClass,
 bool TypeConverter::isExemplarArchetype(ArchetypeType *arch) const {
   auto primary = arch->getRoot();
   if (!isa<PrimaryArchetypeType>(primary) &&
-      !isa<SequenceArchetypeType>(primary))
+      !isa<PackArchetypeType>(primary))
     return true;
   auto genericEnv = primary->getGenericEnvironment();
 
