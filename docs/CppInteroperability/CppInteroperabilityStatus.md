@@ -1,3 +1,5 @@
+[** ‼️ The official C++ interoperability documentation and status page is live at Swift.org and provides an up-to-date guide for mixing Swift and C++ ‼️ **](https://www.swift.org/documentation/cxx-interop/status)
+
 #  C++ Interoperability Status
 
 Swift has some experimental ability to interoperate with C++.
@@ -22,8 +24,7 @@ using V = std::vector<long>;
 ```Swift
 // main.swift
 import CxxTypes
-import std.vector
-import std.algorithm
+import CxxStdlib
 
 // We can extend C++ types in Swift.
 extension V : RandomAccessCollection {

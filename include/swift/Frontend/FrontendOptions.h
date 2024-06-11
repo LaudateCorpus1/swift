@@ -14,14 +14,17 @@
 #define SWIFT_FRONTEND_FRONTENDOPTIONS_H
 
 #include "swift/Basic/FileTypes.h"
-#include "swift/Basic/Version.h"
 #include "swift/Basic/PathRemapper.h"
+#include "swift/Basic/Version.h"
 #include "swift/Frontend/FrontendInputsAndOutputs.h"
 #include "swift/Frontend/InputFile.h"
+#include "clang/CAS/CASOptions.h"
 #include "llvm/ADT/Hashing.h"
-#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/MC/MCTargetOptions.h"
+#include <optional>
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -51,7 +54,7 @@ public:
   /// An Objective-C header to import and make implicitly visible.
   std::string ImplicitObjCHeaderPath;
 
-  /// The map of aliases and underlying names of imported or referenced modules.
+  /// The map of aliases and real names of imported or referenced modules.
   llvm::StringMap<StringRef> ModuleAliasMap;
 
   /// The name of the module that the frontend is building.
@@ -63,6 +66,9 @@ public:
 
   /// The name of the library to link against when using this module.
   std::string ModuleLinkName;
+
+  /// Module name to use when referenced in clients module interfaces.
+  std::string ExportAsName;
 
   /// Arguments which should be passed in immediate mode.
   std::vector<std::string> ImmediateArgv;
@@ -86,6 +92,10 @@ public:
   /// The path to look in when loading a module interface file, to see if a
   /// binary module has already been built for use by the compiler.
   std::string PrebuiltModuleCachePath;
+
+  /// The path to output explicit module dependencies. Only relevant during
+  /// dependency scanning.
+  std::string ExplicitModulesOutputPath;
 
   /// The path to look in to find backup .swiftinterface files if those found
   /// from SDKs are failing.
@@ -118,6 +128,12 @@ public:
 
   /// The module for which we should verify all of the generic signatures.
   std::string VerifyGenericSignaturesInModule;
+
+  /// Emit a .casid file next to the object file if CAS Backend is used.
+  bool EmitCASIDFile = false;
+
+  /// CacheReplay PrefixMap.
+  std::vector<std::string> CacheReplayPrefixMap;
 
   /// Number of retry opening an input file if the previous opening returns
   /// bad file descriptor error.
@@ -195,7 +211,7 @@ public:
   /// When true, emitted module files will always contain options for the
   /// debugger to use. When unset, the options will only be present if the
   /// module appears to not be a public module.
-  Optional<bool> SerializeOptionsForDebugging;
+  std::optional<bool> SerializeOptionsForDebugging;
 
   /// When true the debug prefix map entries will be applied to debugging
   /// options before serialization. These can be reconstructed at debug time by
@@ -238,7 +254,6 @@ public:
   /// \see ModuleDecl::arePrivateImportsEnabled
   bool EnablePrivateImports = false;
 
-
   /// Indicates whether we add implicit dynamic.
   ///
   /// \see ModuleDecl::isImplicitDynamicEnabled
@@ -265,6 +280,10 @@ public:
   /// termination.
   bool PrintClangStats = false;
 
+  /// Indicates whether or not the Clang importer should dump lookup tables
+  /// upon termination.
+  bool DumpClangLookupTables = false;
+
   /// Indicates whether standard help should be shown.
   bool PrintHelp = false;
 
@@ -284,7 +303,7 @@ public:
   /// Specifies the collection mode for the intermodule dependency tracker.
   /// Note that if set, the dependency tracker will be enabled even if no
   /// output path is configured.
-  Optional<IntermoduleDepTrackingMode> IntermoduleDependencyTracking;
+  std::optional<IntermoduleDepTrackingMode> IntermoduleDependencyTracking;
 
   /// Should we emit the cType when printing @convention(c) or no?
   bool PrintFullConvention = false;
@@ -308,15 +327,18 @@ public:
 
   /// The directory path we should use when print #include for the bridging header.
   /// By default, we include ImplicitObjCHeaderPath directly.
-  llvm::Optional<std::string> BridgingHeaderDirForPrint;
+  std::optional<std::string> BridgingHeaderDirForPrint;
 
-  /// Disable implicitly built Swift modules because they are explicitly
-  /// built and given to the compiler invocation.
+  /// Disable implicitly-built Swift modules because they are explicitly
+  /// built and provided to the compiler invocation.
   bool DisableImplicitModules = false;
 
   /// Disable building Swift modules from textual interfaces. This should be
   /// for testing purposes only.
   bool DisableBuildingInterface = false;
+
+  /// Is this frontend configuration of an interface dependency scan sub-invocation
+  bool DependencyScanningSubInvocation = false;
 
   /// When performing a dependency scanning action, only identify and output all imports
   /// of the main Swift module's source files.
@@ -331,8 +353,12 @@ public:
   /// The path at which to either serialize or deserialize the dependency scanner cache.
   std::string SerializedDependencyScannerCachePath;
 
-  /// Emit remarks indicating use of the serialized module dependency scanning cache
+  /// Emit remarks indicating use of the serialized module dependency scanning cache.
   bool EmitDependencyScannerCacheRemarks = false;
+
+  /// Whether the dependency scanner invocation should resolve imports
+  /// to filesystem modules in parallel.
+  bool ParallelDependencyScan = false;
 
   /// When performing an incremental build, ensure that cross-module incremental
   /// build metadata is available in any swift modules emitted by this frontend
@@ -365,6 +391,9 @@ public:
   /// dead-stripping optimizations assuming that all users of library code
   /// are present at LTO time.
   bool HermeticSealAtLink = false;
+
+  /// Disable using the sandbox when executing subprocesses.
+  bool DisableSandbox = false;
 
   /// The different modes for validating TBD against the LLVM IR.
   enum class TBDValidationMode {
@@ -400,16 +429,25 @@ public:
     /// Expose all public declarations in the generated header.
     AllPublic,
     /// Expose declarations only when they have expose attribute.
-    HasExposeAttr
+    HasExposeAttr,
+    /// Expose declarations only when they have expose attribute or are the
+    /// implicitly exposed Stdlib declarations.
+    HasExposeAttrOrImplicitDeps
   };
 
   /// Indicates which declarations should be exposed in the generated clang
   /// header.
-  llvm::Optional<ClangHeaderExposeBehavior> ClangHeaderExposedDecls;
+  std::optional<ClangHeaderExposeBehavior> ClangHeaderExposedDecls;
 
-  /// Emit C++ bindings for the exposed Swift declarations in the generated
-  /// clang header.
-  bool EnableExperimentalCxxInteropInClangHeader = false;
+  struct ClangHeaderExposedImportedModule {
+    std::string moduleName;
+    std::string headerName;
+  };
+
+  /// Indicates which imported modules have a generated header associated with
+  /// them that can be imported into the generated header for the current
+  /// module.
+  std::vector<ClangHeaderExposedImportedModule> clangHeaderExposedImports;
 
   /// \return true if the given action only parses without doing other compilation steps.
   static bool shouldActionOnlyParse(ActionType);
@@ -424,6 +462,9 @@ public:
   /// \return true if the given action requires input files to be provided.
   static bool doesActionPerformEndOfPipelineActions(ActionType action);
 
+  /// \return true if the given action supports caching.
+  static bool supportCompilationCaching(ActionType action);
+
   /// Return a hash code of any components from these options that should
   /// contribute to a Swift Bridging PCH hash.
   llvm::hash_code getPCHHashComponents() const {
@@ -433,7 +474,12 @@ public:
   /// Return a hash code of any components from these options that should
   /// contribute to a Swift Dependency Scanning hash.
   llvm::hash_code getModuleScanningHashComponents() const {
-    return llvm::hash_value(0);
+    return hash_combine(ModuleName,
+                        ModuleABIName,
+                        ModuleLinkName,
+                        ImplicitObjCHeaderPath,
+                        PrebuiltModuleCachePath,
+                        UserModuleVersion);
   }
 
   StringRef determineFallbackModuleName() const;
@@ -458,6 +504,9 @@ public:
   /// Whether we're configured to track system intermodule dependencies.
   bool shouldTrackSystemDependencies() const;
   
+  /// Whether we are configured with -typecheck or -typecheck-module-from-interface actuin
+  bool isTypeCheckAction() const;
+
   /// Whether to emit symbol graphs for the output module.
   bool EmitSymbolGraph = false;
 
@@ -486,6 +535,9 @@ public:
   /// to encode the actual paths into the .swiftmodule file.
   PathObfuscator serializedPathObfuscator;
 
+  /// Whether to run the job twice to check determinism.
+  bool DeterministicCheck = false;
+
   /// Avoid printing actual module content into the ABI descriptor file.
   /// This should only be used as a workaround when emitting ABI descriptor files
   /// crashes the compiler.
@@ -495,6 +547,8 @@ public:
   /// textual imports
   bool EmitClangHeaderWithNonModularIncludes = false;
 
+  /// All block list configuration files to be honored in this compilation.
+  std::vector<std::string> BlocklistConfigFilePaths;
 private:
   static bool canActionEmitDependencies(ActionType);
   static bool canActionEmitReferenceDependencies(ActionType);
@@ -505,6 +559,7 @@ private:
   static bool canActionEmitModuleSummary(ActionType);
   static bool canActionEmitInterface(ActionType);
   static bool canActionEmitABIDescriptor(ActionType);
+  static bool canActionEmitAPIDescriptor(ActionType);
   static bool canActionEmitConstValues(ActionType);
   static bool canActionEmitModuleSemanticInfo(ActionType);
 
@@ -513,6 +568,7 @@ public:
   static bool doesActionGenerateIR(ActionType);
   static bool doesActionProduceOutput(ActionType);
   static bool doesActionProduceTextualOutput(ActionType);
+  static bool doesActionBuildModuleFromInterface(ActionType);
   static bool needsProperModuleName(ActionType);
   static file_types::ID formatForPrincipalOutputFileForAction(ActionType);
 };

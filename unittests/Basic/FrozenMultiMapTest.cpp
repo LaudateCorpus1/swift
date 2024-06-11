@@ -18,7 +18,6 @@
 #include "swift/Basic/NullablePtr.h"
 #include "swift/Basic/Range.h"
 #include "swift/Basic/STLExtras.h"
-#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
@@ -27,6 +26,7 @@
 #include "gtest/gtest.h"
 #include <chrono>
 #include <map>
+#include <optional>
 #include <random>
 #include <set>
 
@@ -75,7 +75,7 @@ TEST(FrozenMultiMapCustomTest, SimpleFind) {
   EXPECT_EQ(map.size(), 5u);
   {
     auto r = map.find(key1);
-    EXPECT_TRUE(r.hasValue());
+    EXPECT_TRUE(r.has_value());
     EXPECT_EQ(r->size(), 3u);
     EXPECT_EQ((*r)[0].getID(), 2u);
     EXPECT_EQ((*r)[1].getID(), 3u);
@@ -84,7 +84,7 @@ TEST(FrozenMultiMapCustomTest, SimpleFind) {
 
   {
     auto r = map.find(key2);
-    EXPECT_TRUE(r.hasValue());
+    EXPECT_TRUE(r.has_value());
     EXPECT_EQ(r->size(), 2u);
     EXPECT_EQ((*r)[0].getID(), 5u);
     EXPECT_EQ((*r)[1].getID(), 6u);
@@ -113,7 +113,7 @@ TEST(FrozenMultiMapCustomTest, TestResetWorks) {
 
   map.setFrozen();
 
-  // Just do a quick sanity test.
+  // Just do a quick soundness test.
   auto range = map.getRange();
   auto begin = range.begin();
   auto end = range.end();

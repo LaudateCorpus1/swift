@@ -57,31 +57,47 @@ public func useDerivedClass(_ x: DerivedClass) {
   print("useDerivedClass, type=\(x.self)")
 }
 
-// CHECK:      class DerivedClass : public BaseClass {
+// CHECK:      class SWIFT_SYMBOL("s:5Class07DerivedA0C") DerivedClass : public BaseClass {
 // CHECK-NEXT:  public:
 // CHECK-NEXT:    using BaseClass::BaseClass;
 // CHECK-NEXT:    using BaseClass::operator=;
 // CHECK-NEXT:  protected:
-// CHECK-NEXT:    inline DerivedClass(void * _Nonnull ptr) noexcept : BaseClass(ptr) {}
+// CHECK-NEXT:    SWIFT_INLINE_THUNK DerivedClass(void * _Nonnull ptr) noexcept : BaseClass(ptr) {}
 // CHECK-NEXT:  private:
 // CHECK-NEXT:    friend class _impl::_impl_DerivedClass;
+// CHECK-NEXT: #pragma clang diagnostic push
+// CHECK-NEXT: #pragma clang diagnostic ignored "-Wc++17-extensions"
+// CHECK-NEXT: #pragma clang diagnostic push
+// CHECK-NEXT: #pragma clang diagnostic ignored "-Wreserved-identifier"
+// CHECK-NEXT:   typedef char $s5Class07DerivedA0CD;
+// CHECK-NEXT:   static inline constexpr $s5Class07DerivedA0CD __swift_mangled_name = 0;
+// CHECK-NEXT: #pragma clang diagnostic pop
+// CHECK-NEXT: #pragma clang diagnostic pop
 // CHECK-NEXT:  };
 
-// CHECK:      class DerivedDerivedClass final : public DerivedClass {
+// CHECK:      class SWIFT_SYMBOL("s:5Class07DerivedbA0C") DerivedDerivedClass final : public DerivedClass {
 // CHECK-NEXT: public:
 // CHECK-NEXT:   using DerivedClass::DerivedClass;
 // CHECK-NEXT:   using DerivedClass::operator=;
 // CHECK-NEXT: protected:
-// CHECK-NEXT:   inline DerivedDerivedClass(void * _Nonnull ptr) noexcept : DerivedClass(ptr) {}
+// CHECK-NEXT:   SWIFT_INLINE_THUNK DerivedDerivedClass(void * _Nonnull ptr) noexcept : DerivedClass(ptr) {}
 // CHECK-NEXT: private:
 // CHECK-NEXT:   friend class _impl::_impl_DerivedDerivedClass;
+// CHECK-NEXT: #pragma clang diagnostic push
+// CHECK-NEXT: #pragma clang diagnostic ignored "-Wc++17-extensions"
+// CHECK-NEXT: #pragma clang diagnostic push
+// CHECK-NEXT: #pragma clang diagnostic ignored "-Wreserved-identifier"
+// CHECK-NEXT:   typedef char $s5Class07DerivedbA0CD;
+// CHECK-NEXT:   static inline constexpr $s5Class07DerivedbA0CD __swift_mangled_name = 0;
+// CHECK-NEXT: #pragma clang diagnostic pop
+// CHECK-NEXT: #pragma clang diagnostic pop
 // CHECK-NEXT: };
 
 // Verify base class names are adjusted to avoid conflict with C++ keywords.
 public class auto {}
 public class derivedRegister: auto {}
 
-// CHECK:      class derivedRegister : public auto_ {
+// CHECK:      class SWIFT_SYMBOL("s:5Class15derivedRegisterC") derivedRegister : public auto_ {
 // CHECK:        using auto_::auto_;
 // CHECK:        using auto_::operator=;
-// CHECK:        inline derivedRegister(void * _Nonnull ptr) noexcept : auto_(ptr) {}
+// CHECK:        SWIFT_INLINE_THUNK derivedRegister(void * _Nonnull ptr) noexcept : auto_(ptr) {}

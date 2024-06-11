@@ -397,6 +397,42 @@ IRGenModule::getObjCProtocolGlobalVars(ProtocolDecl *proto) {
   return pair;
 }
 
+llvm::Constant *
+IRGenModule::getObjCProtocolRefSymRefDescriptor(ProtocolDecl *protocol) {
+  // See whether we already emitted this protocol reference.
+  auto found = ObjCProtocolSymRefs.find(protocol);
+  if (found != ObjCProtocolSymRefs.end()) {
+    return found->second;
+  }
+
+  ConstantInitBuilder InitBuilder(*this);
+  ConstantStructBuilder B(InitBuilder.beginStruct());
+  B.setPacked(true);
+  auto protocolRef = getAddrOfObjCProtocolRef(protocol, NotForDefinition);
+  B.addRelativeAddress(cast<llvm::Constant>(protocolRef.getAddress()));
+  auto ty = protocol->getDeclaredType()->getCanonicalType();
+  auto typeRef =
+      getTypeRef(ty, CanGenericSignature(), MangledTypeRefRole::FlatUnique)
+          .first;
+  B.addRelativeAddress(typeRef);
+  auto future = B.finishAndCreateFuture();
+
+  llvm::SmallString<64> nameBuffer;
+  StringRef protocolName = protocol->getObjCRuntimeName(nameBuffer);
+  auto *protocolSymRef = new llvm::GlobalVariable(
+      Module, future.getType(), /*constant*/ true,
+      llvm::GlobalValue::LinkOnceAnyLinkage, nullptr,
+      llvm::Twine("\01l_OBJC_PROTOCOL_SYMREF_$_") + protocolName);
+  future.installInGlobal(protocolSymRef);
+  protocolSymRef->setAlignment(
+      llvm::MaybeAlign(getPointerAlignment().getValue()));
+  protocolSymRef->setVisibility(llvm::GlobalValue::HiddenVisibility);
+
+  ObjCProtocolSymRefs.insert({protocol, protocolSymRef});
+
+  return protocolSymRef;
+}
+
 static std::pair<uint64_t, llvm::ConstantArray *>
 getProtocolRefsList(llvm::Constant *protocol) {
   // We expect to see a structure like this.
@@ -422,9 +458,8 @@ getProtocolRefsList(llvm::Constant *protocol) {
   if (objCProtocolList->isNullValue()) {
     return std::make_pair(0, nullptr);
   }
-  auto bitcast = cast<llvm::ConstantExpr>(objCProtocolList);
-  assert(bitcast->getOpcode() == llvm::Instruction::BitCast);
-  auto protocolRefsVar = cast<llvm::GlobalVariable>(bitcast->getOperand(0));
+
+  auto protocolRefsVar = cast<llvm::GlobalVariable>(objCProtocolList);
   auto sizeListPair =
       cast<llvm::ConstantStruct>(protocolRefsVar->getInitializer());
   auto size =
@@ -557,9 +592,8 @@ void IRGenModule::emitLazyObjCProtocolDefinition(ProtocolDecl *proto) {
     cast<llvm::GlobalVariable>(ObjCProtocols.find(proto)->second.record);
 
   // Move the new record to the placeholder's position.
-  Module.getGlobalList().remove(record);
-  Module.getGlobalList().insertAfter(placeholder->getIterator(), record);
-
+  Module.removeGlobalVariable(record);
+  Module.insertGlobalVariable(std::next(placeholder->getIterator()), record);
   // Replace and destroy the placeholder.
   placeholder->replaceAllUsesWith(
                             llvm::ConstantExpr::getBitCast(record, Int8PtrTy));
@@ -822,10 +856,8 @@ Callee irgen::getObjCMethodCallee(IRGenFunction &IGF,
 
 Callee irgen::getObjCDirectMethodCallee(CalleeInfo &&info, const FunctionPointer &fn,
                                         llvm::Value *selfValue) {
-  // Direct calls to Objective-C methods have a selector value of `undef`.
-  auto selectorType = fn.getFunctionType()->getParamType(1);
-  auto selectorValue = llvm::UndefValue::get(selectorType);
-  return Callee(std::move(info), fn, selfValue, selectorValue);
+  // Direct calls to Objective-C methods don't have a selector value.
+  return Callee(std::move(info), fn, selfValue, nullptr);
 }
 
 /// Call [self allocWithZone: nil].
@@ -894,6 +926,7 @@ static llvm::Function *emitObjCPartialApplicationForwarder(IRGenModule &IGM,
     case ResultConvention::Unowned:
     case ResultConvention::Owned:
     case ResultConvention::Autoreleased:
+    case ResultConvention::Pack:
       lifetimeExtendsSelf = false;
       break;
     }
@@ -915,6 +948,9 @@ static llvm::Function *emitObjCPartialApplicationForwarder(IRGenModule &IGM,
   case ParameterConvention::Indirect_In:
   case ParameterConvention::Indirect_Inout:
   case ParameterConvention::Indirect_InoutAliasable:
+  case ParameterConvention::Pack_Guaranteed:
+  case ParameterConvention::Pack_Owned:
+  case ParameterConvention::Pack_Inout:
     llvm_unreachable("self passed indirectly?!");
   }
   
@@ -923,7 +959,7 @@ static llvm::Function *emitObjCPartialApplicationForwarder(IRGenModule &IGM,
   llvm::Value *context = params.takeLast();
   Address dataAddr = layout.emitCastTo(subIGF, context);
   auto &fieldLayout = layout.getElement(0);
-  Address selfAddr = fieldLayout.project(subIGF, dataAddr, None);
+  Address selfAddr = fieldLayout.project(subIGF, dataAddr, std::nullopt);
   Explosion selfParams;
   if (retainsSelf)
     cast<LoadableTypeInfo>(selfTI).loadAsCopy(subIGF, selfAddr, selfParams);
@@ -995,7 +1031,7 @@ static llvm::Function *emitObjCPartialApplicationForwarder(IRGenModule &IGM,
     assert(nativeParam.empty());
 
     // Pass along the value.
-    ti.reexplode(subIGF, nonNativeParam, translatedParams);
+    ti.reexplode(nonNativeParam, translatedParams);
   }
 
   // Prepare the call to the underlying method.
@@ -1063,7 +1099,7 @@ void irgen::emitObjCPartialApplication(IRGenFunction &IGF,
   llvm::Value *data = IGF.emitUnmanagedAlloc(layout, "closure",
                                              Descriptor);
   // FIXME: non-fixed offsets
-  NonFixedOffsets offsets = None;
+  NonFixedOffsets offsets = std::nullopt;
   Address dataAddr = layout.emitCastTo(IGF, data);
   auto &fieldLayout = layout.getElement(0);
   auto &fieldType = layout.getElementTypes()[0];
@@ -1676,7 +1712,7 @@ void IRGenFunction::emitBlockRelease(llvm::Value *value) {
 }
 
 void IRGenFunction::emitForeignReferenceTypeLifetimeOperation(
-    ValueDecl *fn, llvm::Value *value) {
+    ValueDecl *fn, llvm::Value *value, bool needsNullCheck) {
   assert(fn->getClangDecl() && isa<clang::FunctionDecl>(fn->getClangDecl()));
 
   auto clangFn = cast<clang::FunctionDecl>(fn->getClangDecl());
@@ -1687,6 +1723,28 @@ void IRGenFunction::emitForeignReferenceTypeLifetimeOperation(
       cast<llvm::FunctionType>(llvmFn->getFunctionType())->getParamType(0);
   value = Builder.CreateBitCast(value, argType);
 
-  auto call = Builder.CreateCall(llvmFn->getFunctionType(), llvmFn, value);
+  llvm::CallInst *call = nullptr;
+  if (needsNullCheck) {
+    // Check if the pointer is null.
+    auto nullValue = llvm::Constant::getNullValue(argType);
+    auto hasValue = Builder.CreateICmpNE(value, nullValue);
+
+    auto nonNullValueBB = createBasicBlock("lifetime.nonnull-value");
+    auto contBB = createBasicBlock("lifetime.cont");
+
+    // If null, just continue.
+    Builder.CreateCondBr(hasValue, nonNullValueBB, contBB);
+
+    // If non-null, emit a call to release/retain function.
+    Builder.emitBlock(nonNullValueBB);
+    call = Builder.CreateCall(llvmFn->getFunctionType(), llvmFn, value);
+
+    Builder.CreateBr(contBB);
+
+    Builder.emitBlock(contBB);
+  } else {
+    call = Builder.CreateCall(llvmFn->getFunctionType(), llvmFn, value);
+  }
+
   call->setDoesNotThrow();
 }

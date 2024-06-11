@@ -22,7 +22,8 @@
 #include "swift/Parse/Lexer.h"
 #include "swift/Strings.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/Triple.h"
+#include "llvm/TargetParser/Triple.h"
+#include "llvm/CAS/ObjectStore.h"
 #include "llvm/Option/Arg.h"
 #include "llvm/Option/ArgList.h"
 #include "llvm/Option/Option.h"
@@ -62,6 +63,13 @@ bool ArgsToFrontendOptionsConverter::convert(
   }
   if (const Arg *A = Args.getLastArg(OPT_prebuilt_module_cache_path)) {
     Opts.PrebuiltModuleCachePath = A->getValue();
+  }
+  if (const Arg *A = Args.getLastArg(OPT_module_cache_path)) {
+    Opts.ExplicitModulesOutputPath = A->getValue();
+  } else {
+    SmallString<128> defaultPath;
+    llvm::sys::path::cache_directory(defaultPath);
+    Opts.ExplicitModulesOutputPath = defaultPath.str().str();
   }
   if (const Arg *A = Args.getLastArg(OPT_backup_module_interface_path)) {
     Opts.BackupModuleInterfaceDir = A->getValue();
@@ -134,6 +142,7 @@ bool ArgsToFrontendOptionsConverter::convert(
   Opts.SerializeDependencyScannerCache |= Args.hasArg(OPT_serialize_dependency_scan_cache);
   Opts.ReuseDependencyScannerCache |= Args.hasArg(OPT_reuse_dependency_scan_cache);
   Opts.EmitDependencyScannerCacheRemarks |= Args.hasArg(OPT_dependency_scan_cache_remarks);
+  Opts.ParallelDependencyScan |= Args.hasArg(OPT_parallel_scan);
   if (const Arg *A = Args.getLastArg(OPT_dependency_scan_cache_path)) {
     Opts.SerializedDependencyScannerCachePath = A->getValue();
   }
@@ -161,6 +170,8 @@ bool ArgsToFrontendOptionsConverter::convert(
   computeDebugTimeOptions();
   computeTBDOptions();
 
+  Opts.DumpClangLookupTables |= Args.hasArg(OPT_dump_clang_lookup_tables);
+
   Opts.CheckOnoneSupportCompleteness = Args.hasArg(OPT_check_onone_completeness);
 
   Opts.ParseStdlib |= Args.hasArg(OPT_parse_stdlib);
@@ -180,7 +191,7 @@ bool ArgsToFrontendOptionsConverter::convert(
 
   computeDumpScopeMapLocations();
 
-  Optional<FrontendInputsAndOutputs> inputsAndOutputs =
+  std::optional<FrontendInputsAndOutputs> inputsAndOutputs =
       ArgsToFrontendInputsConverter(Diags, Args).convert(buffers);
 
   // None here means error, not just "no inputs". Propagate unconditionally.
@@ -216,8 +227,8 @@ bool ArgsToFrontendOptionsConverter::convert(
     Opts.RequestedAction = determineRequestedAction(Args);
   }
 
-  if (Opts.RequestedAction == FrontendOptions::ActionType::CompileModuleFromInterface ||
-      Opts.RequestedAction == FrontendOptions::ActionType::TypecheckModuleFromInterface) {
+  if (FrontendOptions::doesActionBuildModuleFromInterface(
+          Opts.RequestedAction)) {
     // The situations where we use this action, e.g. explicit module building and
     // generating prebuilt module cache, don't need synchronization. We should avoid
     // using lock files for them.
@@ -248,17 +259,15 @@ bool ArgsToFrontendOptionsConverter::convert(
   if (checkBuildFromInterfaceOnlyOptions())
     return true;
 
+  Opts.DeterministicCheck |= Args.hasArg(OPT_enable_deterministic_check);
+  Opts.CacheReplayPrefixMap = Args.getAllArgValues(OPT_cache_replay_prefix_map);
+
   if (FrontendOptions::doesActionGenerateIR(Opts.RequestedAction)) {
     if (Args.hasArg(OPT_experimental_skip_non_inlinable_function_bodies) ||
         Args.hasArg(OPT_experimental_skip_all_function_bodies) ||
         Args.hasArg(
          OPT_experimental_skip_non_inlinable_function_bodies_without_types)) {
       Diags.diagnose(SourceLoc(), diag::cannot_emit_ir_skipping_function_bodies);
-      return true;
-    }
-
-    if (Args.hasArg(OPT_check_api_availability_only)) {
-      Diags.diagnose(SourceLoc(), diag::cannot_emit_ir_checking_api_availability_only);
       return true;
     }
   }
@@ -268,6 +277,14 @@ bool ArgsToFrontendOptionsConverter::convert(
 
   if (const Arg *A = Args.getLastArg(OPT_module_link_name))
     Opts.ModuleLinkName = A->getValue();
+
+  if (const Arg *A = Args.getLastArg(OPT_export_as)) {
+    auto exportAs = A->getValue();
+    if (!Lexer::isIdentifier(exportAs))
+      Diags.diagnose(SourceLoc(), diag::error_bad_export_as_name, exportAs);
+    else
+      Opts.ExportAsName = exportAs;
+  }
 
   // This must be called after computing module name, module abi name,
   // and module link name. If computing module aliases is unsuccessful,
@@ -292,15 +309,29 @@ bool ArgsToFrontendOptionsConverter::convert(
   Opts.UseSharedResourceFolder = !Args.hasArg(OPT_use_static_resource_dir);
   Opts.DisableBuildingInterface = Args.hasArg(OPT_disable_building_interface);
   if (const Arg *A = Args.getLastArg(options::OPT_clang_header_expose_decls)) {
-      Opts.ClangHeaderExposedDecls =
-          llvm::StringSwitch<llvm::Optional<FrontendOptions::ClangHeaderExposeBehavior>>(A->getValue())
-              .Case("all-public", FrontendOptions::ClangHeaderExposeBehavior::AllPublic)
-              .Case("has-expose-attr", FrontendOptions::ClangHeaderExposeBehavior::HasExposeAttr)
-              .Default(llvm::None);
+    Opts.ClangHeaderExposedDecls =
+        llvm::StringSwitch<
+            std::optional<FrontendOptions::ClangHeaderExposeBehavior>>(
+            A->getValue())
+            .Case("all-public",
+                  FrontendOptions::ClangHeaderExposeBehavior::AllPublic)
+            .Case("has-expose-attr",
+                  FrontendOptions::ClangHeaderExposeBehavior::HasExposeAttr)
+            .Case("has-expose-attr-or-stdlib",
+                  FrontendOptions::ClangHeaderExposeBehavior::
+                      HasExposeAttrOrImplicitDeps)
+            .Default(std::nullopt);
   }
-  Opts.EnableExperimentalCxxInteropInClangHeader =
-      Args.hasArg(OPT_enable_experimental_cxx_interop_in_clang_header);
-  
+  for (const auto &arg :
+       Args.getAllArgValues(options::OPT_clang_header_expose_module)) {
+    auto splitArg = StringRef(arg).split('=');
+    if (splitArg.second.empty()) {
+      continue;
+    }
+    Opts.clangHeaderExposedImports.push_back(
+        {splitArg.first.str(), splitArg.second.str()});
+  }
+
   Opts.StrictImplicitModuleContext = Args.hasArg(OPT_strict_implicit_module_context,
                                                  OPT_no_strict_implicit_module_context,
                                                  false);
@@ -328,6 +359,12 @@ bool ArgsToFrontendOptionsConverter::convert(
     Opts.serializedPathObfuscator.addMapping(SplitMap.first, SplitMap.second);
   }
   Opts.emptyABIDescriptor = Args.hasArg(OPT_empty_abi_descriptor);
+  for (auto A : Args.getAllArgValues(options::OPT_block_list_file)) {
+    Opts.BlocklistConfigFilePaths.push_back(A);
+  }
+
+  Opts.DisableSandbox = Args.hasArg(OPT_disable_sandbox);
+
   return false;
 }
 
@@ -380,8 +417,9 @@ void ArgsToFrontendOptionsConverter::computeDebugTimeOptions() {
 
 void ArgsToFrontendOptionsConverter::computeTBDOptions() {
   using namespace options;
+  using Mode = FrontendOptions::TBDValidationMode;
+
   if (const Arg *A = Args.getLastArg(OPT_validate_tbd_against_ir_EQ)) {
-    using Mode = FrontendOptions::TBDValidationMode;
     StringRef value = A->getValue();
     if (value == "none") {
       Opts.ValidateTBDAgainstIR = Mode::None;
@@ -393,6 +431,16 @@ void ArgsToFrontendOptionsConverter::computeTBDOptions() {
       Diags.diagnose(SourceLoc(), diag::error_unsupported_option_argument,
                      A->getOption().getPrefixedName(), value);
     }
+  } else if (Args.hasArg(OPT_enable_experimental_cxx_interop) ||
+             Args.hasArg(OPT_cxx_interoperability_mode)) {
+    // TBD validation currently emits diagnostics when C++ interop is enabled,
+    // which is likely caused by IRGen incorrectly applying attributes to
+    // symbols, forcing the user to pass `-validate-tbd-against-ir=none`.
+    // If no explicit TBD validation mode was specified, disable it if C++
+    // interop is enabled.
+    // See https://github.com/apple/swift/issues/56458.
+    // FIXME: the TBD validation diagnostics are correct and should be enabled.
+    Opts.ValidateTBDAgainstIR = Mode::None;
   }
 }
 
@@ -607,9 +655,9 @@ bool ArgsToFrontendOptionsConverter::computeFallbackModuleName() {
     // selected".
     return false;
   }
-  Optional<std::vector<std::string>> outputFilenames =
+  std::optional<std::vector<std::string>> outputFilenames =
       OutputFilesComputer::getOutputFilenamesFromCommandLineOrFilelist(
-        Args, Diags, options::OPT_o, options::OPT_output_filelist);
+          Args, Diags, options::OPT_o, options::OPT_output_filelist);
 
   std::string nameToStem =
       outputFilenames && outputFilenames->size() == 1 &&
@@ -636,12 +684,19 @@ bool ArgsToFrontendOptionsConverter::
   Opts.InputsAndOutputs.setMainAndSupplementaryOutputs(mainOutputs,
                                                        supplementaryOutputs,
                                                        mainOutputForIndexUnits);
+  // set output type.
+  const file_types::ID outputType =
+      FrontendOptions::formatForPrincipalOutputFileForAction(
+          Opts.RequestedAction);
+  Opts.InputsAndOutputs.setPrincipalOutputType(outputType);
+
   return false;
 }
 
 bool ArgsToFrontendOptionsConverter::checkBuildFromInterfaceOnlyOptions()
     const {
-  if (Opts.RequestedAction != FrontendOptions::ActionType::CompileModuleFromInterface &&
+  if (!FrontendOptions::doesActionBuildModuleFromInterface(
+          Opts.RequestedAction) &&
       Opts.ExplicitInterfaceBuild) {
     Diags.diagnose(SourceLoc(),
                    diag::error_cannot_explicit_interface_build_in_mode);
@@ -653,12 +708,12 @@ bool ArgsToFrontendOptionsConverter::checkBuildFromInterfaceOnlyOptions()
 bool ArgsToFrontendOptionsConverter::checkUnusedSupplementaryOutputPaths()
     const {
   if (!FrontendOptions::canActionEmitDependencies(Opts.RequestedAction) &&
-      Opts.InputsAndOutputs.hasDependenciesPath()) {
+      Opts.InputsAndOutputs.hasDependenciesFilePath()) {
     Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_dependencies);
     return true;
   }
   if (!FrontendOptions::canActionEmitReferenceDependencies(Opts.RequestedAction)
-      && Opts.InputsAndOutputs.hasReferenceDependenciesPath()) {
+      && Opts.InputsAndOutputs.hasReferenceDependenciesFilePath()) {
     Diags.diagnose(SourceLoc(),
                    diag::error_mode_cannot_emit_reference_dependencies);
     return true;
@@ -689,6 +744,11 @@ bool ArgsToFrontendOptionsConverter::checkUnusedSupplementaryOutputPaths()
     Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_abi_descriptor);
     return true;
   }
+  if (!FrontendOptions::canActionEmitAPIDescriptor(Opts.RequestedAction) &&
+      Opts.InputsAndOutputs.hasAPIDescriptorOutputPath()) {
+    Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_api_descriptor);
+    return true;
+  }
   if (!FrontendOptions::canActionEmitConstValues(Opts.RequestedAction) &&
       Opts.InputsAndOutputs.hasConstValuesOutputPath()) {
     Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_const_values);
@@ -707,7 +767,8 @@ bool ArgsToFrontendOptionsConverter::checkUnusedSupplementaryOutputPaths()
    }
   if (!FrontendOptions::canActionEmitInterface(Opts.RequestedAction) &&
       (Opts.InputsAndOutputs.hasModuleInterfaceOutputPath() ||
-       Opts.InputsAndOutputs.hasPrivateModuleInterfaceOutputPath())) {
+       Opts.InputsAndOutputs.hasPrivateModuleInterfaceOutputPath() ||
+        Opts.InputsAndOutputs.hasPackageModuleInterfaceOutputPath())) {
     Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_interface);
     return true;
   }
@@ -779,7 +840,7 @@ bool ModuleAliasesConverter::computeModuleAliases(std::vector<std::string> args,
     
     for (auto item: args) {
       auto str = StringRef(item);
-      // splits to an alias and the underlying name
+      // splits to an alias and its real name
       auto pair = str.split('=');
       auto lhs = pair.first;
       auto rhs = pair.second;
@@ -792,13 +853,13 @@ bool ModuleAliasesConverter::computeModuleAliases(std::vector<std::string> args,
         return false;
       }
       
-      // First, add the underlying name as a key to prevent it from being
+      // First, add the real name as a key to prevent it from being
       // used as an alias
       if (!options.ModuleAliasMap.insert({rhs, StringRef()}).second) {
         diags.diagnose(SourceLoc(), diag::error_module_alias_duplicate, rhs);
         return false;
       }
-      // Next, add the alias as a key and the underlying name as a value to the map
+      // Next, add the alias as a key and the real name as a value to the map
       auto underlyingName = options.ModuleAliasMap.find(rhs)->first();
       if (!options.ModuleAliasMap.insert({lhs, underlyingName}).second) {
         diags.diagnose(SourceLoc(), diag::error_module_alias_duplicate, lhs);

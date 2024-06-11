@@ -5,6 +5,7 @@
 // long enough in the same form to be worth rewriting CHECK lines.
 
 // REQUIRES: objc_interop
+// REQUIRES: swift_in_compiler
 
 import ObjectiveC
 
@@ -43,7 +44,7 @@ class Cat : FakeNSObject {
 
   // CHECK-LABEL: sil hidden @$s40definite_init_failable_initializers_objc3CatC1n5afterACSgSi_Sbtcfc : $@convention(method) (Int, Bool, @owned Cat) -> @owned Optional<Cat>
   // CHECK: bb0([[ARG0:%.*]] : $Int, [[ARG1:%.*]] : $Bool, [[ARG2:%.*]] : $Cat):
-    // CHECK-NEXT: [[SELF_BOX:%.*]] = alloc_stack $Cat
+    // CHECK-NEXT: [[SELF_BOX:%.*]] = alloc_stack [var_decl] $Cat
     // CHECK:      store [[ARG2]] to [[SELF_BOX]] : $*Cat
     // CHECK:      [[FIELD_ADDR:%.*]] = ref_element_addr [[ARG2]] : $Cat, #Cat.x
     // CHECK-NEXT: store {{%.*}} to [[FIELD_ADDR]] : $*LifetimeTracked
@@ -68,7 +69,7 @@ class Cat : FakeNSObject {
     // CHECK-NEXT: strong_release [[ARG2]]
     // CHECK-NEXT: [[RELOAD_ARG2:%.*]] = load [[SELF_BOX]]
     // CHECK-NEXT: [[SUPER:%.*]] = upcast [[RELOAD_ARG2]] : $Cat to $FakeNSObject
-    // CHECK-NEXT: [[SUB:%.*]] = unchecked_ref_cast [[SUPER]] : $FakeNSObject to $Cat
+    // CHECK-NEXT: [[SUB:%.*]] = unchecked_ref_cast [[RELOAD_ARG2]] : $Cat to $Cat
     // CHECK-NEXT: [[SUPER_FN:%.*]] = objc_super_method [[SUB]] : $Cat, #FakeNSObject.init!initializer.foreign : (FakeNSObject.Type) -> () -> FakeNSObject, $@convention(objc_method) (@owned FakeNSObject) -> @owned FakeNSObject
     // CHECK-NEXT: [[NEW_SUPER_SELF:%.*]] = apply [[SUPER_FN]]([[SUPER]]) : $@convention(objc_method) (@owned FakeNSObject) -> @owned FakeNSObject
     // CHECK-NEXT: [[NEW_SELF:%.*]] = unchecked_ref_cast [[NEW_SUPER_SELF]] : $FakeNSObject to $Cat
@@ -102,7 +103,7 @@ class Cat : FakeNSObject {
   // CHECK-LABEL: sil hidden @$s40definite_init_failable_initializers_objc3CatC4fail5afterACSgSb_Sbtcfc : $@convention(method) (Bool, Bool, @owned Cat) -> @owned Optional<Cat>
   // CHECK: bb0([[ARG0:%.*]] : $Bool, [[ARG1:%.*]] : $Bool, [[ARG2:%.*]] : $Cat):
     // CHECK-NEXT: [[HAS_RUN_INIT_BOX:%.+]] = alloc_stack $Builtin.Int1
-    // CHECK-NEXT: [[SELF_BOX:%.+]] = alloc_stack [dynamic_lifetime] $Cat
+    // CHECK-NEXT: [[SELF_BOX:%.+]] = alloc_stack [dynamic_lifetime] [var_decl] $Cat
     // CHECK:      store [[ARG2]] to [[SELF_BOX]] : $*Cat
     // CHECK-NEXT: [[COND:%.+]] = struct_extract [[ARG0]] : $Bool, #Bool._value
     // CHECK-NEXT: cond_br [[COND]], bb1, bb2

@@ -12,6 +12,7 @@
 
 #include "swift/SILOptimizer/Utils/SILSSAUpdater.h"
 #include "swift/Basic/Malloc.h"
+#include "swift/SIL/OwnershipUtils.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBasicBlock.h"
 #include "swift/SIL/SILBuilder.h"
@@ -39,12 +40,13 @@ SILSSAUpdater::SILSSAUpdater(SmallVectorImpl<SILPhiArgument *> *phis)
 
 SILSSAUpdater::~SILSSAUpdater() = default;
 
-void SILSSAUpdater::initialize(SILType inputType, ValueOwnershipKind kind) {
+void SILSSAUpdater::initialize(SILFunction *fn, SILType inputType,
+                               ValueOwnershipKind kind) {
   type = inputType;
   ownershipKind = kind;
 
   phiSentinel = std::unique_ptr<SILUndef, void (*)(SILUndef *)>(
-      SILUndef::getSentinelValue(inputType, this),
+      SILUndef::getSentinelValue(fn, this, inputType),
       SILSSAUpdater::deallocateSentinel);
 
   if (!blockToAvailableValueMap)
@@ -85,20 +87,30 @@ areIdentical(llvm::DenseMap<SILBasicBlock *, SILValue> &availableValues) {
     return true;
   }
 
-  auto *mvir =
-      dyn_cast<MultipleValueInstructionResult>(availableValues.begin()->second);
-  if (!mvir)
-    return false;
+  if (auto *mvir = dyn_cast<MultipleValueInstructionResult>(
+          availableValues.begin()->second)) {
+    for (auto value : availableValues) {
+      auto *result = dyn_cast<MultipleValueInstructionResult>(value.second);
+      if (!result)
+        return false;
+      if (!result->getParent()->isIdenticalTo(mvir->getParent()) ||
+          result->getIndex() != mvir->getIndex()) {
+        return false;
+      }
+    }
+    return true;
+  }
 
+  auto *firstArg = cast<SILArgument>(availableValues.begin()->second);
   for (auto value : availableValues) {
-    auto *result = dyn_cast<MultipleValueInstructionResult>(value.second);
-    if (!result)
+    auto *arg = dyn_cast<SILArgument>(value.second);
+    if (!arg)
       return false;
-    if (!result->getParent()->isIdenticalTo(mvir->getParent()) ||
-        result->getIndex() != mvir->getIndex()) {
+    if (arg != firstArg) {
       return false;
     }
   }
+
   return true;
 }
 
@@ -214,7 +226,7 @@ SILValue SILSSAUpdater::getValueInMiddleOfBlock(SILBasicBlock *block) {
 
   // Return undef for blocks without predecessor.
   if (predVals.empty())
-    return SILUndef::get(type, *block->getParent());
+    return SILUndef::get(block->getParent(), type);
 
   if (singularValue)
     return singularValue;
@@ -234,6 +246,9 @@ SILValue SILSSAUpdater::getValueInMiddleOfBlock(SILBasicBlock *block) {
     addNewEdgeValueToBranch(pair.first->getTerminator(), block, pair.second,
                             deleter);
   }
+  // Set the reborrow flag on the newly created phi.
+  phiArg->setReborrow(computeIsReborrow(phiArg));
+
   if (insertedPhis)
     insertedPhis->push_back(phiArg);
 
@@ -311,7 +326,7 @@ public:
   }
 
   static SILValue GetUndefVal(SILBasicBlock *block, SILSSAUpdater *ssaUpdater) {
-    return SILUndef::get(ssaUpdater->type, *block->getParent());
+    return SILUndef::get(block->getParent(), ssaUpdater->type);
   }
 
   /// Add an Argument to the basic block.
@@ -343,6 +358,9 @@ public:
     auto *ti = predBlock->getTerminator();
 
     changeEdgeValue(ti, phiBlock, phiArgIndex, value);
+
+    // Set the reborrow flag.
+    phi->setReborrow(computeIsReborrow(phi));
   }
 
   /// Check if an instruction is a PHI.

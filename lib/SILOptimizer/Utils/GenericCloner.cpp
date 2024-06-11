@@ -32,8 +32,6 @@ using namespace swift;
 SILFunction *GenericCloner::createDeclaration(
     SILOptFunctionBuilder &FunctionBuilder, SILFunction *Orig,
     const ReabstractionInfo &ReInfo, StringRef NewName) {
-  assert((!ReInfo.isSerialized() || Orig->isSerialized())
-         && "Specialization cannot make body more resilient");
   assert((Orig->isTransparent() || Orig->isBare() || Orig->getLocation())
          && "SILFunction missing location");
   assert((Orig->isTransparent() || Orig->isBare() || Orig->getDebugScope())
@@ -45,10 +43,10 @@ SILFunction *GenericCloner::createDeclaration(
       getSpecializedLinkage(Orig, Orig->getLinkage()), NewName,
       ReInfo.getSpecializedType(), ReInfo.getSpecializedGenericEnvironment(),
       Orig->getLocation(), Orig->isBare(), Orig->isTransparent(),
-      ReInfo.isSerialized(), IsNotDynamic, IsNotDistributed,
-      Orig->getEntryCount(), Orig->isThunk(), Orig->getClassSubclassScope(),
-      Orig->getInlineStrategy(), Orig->getEffectsKind(),
-      Orig, Orig->getDebugScope());
+      ReInfo.getSerializedKind(), IsNotDynamic, IsNotDistributed,
+      IsNotRuntimeAccessible, Orig->getEntryCount(), Orig->isThunk(),
+      Orig->getClassSubclassScope(), Orig->getInlineStrategy(),
+      Orig->getEffectsKind(), Orig, Orig->getDebugScope());
   for (auto &Attr : Orig->getSemanticsAttrs()) {
     NewF->addSemanticsAttr(Attr);
   }
@@ -62,12 +60,15 @@ SILFunction *GenericCloner::createDeclaration(
 void GenericCloner::populateCloned() {
   assert(AllocStacks.empty() && "Stale cloner state.");
   assert(!ReturnValueAddr && "Stale cloner state.");
+  assert(!ErrorValueAddr && "Stale cloner state.");
 
   SILFunction *Cloned = getCloned();
   // Create arguments for the entry block.
   SILBasicBlock *OrigEntryBB = &*Original.begin();
   SILBasicBlock *ClonedEntryBB = Cloned->createBasicBlock();
   getBuilder().setInsertionPoint(ClonedEntryBB);
+
+  RemappedScopeCache.insert({Original.getDebugScope(), Cloned->getDebugScope()});
 
   // Create the entry basic block with the function arguments.
   auto origConv = Original.getConventions();
@@ -95,17 +96,33 @@ void GenericCloner::populateCloned() {
         return false;
 
       if (ArgIdx < origConv.getSILArgIndexOfFirstParam()) {
-        // Handle result arguments.
-        unsigned formalIdx =
-            origConv.getIndirectFormalResultIndexForSILArg(ArgIdx);
-        if (ReInfo.isFormalResultConverted(formalIdx)) {
-          // This result is converted from indirect to direct. The return inst
-          // needs to load the value from the alloc_stack. See below.
-          createAllocStack();
-          assert(!ReturnValueAddr);
-          ReturnValueAddr = ASI;
-          entryArgs.push_back(ASI);
-          return true;
+        if (ArgIdx < origConv.getNumIndirectSILResults()) {
+          // Handle result arguments.
+          unsigned formalIdx =
+              origConv.getIndirectFormalResultIndexForSILArg(ArgIdx);
+          if (ReInfo.isFormalResultConverted(formalIdx)) {
+            // This result is converted from indirect to direct. The return inst
+            // needs to load the value from the alloc_stack. See below.
+            createAllocStack();
+            assert(!ReturnValueAddr);
+            ReturnValueAddr = ASI;
+            entryArgs.push_back(ASI);
+            return true;
+          }
+        } else {
+          assert(origConv.getNumIndirectSILErrorResults() == 1 &&
+                 "only a single indirect error result is supported");
+          assert(ArgIdx == origConv.getNumIndirectSILResults());
+
+          if (ReInfo.isErrorResultConverted()) {
+            // This error result is converted from indirect to direct. The throw
+            // instruction needs to load the value from the alloc_stack. See below.
+            createAllocStack();
+            assert(!ErrorValueAddr);
+            ErrorValueAddr = ASI;
+            entryArgs.push_back(ASI);
+            return true;
+          }
         }
       } else if (ReInfo.isDroppedMetatypeArg(ArgIdx)) {
         // Replace the metatype argument with an `metatype` instruction in the
@@ -122,26 +139,6 @@ void GenericCloner::populateCloned() {
           auto *NewArg = ClonedEntryBB->createFunctionArgument(
               mappedType, OrigArg->getDecl());
           NewArg->copyFlags(cast<SILFunctionArgument>(OrigArg));
-
-          // Try to create a new debug_value from an existing debug_value w/
-          // address value for the argument. We do this before storing to
-          // ensure that when we are cloning code in ossa the argument has
-          // not been consumed by the store below.
-          for (Operand *ArgUse : OrigArg->getUses()) {
-            if (auto *DVI = DebugValueInst::hasAddrVal(ArgUse->getUser())) {
-              auto *oldScope = getBuilder().getCurrentDebugScope();
-              getBuilder().setCurrentDebugScope(
-                  remapScope(DVI->getDebugScope()));
-              auto VarInfo = DVI->getVarInfo();
-              assert(VarInfo && VarInfo->DIExpr &&
-                     "No DebugVarInfo or no DIExpr operand?");
-              // Drop the op_deref
-              VarInfo->DIExpr.eraseElement(VarInfo->DIExpr.element_begin());
-              getBuilder().createDebugValue(DVI->getLoc(), NewArg, *VarInfo);
-              getBuilder().setCurrentDebugScope(oldScope);
-              break;
-            }
-          }
 
           // Store the new direct parameter to an alloc_stack.
           createAllocStack();
@@ -192,10 +189,20 @@ void GenericCloner::visitTerminator(SILBasicBlock *BB) {
       getBuilder().createDeallocStack(ASI->getLoc(), ASI);
     }
     if (ReturnValue) {
-      auto *NewReturn = getBuilder().createReturn(RI->getLoc(), ReturnValue);
-      FunctionExits.push_back(NewReturn);
+      getBuilder().createReturn(RI->getLoc(), ReturnValue);
       return;
     }
+  } else if (isa<ThrowAddrInst>(OrigTermInst) && ErrorValueAddr) {
+      // The result is converted from indirect to direct. We have to load the
+      // returned value from the alloc_stack.
+      SILValue errorValue = getBuilder().emitLoadValueOperation(
+            ErrorValueAddr->getLoc(), ErrorValueAddr,
+            LoadOwnershipQualifier::Take);
+      for (AllocStackInst *ASI : reverse(AllocStacks)) {
+        getBuilder().createDeallocStack(ASI->getLoc(), ASI);
+      }
+      getBuilder().createThrow(OrigTermInst->getLoc(), errorValue);
+      return;
   } else if (OrigTermInst->isFunctionExiting()) {
     for (AllocStackInst *ASI : reverse(AllocStacks)) {
       getBuilder().createDeallocStack(ASI->getLoc(), ASI);
@@ -248,7 +255,7 @@ void GenericCloner::postFixUp(SILFunction *f) {
     // FIXME: Call OSSA lifetime fixup on all values used within the unreachable
     // code. This will recursively fixup nested scopes from the inside out so
     // that transitive liveness is not required.
-    SSAPrunedLiveness storeBorrowLiveness(&discoveredBlocks);
+    SSAPrunedLiveness storeBorrowLiveness(getCloned(), &discoveredBlocks);
     AddressUseKind useKind =
         scopedAddress.computeTransitiveLiveness(storeBorrowLiveness);
     if (useKind == AddressUseKind::NonEscaping) {

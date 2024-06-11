@@ -102,7 +102,7 @@ deriveBodyRawRepresentable_raw(AbstractFunctionDecl *toRawDecl, void *) {
     auto *argList = ArgumentList::forImplicitCallTo(functionRef->getName(),
                                                     {selfRef, typeExpr}, C);
     auto call = CallExpr::createImplicit(C, functionRef, argList);
-    auto returnStmt = new (C) ReturnStmt(SourceLoc(), call);
+    auto *returnStmt = ReturnStmt::createImplicit(C, call);
     auto body = BraceStmt::create(C, SourceLoc(), ASTNode(returnStmt),
                                   SourceLoc());
     return { body, /*isTypeChecked=*/false };
@@ -114,20 +114,21 @@ deriveBodyRawRepresentable_raw(AbstractFunctionDecl *toRawDecl, void *) {
   for (auto elt : enumDecl->getAllElements()) {
     auto pat = new (C)
         EnumElementPattern(TypeExpr::createImplicit(enumType, C), SourceLoc(),
-                           DeclNameLoc(), DeclNameRef(), elt, nullptr);
+                           DeclNameLoc(), DeclNameRef(), elt, nullptr,
+                           /*DC*/ toRawDecl);
     pat->setImplicit();
 
     auto labelItem = CaseLabelItem(pat);
 
     auto returnExpr = cloneRawLiteralExpr(C, elt->getRawValueExpr());
-    auto returnStmt = new (C) ReturnStmt(SourceLoc(), returnExpr);
+    auto *returnStmt = ReturnStmt::createImplicit(C, returnExpr);
 
     auto body = BraceStmt::create(C, SourceLoc(),
                                   ASTNode(returnStmt), SourceLoc());
 
     cases.push_back(CaseStmt::create(C, CaseParentKind::Switch, SourceLoc(),
                                      labelItem, SourceLoc(), SourceLoc(), body,
-                                     /*case body var decls*/ None));
+                                     /*case body var decls*/ std::nullopt));
   }
 
   auto selfRef = DerivedConformance::createSelfDeclRef(toRawDecl);
@@ -239,12 +240,21 @@ struct RuntimeVersionCheck {
 /// be available, returns true. If it will sometimes be available, adds
 /// information about the runtime check needed to ensure it is available to
 /// \c versionCheck and returns true.
-static bool checkAvailability(const EnumElementDecl* elt, ASTContext &C,
-    Optional<RuntimeVersionCheck> &versionCheck) {
+static bool
+checkAvailability(const EnumElementDecl *elt, ASTContext &C,
+                  std::optional<RuntimeVersionCheck> &versionCheck) {
   auto *attr = elt->getAttrs().getPotentiallyUnavailable(C);
 
   // Is it always available?
   if (!attr)
+    return true;
+
+  // For type-checking purposes, iOS availability is inherited for visionOS
+  // targets. However, it is not inherited for the sake of code-generation
+  // of runtime availability queries, and is assumed to be available.
+  if ((attr->Platform == PlatformKind::iOS ||
+       attr->Platform == PlatformKind::iOSApplicationExtension) &&
+      C.LangOpts.Target.isXROS())
     return true;
 
   AvailableVersionComparison availability = attr->getVersionAvailability(C);
@@ -311,7 +321,7 @@ deriveBodyRawRepresentable_init(AbstractFunctionDecl *initDecl, void *) {
     // unavailable, skip it. If it might be unavailable at runtime, save
     // information about that check in versionCheck and keep processing this
     // element.
-    Optional<RuntimeVersionCheck> versionCheck(None);
+    std::optional<RuntimeVersionCheck> versionCheck(std::nullopt);
     if (!checkAvailability(elt, C, versionCheck))
       continue;
 
@@ -321,11 +331,9 @@ deriveBodyRawRepresentable_init(AbstractFunctionDecl *initDecl, void *) {
       // In case of a string enum we are calling the _findStringSwitchCase
       // function from the library and switching on the returned Int value.
       stringExprs.push_back(litExpr);
-      litExpr = IntegerLiteralExpr::createFromUnsigned(C, Idx); 
+      litExpr = IntegerLiteralExpr::createFromUnsigned(C, Idx, SourceLoc()); 
     }
-    auto litPat = new (C) ExprPattern(litExpr, /*isResolved*/ true,
-                                      nullptr, nullptr);
-    litPat->setImplicit();
+    auto *litPat = ExprPattern::createImplicit(C, litExpr, /*DC*/ initDecl);
 
     /// Statements in the body of this case.
     SmallVector<ASTNode, 2> stmts;
@@ -359,7 +367,7 @@ deriveBodyRawRepresentable_init(AbstractFunctionDecl *initDecl, void *) {
     cases.push_back(CaseStmt::create(C, CaseParentKind::Switch, SourceLoc(),
                                      CaseLabelItem(litPat), SourceLoc(),
                                      SourceLoc(), body,
-                                     /*case body var decls*/ None));
+                                     /*case body var decls*/ std::nullopt));
     ++Idx;
   }
 
@@ -372,7 +380,7 @@ deriveBodyRawRepresentable_init(AbstractFunctionDecl *initDecl, void *) {
   cases.push_back(CaseStmt::create(C, CaseParentKind::Switch, SourceLoc(),
                                    dfltLabelItem, SourceLoc(), SourceLoc(),
                                    dfltBody,
-                                   /*case body var decls*/ None));
+                                   /*case body var decls*/ std::nullopt));
 
   auto rawDecl = initDecl->getParameters()->get(0);
   auto rawRef = new (C) DeclRefExpr(rawDecl, DeclNameLoc(), /*implicit*/true);
@@ -423,15 +431,16 @@ deriveRawRepresentable_init(DerivedConformance &derived) {
   auto paramList = ParameterList::createWithoutLoc(rawDecl);
   
   DeclName name(C, DeclBaseName::createConstructor(), paramList);
-  
+
   auto initDecl =
-    new (C) ConstructorDecl(name, SourceLoc(),
-                            /*Failable=*/ true, /*FailabilityLoc=*/SourceLoc(),
-                            /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
-                            /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
-                            paramList,
-                            /*GenericParams=*/nullptr, parentDC);
-  
+      new (C) ConstructorDecl(name, SourceLoc(),
+                              /*Failable=*/true, /*FailabilityLoc=*/SourceLoc(),
+                              /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
+                              /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
+                              /*ThrownType=*/TypeLoc(), paramList,
+                              /*GenericParams=*/nullptr, parentDC,
+                              /*LifetimeDependentReturnTypeRepr*/ nullptr);
+
   initDecl->setImplicit();
   initDecl->setBodySynthesizer(&deriveBodyRawRepresentable_init);
   addNonIsolatedToSynthesized(enumDecl, initDecl);
@@ -460,7 +469,7 @@ bool DerivedConformance::canDeriveRawRepresentable(DeclContext *DC,
 
   rawType = DC->mapTypeIntoContext(rawType);
 
-  auto inherited = enumDecl->getInherited();
+  auto inherited = enumDecl->getInherited().getEntries();
   if (!inherited.empty() && inherited.front().wasValidated() &&
       inherited.front().isError())
     return false;
@@ -517,7 +526,7 @@ ValueDecl *DerivedConformance::deriveRawRepresentable(ValueDecl *requirement) {
   if (requirement->getBaseName() == Context.Id_rawValue)
     return deriveRawRepresentable_raw(*this);
 
-  if (requirement->getBaseName() == DeclBaseName::createConstructor())
+  if (requirement->getBaseName().isConstructor())
     return deriveRawRepresentable_init(*this);
 
   Context.Diags.diagnose(requirement->getLoc(),

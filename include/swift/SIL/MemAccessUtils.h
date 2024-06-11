@@ -206,7 +206,12 @@ SILValue findOwnershipReferenceRoot(SILValue ref);
 
 /// Look through all ownership forwarding instructions to find the values which
 /// were originally borrowed.
-void findGuaranteedReferenceRoots(SILValue value, bool lookThroughNestedBorrows,
+///
+/// Note: This treats guaranteed forwarding phis like roots even though they do
+/// not introduce the borrow scope. This ensures that all roots dominate \p
+/// reference Value. But the client will need to handle forwarding phis.
+void findGuaranteedReferenceRoots(SILValue referenceValue,
+                                  bool lookThroughNestedBorrows,
                                   SmallVectorImpl<SILValue> &roots);
 
 /// Find the aggregate containing the first owned root of the
@@ -232,8 +237,8 @@ inline bool accessKindMayConflict(SILAccessKind a, SILAccessKind b) {
   return !(a == SILAccessKind::Read && b == SILAccessKind::Read);
 }
 
-/// Whether \p instruction accesses storage whose representation is unidentified
-/// such as by reading a pointer.
+/// Whether \p instruction accesses storage whose representation is either (1)
+/// unidentified such as by reading a pointer or (2) global.
 bool mayAccessPointer(SILInstruction *instruction);
 
 /// Whether this instruction loads or copies a value whose storage does not
@@ -242,7 +247,7 @@ bool mayLoadWeakOrUnowned(SILInstruction* instruction);
 
 /// Conservatively, whether this instruction could involve a synchronization
 /// point like a memory barrier, lock or syscall.
-bool maySynchronizeNotConsideringSideEffects(SILInstruction* instruction);
+bool maySynchronize(SILInstruction* instruction);
 
 /// Conservatively, whether this instruction could be a barrier to hoisting
 /// destroys.
@@ -940,7 +945,7 @@ struct RelativeAccessStorageWithBase {
   AccessStorageWithBase storageWithBase;
   /// The most transformative cast that was seen between when walking from
   /// address to storage.base;
-  Optional<AccessStorageCast> cast;
+  std::optional<AccessStorageCast> cast;
 
   AccessStorage getStorage() const { return storageWithBase.storage; }
 };
@@ -1127,6 +1132,8 @@ public:
     // Precondition: this != subNode
     PathNode findPrefix(PathNode subNode) const;
 
+    bool isPrefixOf(PathNode other) { return node->isPrefixOf(other.node); }
+
     bool operator==(PathNode other) const { return node == other.node; }
     bool operator!=(PathNode other) const { return node != other.node; }
   };
@@ -1247,6 +1254,8 @@ struct AccessPathWithBase {
     return AccessBase(base, accessPath.getStorage().getKind());
   }
 
+  bool isValid() const { return base && accessPath.isValid(); }
+
   bool operator==(AccessPathWithBase other) const {
     return accessPath == other.accessPath && base == other.base;
   }
@@ -1262,7 +1271,9 @@ struct AccessPathWithBase {
 //
 // The "product leaves" are the leaves obtained by only looking through type
 // products (structs and tuples) and NOT type sums (enums).
-void visitProductLeafAccessPathNodes(
+//
+// Returns false if the access path couldn't be computed.
+bool visitProductLeafAccessPathNodes(
     SILValue address, TypeExpansionContext tec, SILModule &module,
     std::function<void(AccessPath::PathNode, SILType)> visitor);
 
@@ -1389,6 +1400,12 @@ bool visitAccessStorageUses(AccessUseVisitor &visitor, AccessStorage storage,
 /// visitor's visitUse method returns true.
 bool visitAccessPathUses(AccessUseVisitor &visitor, AccessPath accessPath,
                          SILFunction *function);
+
+/// Similar to visitAccessPathUses, but the visitor is restricted to a specific
+/// access base, such as a particular ref_element_addr.
+bool visitAccessPathBaseUses(AccessUseVisitor &visitor,
+                             AccessPathWithBase accessPathWithBase,
+                             SILFunction *function);
 
 } // end namespace swift
 
@@ -1576,6 +1593,12 @@ inline bool isAccessStorageTypeCast(SingleValueInstruction *svi) {
   switch (svi->getKind()) {
   default:
     return false;
+  // This extracts out the block storage from an alloc_stack. We do not want
+  // to treat it as any more than a cast of the underlying value.
+  case SILInstructionKind::ProjectBlockStorageInst:
+  // Simply pass-thru the incoming address.  But change its type!
+  case SILInstructionKind::MoveOnlyWrapperToCopyableAddrInst:
+  case SILInstructionKind::CopyableToMoveOnlyWrapperAddrInst:
   // Simply pass-thru the incoming address.  But change its type!
   case SILInstructionKind::UncheckedAddrCastInst:
   // Casting to RawPointer does not affect the AccessPath. When converting
@@ -1616,9 +1639,13 @@ inline bool isAccessStorageIdentityCast(SingleValueInstruction *svi) {
 
   // Simply pass-thru the incoming address.
   case SILInstructionKind::MarkUninitializedInst:
-  case SILInstructionKind::MarkMustCheckInst:
+  case SILInstructionKind::MarkUnresolvedNonCopyableValueInst:
+  case SILInstructionKind::DropDeinitInst:
+  case SILInstructionKind::MarkUnresolvedReferenceBindingInst:
   case SILInstructionKind::MarkDependenceInst:
   case SILInstructionKind::CopyValueInst:
+  case SILInstructionKind::BeginBorrowInst:
+  case SILInstructionKind::MoveOnlyWrapperToCopyableBoxInst:
     return true;
   }
 }

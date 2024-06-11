@@ -172,7 +172,9 @@ func rdar21080030() {
   var s = "Hello"
   // https://github.com/apple/swift/issues/50141
   // This should be 'cannot_call_non_function_value'.
-  if s.count() == 0 {} // expected-error{{cannot call value of non-function type 'Int'}} {{13-15=}}
+  if s.count() == 0 {} 
+  // expected-error@-1 {{generic parameter 'E' could not be inferred}}
+  // expected-error@-2 {{missing argument for parameter 'where' in call}}
 }
 
 // <rdar://problem/21248136> QoI: problem with return type inference mis-diagnosed as invalid arguments
@@ -297,7 +299,7 @@ func r18800223(_ i : Int) {
 }
 
 // <rdar://problem/21883806> Bogus "'_' can only appear in a pattern or on the left side of an assignment" is back
-_ = { $0 }  // expected-error {{unable to infer type of a closure parameter '$0' in the current context}}
+_ = { $0 }  // expected-error {{cannot infer type of closure parameter '$0' without a type annotation}}
 
 
 
@@ -661,10 +663,7 @@ example21890157.property = "confusing"  // expected-error {{value of optional ty
 
 
 struct UnaryOp {}
-
 _ = -UnaryOp() // expected-error {{unary operator '-' cannot be applied to an operand of type 'UnaryOp'}}
-// expected-note@-1 {{overloads for '-' exist with these partially matching parameter lists: (Double), (Float)}}
-
 
 // <rdar://problem/23433271> Swift compiler segfault in failure diagnosis
 func f23433271(_ x : UnsafePointer<Int>) {}
@@ -1042,18 +1041,6 @@ class C2_47269 {
   }
 }
 
-// rdar://problem/32101765 - Keypath diagnostics are not actionable/helpful
-
-struct R32101765 { let prop32101765 = 0 }
-let _: KeyPath<R32101765, Float> = \.prop32101765
-// expected-error@-1 {{key path value type 'Int' cannot be converted to contextual type 'Float'}}
-let _: KeyPath<R32101765, Float> = \R32101765.prop32101765
-// expected-error@-1 {{key path value type 'Int' cannot be converted to contextual type 'Float'}}
-let _: KeyPath<R32101765, Float> = \.prop32101765.unknown
-// expected-error@-1 {{type 'Int' has no member 'unknown'}}
-let _: KeyPath<R32101765, Float> = \R32101765.prop32101765.unknown
-// expected-error@-1 {{type 'Int' has no member 'unknown'}}
-
 // rdar://problem/32390726 - Bad Diagnostic: Don't suggest `var` to `let` when binding inside for-statement
 for var i in 0..<10 { // expected-warning {{variable 'i' was never mutated; consider removing 'var' to make it constant}} {{5-9=}}
   _ = i + 1
@@ -1217,24 +1204,24 @@ takesTuple(true) // expected-error {{cannot convert value of type 'Bool' to expe
 func voidFunc() {
   return 1 
   // expected-error@-1 {{unexpected non-void return value in void function}}
-  // expected-note@-2 {{did you mean to add a return type?}}{{16-16= -> <#Return Type#>}}
+  // expected-note@-2 {{did you mean to add a return type?}}{{-1:16-16= -> <#Return Type#>}}
 }
 
 func voidFuncWithArgs(arg1: Int) {
   return 1 
   // expected-error@-1 {{unexpected non-void return value in void function}}
-  // expected-note@-2 {{did you mean to add a return type?}}{{33-33= -> <#Return Type#>}}
+  // expected-note@-2 {{did you mean to add a return type?}}{{-1:33-33= -> <#Return Type#>}}
 }
 
 func voidFuncWithCondFlow() {
   if Bool.random() {
     return 1
     // expected-error@-1 {{unexpected non-void return value in void function}}
-    // expected-note@-2 {{did you mean to add a return type?}}{{28-28= -> <#Return Type#>}}
+    // expected-note@-2 {{did you mean to add a return type?}}{{-2:28-28= -> <#Return Type#>}}
   } else {
     return 2
     // expected-error@-1 {{unexpected non-void return value in void function}}
-    // expected-note@-2 {{did you mean to add a return type?}}{{28-28= -> <#Return Type#>}}
+    // expected-note@-2 {{did you mean to add a return type?}}{{-6:28-28= -> <#Return Type#>}}
   }
 }
 
@@ -1242,21 +1229,21 @@ func voidFuncWithNestedVoidFunc() {
   func nestedVoidFunc() {
     return 1
     // expected-error@-1 {{unexpected non-void return value in void function}}
-    // expected-note@-2 {{did you mean to add a return type?}}{{24-24= -> <#Return Type#>}}
+    // expected-note@-2 {{did you mean to add a return type?}}{{-1:24-24= -> <#Return Type#>}}
   }
 }
 
 func voidFuncWithEffects1() throws {
   return 1
   // expected-error@-1 {{unexpected non-void return value in void function}}
-  // expected-note@-2 {{did you mean to add a return type?}}{{35-35= -> <#Return Type#>}}
+  // expected-note@-2 {{did you mean to add a return type?}}{{-1:35-35= -> <#Return Type#>}}
 }
 
 @available(SwiftStdlib 5.5, *)
 func voidFuncWithEffects2() async throws {
   return 1
   // expected-error@-1 {{unexpected non-void return value in void function}}
-  // expected-note@-2 {{did you mean to add a return type?}}{{41-41= -> <#Return Type#>}}
+  // expected-note@-2 {{did you mean to add a return type?}}{{-1:41-41= -> <#Return Type#>}}
 }
 
 @available(SwiftStdlib 5.5, *)
@@ -1264,27 +1251,27 @@ func voidFuncWithEffects2() async throws {
 func voidFuncWithEffects3() throws async {
   return 1
   // expected-error@-1 {{unexpected non-void return value in void function}}
-  // expected-note@-2 {{did you mean to add a return type?}}{{41-41= -> <#Return Type#>}}
+  // expected-note@-2 {{did you mean to add a return type?}}{{-1:41-41= -> <#Return Type#>}}
 }
 
 @available(SwiftStdlib 5.5, *)
 func voidFuncWithEffects4() async {
   return 1
   // expected-error@-1 {{unexpected non-void return value in void function}}
-  // expected-note@-2 {{did you mean to add a return type?}}{{34-34= -> <#Return Type#>}}
+  // expected-note@-2 {{did you mean to add a return type?}}{{-1:34-34= -> <#Return Type#>}}
 }
 
 func voidFuncWithEffects5(_ closure: () throws -> Void) rethrows {
   return 1
   // expected-error@-1 {{unexpected non-void return value in void function}}
-  // expected-note@-2 {{did you mean to add a return type?}}{{65-65= -> <#Return Type#>}}
+  // expected-note@-2 {{did you mean to add a return type?}}{{-1:65-65= -> <#Return Type#>}}
 }
 
 @available(SwiftStdlib 5.5, *)
 func voidGenericFuncWithEffects<T>(arg: T) async where T: CustomStringConvertible {
   return 1
   // expected-error@-1 {{unexpected non-void return value in void function}}
-  // expected-note@-2 {{did you mean to add a return type?}}{{49-49= -> <#Return Type#>}}
+  // expected-note@-2 {{did you mean to add a return type?}}{{-1:49-49= -> <#Return Type#>}}
 }
 
 // Special cases: These should not offer a note + fix-it
@@ -1409,7 +1396,9 @@ do {
   func generic<T>(_ value: inout T, _ closure: (S<T>) -> Void) {}
 
   let arg: Int
+  // expected-note@-1{{change 'let' to 'var' to make it mutable}}
   generic(&arg) { (g: S<Double>) -> Void in } // expected-error {{cannot convert value of type '(S<Double>) -> Void' to expected argument type '(S<Int>) -> Void'}}
+  // expected-error@-1{{cannot pass immutable value as inout argument: 'arg' is a 'let' constant}}
 }
 
 // rdar://problem/62428353 - bad error message for passing `T` where `inout T` was expected
@@ -1531,7 +1520,55 @@ func testUnwrapFixIts(x: Int?) throws {
   let _: Int = try! .optionalThrowsMember ?? 0
 }
 
+// https://github.com/apple/swift/issues/63746
+func issue63746() {
+  let fn1 = {
+    switch 0 {
+      case 1 where 0: // expected-error {{integer literal value '0' cannot be used as a boolean; did you mean 'false'?}}
+        ()
+    }
+  }
+  let fn2 = {
+    switch 0 {
+      case 1 where 0: // expected-error {{integer literal value '0' cannot be used as a boolean; did you mean 'false'?}}
+        break
+    }
+  }
+}
+
 func rdar86611718(list: [Int]) {
   String(list.count())
-  // expected-error@-1 {{cannot call value of non-function type 'Int'}}
+  // expected-error@-1 {{missing argument for parameter 'where' in call}}
+  // expected-error@-2 {{generic parameter 'E' could not be inferred}}
+}
+
+// rdar://108977234 - failed to produce diagnostic when argument to AnyHashable parameter doesn't conform to Hashable protocol
+do {
+  struct NonHashable {}
+
+  func test(result: inout [AnyHashable], value: NonHashable) {
+    result.append(value) // expected-error {{argument type 'NonHashable' does not conform to expected type 'Hashable'}}
+  }
+}
+
+// https://github.com/apple/swift/issues/66206
+func testNilCoalescingOperatorRemoveFix() {
+  let _ = "" ?? "" // expected-warning {{left side of nil coalescing operator '??' has non-optional type 'String', so the right side is never used}} {{13-19=}}
+  let _ = ""     ?? "" // expected-warning {{left side of nil coalescing operator '??' has non-optional type 'String', so the right side is never used}} {{13-23=}}
+  let _ = "" /* This is a comment */ ?? "" // expected-warning {{left side of nil coalescing operator '??' has non-optional type 'String', so the right side is never used}} {{13-43=}}
+
+  let _ = "" // This is a comment
+    ?? "" // expected-warning {{left side of nil coalescing operator '??' has non-optional type 'String', so the right side is never used}} {{1560:13-1561:10=}}
+
+  let _ = "" // This is a comment
+    /*
+     * The blank line below is part of the test case, do not delete it
+     */
+    ?? "" // expected-warning {{left side of nil coalescing operator '??' has non-optional type 'String', so the right side is never used}} {{1563:13-1567:10=}}
+
+  if ("" ?? // This is a comment // expected-warning {{left side of nil coalescing operator '??' has non-optional type 'String', so the right side is never used}} {{9-1570:9=}}
+      "").isEmpty {}
+
+  if ("" // This is a comment
+      ?? "").isEmpty {} // expected-warning {{left side of nil coalescing operator '??' has non-optional type 'String', so the right side is never used}} {{1572:9-1573:12=}}
 }

@@ -25,13 +25,16 @@ SWIFT_REQUEST(ClangImporter, ClangRecordMemberLookup,
               Decl *(ClangRecordMemberLookupDescriptor), Uncached,
               NoLocationInfo)
 SWIFT_REQUEST(ClangImporter, ClangCategoryLookupRequest,
-              IterableDeclContext *(ClangCategoryLookupDescriptor), Uncached,
+              llvm::TinyPtrVector<Decl *>(ClangCategoryLookupDescriptor), Uncached,
               NoLocationInfo)
 SWIFT_REQUEST(ClangImporter, ObjCInterfaceAndImplementationRequest,
               ObjCInterfaceAndImplementation(Decl *), SeparatelyCached,
               NoLocationInfo)
 SWIFT_REQUEST(ClangImporter, CxxRecordSemantics,
               CxxRecordSemanticsKind(const clang::CXXRecordDecl *), Cached,
+              NoLocationInfo)
+SWIFT_REQUEST(ClangImporter, CxxRecordAsSwiftType,
+              ValueDecl *(CxxRecordSemanticsDescriptor), Cached,
               NoLocationInfo)
 SWIFT_REQUEST(ClangImporter, IsSafeUseOfCxxDecl,
               bool(SafeUseOfCxxRecordDescriptor), Cached,

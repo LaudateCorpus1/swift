@@ -57,6 +57,10 @@ public:
                       NLOptions options);
 };
 
+// Exclude names introduced by macro expansions.
+enum class LocalLookupFlags {
+  ExcludeMacroExpansions,
+};
 
 /// Encapsulates the work done for a recursive qualified lookup into a module
 /// by full name.
@@ -74,19 +78,20 @@ public:
       lookupKind(lookupKind) {}
 
 private:
-  /// Returns whether it's okay to stop recursively searching imports, given 
+  /// Returns whether it's okay to stop recursively searching imports, given
   /// that we found something non-overloadable.
   static bool canReturnEarly() {
     return true;
   }
 
   void doLocalLookup(ModuleDecl *module, ImportPath::Access path,
+                     OptionSet<ModuleLookupFlags> flags,
                      SmallVectorImpl<ValueDecl *> &localDecls) {
     // If this import is specific to some named decl ("import Swift.Int")
     // then filter out any lookups that don't match.
     if (!path.matches(name))
       return;
-    module->lookupValue(name, lookupKind, localDecls);
+    module->lookupValue(name, lookupKind, flags, localDecls);
   }
 };
 
@@ -112,6 +117,7 @@ private:
   }
 
   void doLocalLookup(ModuleDecl *module, ImportPath::Access path,
+                     OptionSet<ModuleLookupFlags> flags,
                      SmallVectorImpl<ValueDecl *> &localDecls) {
     VectorDeclConsumer consumer(localDecls);
     module->lookupVisibleDecls(path, consumer, lookupKind);
@@ -119,6 +125,22 @@ private:
 };
 
 } // end anonymous namespace
+
+bool swift::declIsVisibleToNameLookup(
+    const ValueDecl *decl, const DeclContext *moduleScopeContext,
+    NLOptions options) {
+  // NL_IgnoreAccessControl only applies to the current module. If
+  // it applies here, the declaration is visible.
+  if ((options & NL_IgnoreAccessControl) &&
+      moduleScopeContext &&
+      moduleScopeContext->getParentModule() ==
+          decl->getDeclContext()->getParentModule())
+    return true;
+
+  bool includeUsableFromInline = options & NL_IncludeUsableFromInline;
+  return decl->isAccessibleFrom(moduleScopeContext, false,
+                                includeUsableFromInline);
+}
 
 template <typename LookupStrategy>
 void ModuleNameLookup<LookupStrategy>::lookupInModule(
@@ -145,7 +167,6 @@ void ModuleNameLookup<LookupStrategy>::lookupInModule(
 
   const size_t initialCount = decls.size();
   size_t currentCount = decls.size();
-  bool includeUsableFromInline = options & NL_IncludeUsableFromInline;
 
   auto updateNewDecls = [&](const DeclContext *moduleScopeContext) {
     if (decls.size() == currentCount)
@@ -156,9 +177,10 @@ void ModuleNameLookup<LookupStrategy>::lookupInModule(
       [&](ValueDecl *VD) {
         if (resolutionKind == ResolutionKind::TypesOnly && !isa<TypeDecl>(VD))
           return true;
+        if (resolutionKind == ResolutionKind::MacrosOnly && !isa<MacroDecl>(VD))
+          return true;
         if (respectAccessControl &&
-            !VD->isAccessibleFrom(moduleScopeContext, false,
-                                  includeUsableFromInline))
+            !declIsVisibleToNameLookup(VD, moduleScopeContext, options))
           return true;
         return false;
       });
@@ -167,19 +189,26 @@ void ModuleNameLookup<LookupStrategy>::lookupInModule(
     currentCount = decls.size();
   };
 
+  OptionSet<ModuleLookupFlags> currentModuleLookupFlags = {};
+  if (options & NL_ExcludeMacroExpansions)
+    currentModuleLookupFlags |= ModuleLookupFlags::ExcludeMacroExpansions;
+
   // Do the lookup into the current module.
   auto *module = moduleOrFile->getParentModule();
-  getDerived()->doLocalLookup(module, accessPath, decls);
+  getDerived()->doLocalLookup(
+      module, accessPath, currentModuleLookupFlags, decls);
   updateNewDecls(moduleScopeContext);
 
   bool canReturnEarly = (initialCount != decls.size() &&
                          getDerived()->canReturnEarly());
   if (canReturnEarly &&
       resolutionKind == ResolutionKind::Overloadable) {
-    // If we only found top-level functions, keep looking, since we may
-    // find additional overloads.
+    // If we only found top-level functions or macros, keep looking, since
+    // we may find additional overloads.
     if (std::all_of(decls.begin() + initialCount, decls.end(),
-                    [](ValueDecl *VD) { return isa<FuncDecl>(VD); }))
+                    [](ValueDecl *VD) {
+      return isa<FuncDecl>(VD) || isa<MacroDecl>(VD);
+    }))
       canReturnEarly = false;
   }
 
@@ -196,7 +225,7 @@ void ModuleNameLookup<LookupStrategy>::lookupInModule(
         return;
 
       getDerived()->doLocalLookup(import.importedModule, import.accessPath,
-                                  decls);
+                                  { }, decls);
       updateNewDecls(moduleScopeContext);
     };
 
@@ -268,10 +297,10 @@ void namelookup::lookupInModule(const DeclContext *moduleOrFile,
                                 NLKind lookupKind,
                                 ResolutionKind resolutionKind,
                                 const DeclContext *moduleScopeContext,
-                                NLOptions options) {
+                                SourceLoc loc, NLOptions options) {
   auto &ctx = moduleOrFile->getASTContext();
   LookupInModuleRequest req(moduleOrFile, name, lookupKind, resolutionKind,
-                            moduleScopeContext, options);
+                            moduleScopeContext, loc, options);
   auto results = evaluateOrDefault(ctx.evaluator, req, {});
   decls.append(results.begin(), results.end());
 }
@@ -297,6 +326,9 @@ void namelookup::simple_display(llvm::raw_ostream &out, ResolutionKind kind) {
     return;
   case ResolutionKind::TypesOnly:
     out << "TypesOnly";
+    return;
+  case ResolutionKind::MacrosOnly:
+    out << "MacrosOnly";
     return;
   }
   llvm_unreachable("Unhandled case in switch");

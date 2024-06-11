@@ -46,6 +46,9 @@ enum class DisallowedOriginKind : uint8_t {
   SPILocal,
   SPIOnly,
   MissingImport,
+  FragileCxxAPI,
+  InternalOrLessImport,
+  PackageImport,
   None
 };
 

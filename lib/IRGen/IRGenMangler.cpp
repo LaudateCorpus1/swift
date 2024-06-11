@@ -70,7 +70,7 @@ std::string IRGenMangler::manglePartialApplyForwarder(StringRef FuncName) {
   if (FuncName.empty()) {
     beginMangling();
   } else {
-    if (FuncName.startswith(MANGLING_PREFIX_STR)) {
+    if (FuncName.starts_with(MANGLING_PREFIX_STR)) {
       Buffer << FuncName;
     } else {
       beginMangling();
@@ -110,7 +110,7 @@ IRGenMangler::withSymbolicReferences(IRGenModule &IGM,
       // TODO: We could assign a symbolic reference discriminator to refer
       // to objc protocol refs.
       if (auto proto = dyn_cast<ProtocolDecl>(type)) {
-        if (proto->isObjC()) {
+        if (proto->isObjC() && !IGM.canUseObjCSymbolicReferences()) {
           return false;
         }
       }
@@ -186,6 +186,9 @@ IRGenMangler::mangleTypeForFlatUniqueTypeRef(CanGenericSignature sig,
   // mangled name.
   configureForSymbolicMangling();
 
+  llvm::SaveAndRestore<bool> savedAllowMarkerProtocols(
+      AllowMarkerProtocols, false);
+
   // We don't make the substitution adjustments above because they're
   // target-specific and so would break the goal of getting a unique
   // string.
@@ -197,6 +200,9 @@ IRGenMangler::mangleTypeForFlatUniqueTypeRef(CanGenericSignature sig,
 
 std::string IRGenMangler::mangleProtocolConformanceDescriptor(
                                  const RootProtocolConformance *conformance) {
+  llvm::SaveAndRestore X(AllowInverses,
+                         inversesAllowedIn(conformance->getDeclContext()));
+
   beginMangling();
   if (isa<NormalProtocolConformance>(conformance)) {
     appendProtocolConformance(conformance);
@@ -211,6 +217,9 @@ std::string IRGenMangler::mangleProtocolConformanceDescriptor(
 
 std::string IRGenMangler::mangleProtocolConformanceDescriptorRecord(
                                  const RootProtocolConformance *conformance) {
+  llvm::SaveAndRestore X(AllowInverses,
+                         inversesAllowedIn(conformance->getDeclContext()));
+
   beginMangling();
   appendProtocolConformance(conformance);
   appendOperator("Hc");
@@ -219,6 +228,9 @@ std::string IRGenMangler::mangleProtocolConformanceDescriptorRecord(
 
 std::string IRGenMangler::mangleProtocolConformanceInstantiationCache(
                                  const RootProtocolConformance *conformance) {
+  llvm::SaveAndRestore X(AllowInverses,
+                         inversesAllowedIn(conformance->getDeclContext()));
+
   beginMangling();
   if (isa<NormalProtocolConformance>(conformance)) {
     appendProtocolConformance(conformance);
@@ -263,11 +275,23 @@ mangleProtocolForLLVMTypeName(ProtocolCompositionType *type) {
     // To make LLVM IR more readable we always add a 'T' prefix so that type names
     // don't start with a digit and don't need to be quoted.
     Buffer << 'T';
+    bool isFirstItem = true;
+    InvertibleProtocolSet inverses = InvertibleProtocolSet::allKnown();
     auto protocols = layout.getProtocols();
-    for (unsigned i = 0, e = protocols.size(); i != e; ++i) {
-      appendProtocolName(protocols[i]);
-      if (i == 0)
-        appendOperator("_");
+    for (auto *proto : protocols) {
+      if (auto ip = proto->getInvertibleProtocolKind()) {
+        inverses.remove(*ip);
+        continue;
+      }
+
+      appendProtocolName(proto);
+      appendListSeparator(isFirstItem);
+    }
+    // Append inverses like '~Copyable' as '-Copyable'
+    for (auto ip : inverses) {
+      appendOperator("-");
+      appendIdentifier(getProtocolName(getKnownProtocolKind(ip)));
+      appendListSeparator(isFirstItem);
     }
     if (auto superclass = layout.explicitSuperclass) {
       // We share type infos for different instantiations of a generic type
@@ -300,6 +324,7 @@ mangleSymbolNameForSymbolicMangling(const SymbolicMangling &mangling,
     prefix = "default assoc type ";
     break;
 
+  case MangledTypeRefRole::FieldMetadata:
   case MangledTypeRefRole::Metadata:
   case MangledTypeRefRole::Reflection:
     prefix = "symbolic ";
@@ -328,7 +353,8 @@ mangleSymbolNameForSymbolicMangling(const SymbolicMangling &mangling,
     switch (referent.getKind()) {
     case SymbolicReferent::NominalType: {
       auto ty = referent.getNominalType();
-      appendContext(ty, ty->getAlternateModuleName());
+      BaseEntitySignature base(ty);
+      appendContext(ty, base, ty->getAlternateModuleName());
       continue;
     }
     case SymbolicReferent::OpaqueType: {
@@ -399,12 +425,23 @@ std::string IRGenMangler::mangleSymbolNameForMangledConformanceAccessorString(
   return finalize();
 }
 
+std::string IRGenMangler::mangleSymbolNameForMangledGetEnumTagForLayoutString(
+    CanType type) {
+  beginManglingWithoutPrefix();
+  Buffer << "get_enum_tag_for_layout_string"
+         << " ";
+
+  appendType(type, nullptr);
+  return finalize();
+}
+
 std::string IRGenMangler::mangleSymbolNameForUnderlyingTypeAccessorString(
     OpaqueTypeDecl *opaque, unsigned index) {
   beginManglingWithoutPrefix();
   Buffer << "get_underlying_type_ref ";
 
-  appendContextOf(opaque);
+  BaseEntitySignature base(opaque);
+  appendContextOf(opaque, base);
   appendOpaqueDeclName(opaque);
 
   if (index == 0) {
@@ -422,7 +459,8 @@ IRGenMangler::mangleSymbolNameForUnderlyingWitnessTableAccessorString(
   beginManglingWithoutPrefix();
   Buffer << "get_underlying_witness ";
 
-  appendContextOf(opaque);
+  BaseEntitySignature base(opaque);
+  appendContextOf(opaque, base);
   appendOpaqueDeclName(opaque);
 
   appendType(req.getFirstType()->getCanonicalType(), opaque->getGenericSignature());
@@ -469,7 +507,11 @@ void
 IRGenMangler::appendExtendedExistentialTypeShape(CanGenericSignature genSig,
                                                  CanType shapeType) {
   // Append the generalization signature.
-  if (genSig) appendGenericSignature(genSig);
+  if (genSig) {
+    // Generalization signature never mangles inverses.
+    llvm::SaveAndRestore X(AllowInverses, false);
+    appendGenericSignature(genSig);
+  }
 
   // Append the existential type.
   appendType(shapeType, genSig);
@@ -478,3 +520,17 @@ IRGenMangler::appendExtendedExistentialTypeShape(CanGenericSignature genSig,
   appendOperator(genSig ? "XG" : "Xg");
 }
 
+std::string
+IRGenMangler::mangleConformanceSymbol(Type type,
+                                      const ProtocolConformance *Conformance,
+                                      const char *Op) {
+  llvm::SaveAndRestore X(AllowInverses,
+                         inversesAllowedIn(Conformance->getDeclContext()));
+
+  beginMangling();
+  if (type)
+    appendType(type, nullptr);
+  appendProtocolConformance(Conformance);
+  appendOperator(Op);
+  return finalize();
+}

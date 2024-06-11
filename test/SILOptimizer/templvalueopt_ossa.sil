@@ -1,5 +1,7 @@
 // RUN: %target-sil-opt -enable-sil-verify-all %s -temp-lvalue-opt | %FileCheck %s
 
+// REQUIRES: swift_in_compiler
+
 import Swift
 import Builtin
 
@@ -132,15 +134,15 @@ bb0(%0 : $*Optional<Any>, %1 : $*Any):
   return %6 : $()
 }
 
-// CHECK-LABEL: sil [ossa] @write_to_dest_ok_if_before_liferange :
+// CHECK-LABEL: sil [ossa] @write_to_dest_ok_if_before_liverange :
 // CHECK:      bb0(%0 : $*Optional<Any>, %1 : $*Any):
 // CHECK-NEXT:   destroy_addr
 // CHECK-NEXT:   init_enum_data_addr
 // CHECK-NEXT:   copy_addr
 // CHECK-NEXT:   inject_enum_addr
 // CHECK-NOT:    copy_addr
-// CHECK: } // end sil function 'write_to_dest_ok_if_before_liferange'
-sil [ossa] @write_to_dest_ok_if_before_liferange : $@convention(thin) (@inout Optional<Any>, @in Any) -> () {
+// CHECK: } // end sil function 'write_to_dest_ok_if_before_liverange'
+sil [ossa] @write_to_dest_ok_if_before_liverange : $@convention(thin) (@inout Optional<Any>, @in Any) -> () {
 bb0(%0 : $*Optional<Any>, %1 : $*Any):
   %2 = alloc_stack $Optional<Any>
   destroy_addr %0 : $*Optional<Any>
@@ -300,3 +302,35 @@ bb0(%0 : $*T):
   return %78 : $()
 }
 
+sil @createAny : $@convention(thin) () -> @out Any
+sil @createAny_no_barrier : $@convention(thin) () -> @out Any {
+ [global:]
+}
+
+// CHECK-LABEL: sil [ossa] @test_deinit_barrier :
+// CHECK:         copy_addr [take]
+// CHECK-LABEL: } // end sil function 'test_deinit_barrier'
+sil [ossa] @test_deinit_barrier : $@convention(thin) (@guaranteed Any, @inout Any) -> () {
+bb0(%0 : @guaranteed $Any, %1 : $*Any):
+  %2 = alloc_stack $Any
+  %4 = function_ref @createAny : $@convention(thin) () -> @out Any
+  %5 = apply %4(%2) : $@convention(thin) () -> @out Any
+  copy_addr [take] %2 to %1 : $*Any
+  dealloc_stack %2 : $*Any
+  %11 = tuple ()
+  return %11 : $()
+}
+
+// CHECK-LABEL: sil [ossa] @test_no_deinit_barrier :
+// CHECK-NOT:     copy_addr
+// CHECK-LABEL: } // end sil function 'test_no_deinit_barrier'
+sil [ossa] @test_no_deinit_barrier : $@convention(thin) (@guaranteed Any, @inout Any) -> () {
+bb0(%0 : @guaranteed $Any, %1 : $*Any):
+  %2 = alloc_stack $Any
+  %4 = function_ref @createAny_no_barrier : $@convention(thin) () -> @out Any
+  %5 = apply %4(%2) : $@convention(thin) () -> @out Any
+  copy_addr [take] %2 to %1 : $*Any
+  dealloc_stack %2 : $*Any
+  %11 = tuple ()
+  return %11 : $()
+}

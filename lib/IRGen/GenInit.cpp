@@ -44,9 +44,11 @@ void IRGenModule::emitSILGlobalVariable(SILGlobalVariable *var) {
   if (ti.isKnownEmpty(expansion)) {
     if (DebugInfo && var->getDecl()) {
       auto DbgTy = DebugTypeInfo::getGlobal(var, Int8Ty, *this);
-      DebugInfo->emitGlobalVariableDeclaration(
-          nullptr, var->getDecl()->getName().str(), "", DbgTy,
-          var->getLinkage() != SILLinkage::Public, SILLocation(var->getDecl()));
+      DebugInfo->emitGlobalVariableDeclaration(nullptr, var->getDecl()->getName().str(),
+                                               "", DbgTy,
+                                               var->getLinkage() != SILLinkage::Public &&
+                                               var->getLinkage() != SILLinkage::Package,
+                                               SILLocation(var->getDecl()));
     }
     return;
   }
@@ -68,6 +70,23 @@ StackAddress FixedTypeInfo::allocateStack(IRGenFunction &IGF, SILType T,
     IGF.createAlloca(getStorageType(), getFixedAlignment(), name);
   IGF.Builder.CreateLifetimeStart(alloca, getFixedSize());
   
+  return { alloca };
+}
+
+StackAddress FixedTypeInfo::allocateVector(IRGenFunction &IGF, SILType T,
+                                           llvm::Value *capacity,
+                                           const Twine &name) const {
+  // If the type is known to be empty, don't actually allocate anything.
+  if (isKnownEmpty(ResilienceExpansion::Maximal)) {
+    auto addr = getUndefAddress();
+    return { addr };
+  }
+
+  StackAddress alloca =
+    IGF.emitDynamicAlloca(getStorageType(), capacity, getFixedAlignment(),
+                          /*allowTaskAlloc*/ true, name);
+  IGF.Builder.CreateLifetimeStart(alloca.getAddress(), getFixedSize());
+
   return { alloca };
 }
 
@@ -95,5 +114,9 @@ void TemporarySet::destroyAll(IRGenFunction &IGF) const {
 
 void Temporary::destroy(IRGenFunction &IGF) const {
   auto &ti = IGF.getTypeInfo(Type);
+  if (Type.isSensitive()) {
+    llvm::Value *size = ti.getSize(IGF, Type);
+    IGF.emitClearSensitive(Addr.getAddress(), size);
+  }
   ti.deallocateStack(IGF, Addr, Type);
 }

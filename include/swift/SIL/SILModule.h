@@ -108,7 +108,6 @@ class FuncDecl;
 class IRGenOptions;
 class KeyPathPattern;
 class ModuleDecl;
-class SILUndef;
 class SourceFile;
 class SerializedSILLoader;
 class SILFunctionBuilder;
@@ -192,7 +191,6 @@ private:
   friend SILType;
   friend SILVTable;
   friend SILProperty;
-  friend SILUndef;
   friend SILWitnessTable;
   friend SILMoveOnlyDeinit;
   friend Lowering::SILGenModule;
@@ -242,6 +240,9 @@ private:
 
   /// Lookup table for SIL vtables from class decls.
   llvm::DenseMap<const ClassDecl *, SILVTable *> VTableMap;
+
+  /// Lookup table for specialized SIL vtables from types.
+  llvm::DenseMap<SILType, SILVTable *> SpecializedVTableMap;
 
   /// The list of SILVTables in the module.
   std::vector<SILVTable*> vtables;
@@ -311,9 +312,6 @@ private:
 
   /// This is a cache of builtin Function declarations to numeric ID mappings.
   llvm::DenseMap<Identifier, BuiltinInfo> BuiltinIDCache;
-
-  /// This is the set of undef values we've created, for uniquing purposes.
-  llvm::DenseMap<SILType, SILUndef *> UndefValues;
 
   llvm::DenseMap<std::pair<Decl *, VarDecl *>, unsigned> fieldIndices;
   llvm::DenseMap<EnumElementDecl *, unsigned> enumCaseIndices;
@@ -390,14 +388,16 @@ private:
   /// This gets set in OwnershipModelEliminator pass.
   bool regDeserializationNotificationHandlerForAllFuncOME;
 
+  // True if a DeserializationNotificationHandler is set for
+  // AccessMarkerElimination.
+  bool hasAccessMarkerHandler;
+
   bool prespecializedFunctionDeclsImported;
 
   /// Action to be executed for serializing the SILModule.
   ActionCallback SerializeSILAction;
 
-#ifndef NDEBUG
   BasicBlockNameMapType basicBlockNames;
-#endif
 
   SILModule(llvm::PointerUnion<FileUnit *, ModuleDecl *> context,
             Lowering::TypeConverter &TC, const SILOptions &Options,
@@ -444,6 +444,13 @@ public:
     regDeserializationNotificationHandlerForAllFuncOME = true;
   }
 
+  bool checkHasAccessMarkerHandler() {
+    return hasAccessMarkerHandler;
+  }
+  void setHasAccessMarkerHandler() {
+    hasAccessMarkerHandler = true;
+  }
+
   /// Returns the instruction which defines the given root local archetype,
   /// e.g. an open_existential_addr.
   ///
@@ -461,7 +468,7 @@ public:
   SingleValueInstruction *
   getRootLocalArchetypeDefInst(CanLocalArchetypeType archetype,
                                SILFunction *inFunction) {
-    return cast<SingleValueInstruction>(
+    return dyn_cast<SingleValueInstruction>(
         getRootLocalArchetypeDef(archetype, inFunction));
   }
 
@@ -469,6 +476,11 @@ public:
   ///
   /// This should only be the case during parsing or deserialization.
   bool hasUnresolvedLocalArchetypeDefinitions();
+
+  /// If we added any instructions that reference unresolved local archetypes
+  /// and then deleted those instructions without resolving those archetypes,
+  /// we must reclaim those unresolved local archetypes.
+  void reclaimUnresolvedLocalArchetypeDefinitions();
 
   /// Get a unique index for a struct or class field in layout order.
   ///
@@ -514,15 +526,15 @@ public:
     basicBlockNames[block] = name.str();
 #endif
   }
-  Optional<StringRef> getBasicBlockName(const SILBasicBlock *block) {
+  std::optional<StringRef> getBasicBlockName(const SILBasicBlock *block) {
 #ifndef NDEBUG
     auto Known = basicBlockNames.find(block);
     if (Known == basicBlockNames.end())
-      return None;
+      return std::nullopt;
 
     return StringRef(Known->second);
 #else
-    return None;
+    return std::nullopt;
 #endif
   }
 
@@ -591,9 +603,8 @@ public:
 
   const SILOptions &getOptions() const { return Options; }
   const IRGenOptions *getIRGenOptionsOrNull() const {
-    // We don't want to serialize target specific SIL.
-    assert(isSerialized() &&
-           "Target specific options must not be used before serialization");
+    // This exposes target specific information, therefore serialized SIL
+    // is also target specific.
     return irgenOptions;
   }
 
@@ -740,6 +751,12 @@ public:
     return isPossiblyUsedExternally(getDeclSILLinkage(decl), isWholeModule());
   }
 
+  /// Promote the linkage of every entity in this SIL module so that they are
+  /// externally visible. This is used to promote the linkage of private
+  /// entities that are compiled on-demand for lazy immediate mode, as each is
+  /// emitted into its own `SILModule`.
+  void promoteLinkages();
+
   PropertyListType &getPropertyList() { return properties; }
   const PropertyListType &getPropertyList() const { return properties; }
 
@@ -773,9 +790,8 @@ public:
   ///
   /// If \p linkage is provided, the deserialized function is required to have
   /// that linkage. Returns null, if this is not the case.
-  SILFunction *loadFunction(StringRef name,
-                            LinkingMode LinkMode,
-                            Optional<SILLinkage> linkage = None);
+  SILFunction *loadFunction(StringRef name, LinkingMode LinkMode,
+                            std::optional<SILLinkage> linkage = std::nullopt);
 
   /// Update the linkage of the SILFunction with the linkage of the serialized
   /// function.
@@ -824,6 +840,9 @@ public:
 
   /// Look up the VTable mapped to the given ClassDecl. Returns null on failure.
   SILVTable *lookUpVTable(const ClassDecl *C, bool deserializeLazily = true);
+
+  /// Look up a specialized VTable
+  SILVTable *lookUpSpecializedVTable(SILType classTy);
 
   /// Attempt to lookup the function corresponding to \p Member in the class
   /// hierarchy of \p Class.
@@ -902,22 +921,23 @@ public:
   /// fetched in the given module?
   bool isTypeMetadataForLayoutAccessible(SILType type);
 
+  void verify(bool isCompleteOSSA = true,
+              bool checkLinearLifetime = true) const;
+
   /// Run the SIL verifier to make sure that all Functions follow
   /// invariants.
-  void verify() const;
+  void verify(CalleeCache *calleeCache,
+              bool isCompleteOSSA = true,
+              bool checkLinearLifetime = true) const;
 
-  /// Check if there are any leaking instructions.
-  ///
-  /// Aborts with an error if more instructions are allocated than contained in
-  /// the module.
-  void checkForLeaks() const;
+  /// Run the SIL verifier without assuming OSSA lifetimes end at dead end
+  /// blocks.
+  void verifyIncompleteOSSA() const {
+    verify(/*isCompleteOSSA=*/false);
+  }
 
-  /// Check if there are any leaking instructions after the SILModule is
-  /// destructed.
-  ///
-  /// The SILModule destructor already calls checkForLeaks(). This function is
-  /// useful to check if the destructor itself destroys all data structures.
-  static void checkForLeaksAfterDestruction();
+  /// Check linear OSSA lifetimes, assuming complete OSSA.
+  void verifyOwnership() const;
 
   /// Pretty-print the module.
   void dump(bool Verbose = false) const;
@@ -1042,10 +1062,9 @@ inline llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, const SILModule &M){
 inline bool SILOptions::supportsLexicalLifetimes(const SILModule &mod) const {
   switch (mod.getStage()) {
   case SILStage::Raw:
-    // In raw SIL, lexical markers are used for diagnostics.  These markers are
-    // present as long as the lexical lifetimes feature is not disabled
-    // entirely.
-    return LexicalLifetimes != LexicalLifetimesOption::Off;
+    // In raw SIL, lexical markers are used for diagnostics and are always
+    // present.
+    return true;
   case SILStage::Canonical:
   case SILStage::Lowered:
     // In Canonical SIL, lexical markers are used to ensure that object
@@ -1069,7 +1088,6 @@ namespace Lowering {
 /// Objective-C runtime, i.e., +alloc and -dealloc.
 LLVM_LIBRARY_VISIBILITY bool usesObjCAllocator(ClassDecl *theClass);
 } // namespace Lowering
-
 } // namespace swift
 
 #endif

@@ -133,21 +133,22 @@ struct SILDynamicCastKind {
   SILDynamicCastKind(innerty value) : value(value) {}
   operator innerty() const { return value; }
 
-  static Optional<SILDynamicCastKind> fromNodeKind(SILInstructionKind kind) {
+  static std::optional<SILDynamicCastKind>
+  fromNodeKind(SILInstructionKind kind) {
     if (auto innerTyOpt = SILDynamicCastKind::fromNodeKindHelper(kind))
       return SILDynamicCastKind(*innerTyOpt);
-    return None;
+    return std::nullopt;
   }
 
 private:
-  static Optional<innerty> fromNodeKindHelper(SILInstructionKind kind) {
+  static std::optional<innerty> fromNodeKindHelper(SILInstructionKind kind) {
     switch (kind) {
 #define DYNAMICCAST_INST(ID, PARENT)                                           \
   case SILInstructionKind::ID:                                                 \
     return SILDynamicCastKind::ID;
 #include "swift/SIL/SILNodes.def"
     default:
-      return None;
+      return std::nullopt;
     }
   }
 };
@@ -230,7 +231,7 @@ public:
     llvm_unreachable("covered switch");
   }
 
-  Optional<ProfileCounter> getSuccessBlockCount() {
+  std::optional<ProfileCounter> getSuccessBlockCount() {
     switch (getKind()) {
     case SILDynamicCastKind::CheckedCastAddrBranchInst:
       llvm_unreachable("unsupported");
@@ -238,7 +239,7 @@ public:
       return cast<CheckedCastBranchInst>(inst)->getTrueBBCount();
     case SILDynamicCastKind::UnconditionalCheckedCastAddrInst:
     case SILDynamicCastKind::UnconditionalCheckedCastInst:
-      return None;
+      return std::nullopt;
     }
     llvm_unreachable("covered switch");
   }
@@ -260,7 +261,7 @@ public:
     llvm_unreachable("covered switch");
   }
 
-  Optional<ProfileCounter> getFailureBlockCount() {
+  std::optional<ProfileCounter> getFailureBlockCount() {
     switch (getKind()) {
     case SILDynamicCastKind::CheckedCastAddrBranchInst:
       llvm_unreachable("unsupported");
@@ -268,7 +269,7 @@ public:
       return cast<CheckedCastBranchInst>(inst)->getFalseBBCount();
     case SILDynamicCastKind::UnconditionalCheckedCastAddrInst:
     case SILDynamicCastKind::UnconditionalCheckedCastInst:
-      return None;
+      return std::nullopt;
     }
     llvm_unreachable("covered switch");
   }
@@ -423,10 +424,10 @@ public:
     return t->getCanonicalType();
   }
 
-  Optional<SILType> getLoweredBridgedTargetObjectType() const {
+  std::optional<SILType> getLoweredBridgedTargetObjectType() const {
     CanType t = getBridgedTargetType();
     if (!t)
-      return None;
+      return std::nullopt;
     return SILType::getPrimitiveObjectType(t);
   }
 

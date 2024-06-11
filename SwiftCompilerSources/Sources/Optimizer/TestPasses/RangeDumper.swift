@@ -12,8 +12,8 @@
 
 import SIL
 
-let rangeDumper = FunctionPass(name: "dump-ranges", {
-  (function: Function, context: PassContext) in
+let rangeDumper = FunctionPass(name: "dump-ranges") {
+  (function: Function, context: FunctionPassContext) in
 
   var begin: Instruction?
   var ends = Stack<Instruction>(context)
@@ -27,7 +27,7 @@ let rangeDumper = FunctionPass(name: "dump-ranges", {
 
   for inst in function.instructions {
     if let sli = inst as? StringLiteralInst {
-      switch sli.string {
+      switch sli.value {
         case "begin":
           assert(begin == nil, "more than one begin instruction")
           begin = sli
@@ -73,9 +73,9 @@ let rangeDumper = FunctionPass(name: "dump-ranges", {
     assert(!instRange.contains(o))
     assert(!instRange.inclusiveRangeContains(o))
   }
-})
+}
 
-private func verify(_ blockRange: BasicBlockRange, _ context: PassContext) {
+private func verify(_ blockRange: BasicBlockRange, _ context: FunctionPassContext) {
   var inRange = BasicBlockSet(context)
   defer { inRange.deinitialize() }
   for b in blockRange.range {
@@ -88,7 +88,7 @@ private func verify(_ blockRange: BasicBlockRange, _ context: PassContext) {
     inInclusiveRange.insert(b)
   }
 
-  for b in blockRange.begin.function.blocks {
+  for b in blockRange.begin.parentFunction.blocks {
     assert(blockRange.contains(b) == inRange.contains(b))
     assert(blockRange.inclusiveRangeContains(b) == inInclusiveRange.contains(b))
   }

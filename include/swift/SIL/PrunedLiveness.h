@@ -86,31 +86,41 @@
 /// ---------------------------------------------------------------------------
 ///
 /// "Use points" are the instructions that "generate" liveness for a given
-/// operand. A generalized use point visitor would look like this:
+/// operand.
 ///
-/// Given an \p operand, visit the use points relevant for liveness. For most
-/// operands, this is simply the user instruction. For scoped operands, each
-/// scope-ending instruction is a separate use point.
-/// template<typename Operation>
-/// inline bool visitUsePoints(Operand *use, Operation visitUsePoint) {
-///   // Handle TrivialUse operands: begin_access & store_borrow address
-///   // Handle InteriorPointer operands: store_borrow source
-///   if (auto scopedAddress = ScopedAddressValue::forUse(use)) {
-///     return scopedAddress.visitScopeEndingUses(visitUsePoint);
-///   }
-///   // Handle Borrow operands...
-///   // Handles borrow scope introducers: begin_borrow & load_borrow.
-///   // Handles guaranteed return values: begin_apply.
-///   if (!BorrowingOperand(operand).visitScopeEndingUses([this](Operand *end) {
-///     if (!visitUsePoint(end))
-///       return false;
-///     return true;
-///   }
-///   return visitUsePoint(use);
-/// }
+/// ** Lifetime-ending uses **
 ///
-/// The visitors that switch on OperandOwnership use a specialized
-/// implementation because each case above is specific to an ownership case.
+/// When PrunedLiveness records uses, it caches the "lifetime-ending"
+/// state. This flag has _zero effect_ on liveness. It refers to the use's
+/// ownership constraint. But liveness does not map cleanly to ownership
+/// lifetime. For extended live ranges, lifetime ending uses may occur in the
+/// middle of liveness (a live-out block may contain a "lifetime-ending"
+/// use). For incomplete ownership lifetimes, and for guaranteed phis,
+/// non-lifetime ending uses may end liveness. This deliberate abstraction
+/// leakage is only done for efficiency. Note that use-points are recorded as
+/// instructions, not operands. Caching "lifetime-ending" state avoids the need
+/// to visit all operands when computing liveness and, in the common case,
+/// avoids the need for a separate operand map in the client.
+///
+/// ** Scoped operations **
+///
+/// Handling uses that must be live over a scope requires treating all the
+/// scope-ending points as "use points". See
+/// PrunedLiveRange<LivenessWithDefs>::recursivelyUpdateForDef for an example of
+/// handling scopes.
+///
+/// ** Phis **
+///
+/// PrunedLiveness has no way to know whether a phi is intended to end a live
+/// range. It consistently models all phi operands as uses in the predecessor
+/// block (the branch is the use point). A guaranteed phi may or may not
+/// actually end liveness depending on whether its enclosing def is an outer
+/// adjacent phi. Liveness cannot, therefore, distinguish between a guaranteed
+/// phi that ends liveness, and a dead guaranteed phi that does not end
+/// liveness. In the later case, predecessor blocks are confusingly marked
+/// live-within instead of live-out. visitInsertionPoints compensates by moving
+/// the insertion point to the successor block.
+///
 //===----------------------------------------------------------------------===//
 
 #ifndef SWIFT_SILOPTIMIZER_UTILS_PRUNEDLIVENESS_H
@@ -122,8 +132,10 @@
 #include "swift/SIL/OwnershipUtils.h"
 #include "swift/SIL/SILBasicBlock.h"
 #include "swift/SIL/SILFunction.h"
+#include "swift/SIL/SILInstruction.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/PointerIntPair.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
 namespace swift {
@@ -142,16 +154,6 @@ class DeadEndBlocks;
 /// blocks to the blocks that occur on or after the def block. If any uses is
 /// not dominated by a def block, then liveness will include the entry block,
 /// as if defined by a function argument
-///
-/// We allow for multiple bits of liveness information to be tracked by
-/// internally using a SmallBitVector. The multiple bit tracking is useful when
-/// tracking state for multiple fields of the same root value. To do this, we
-/// actually track 2 bits per actual needed bit so we can represent 3 Dead,
-/// LiveOut, LiveWithin. This was previously unnecessary since we could just
-/// represent dead by not having liveness state for a block. With multiple bits
-/// possible this is no longer true.
-///
-/// TODO: For efficiency, use BasicBlockBitfield rather than SmallDenseMap.
 class PrunedLiveBlocks {
 public:
   /// Per-block liveness state computed during backward dataflow propagation.
@@ -169,110 +171,52 @@ public:
   /// LiveOut blocks are live on at least one successor path. LiveOut blocks may
   /// or may not contain defs or uses.
   ///
-  /// NOTE: The values below for Dead, LiveWithin, LiveOut were picked to ensure
-  /// that given a 2 bit representation of the value, a value is Dead if the
-  /// first bit is 0 and is LiveOut if the second bit is set.
+  /// NOTE: The values below for Dead, LiveWithin, LiveOut were picked to
+  /// establish a lattice such that:
+  /// - Dead is the initial state (zero bitfield)
+  /// - Merging liveness information is a bitwise-or
   enum IsLive {
     Dead = 0,
     LiveWithin = 1,
     LiveOut = 3,
   };
 
-  /// A bit vector that stores information about liveness. This is composed
-  /// with SmallBitVector since it contains two bits per liveness so that it
-  /// can represent 3 states, Dead, LiveWithin, LiveOut. We take advantage of
-  /// their numeric values to make testing easier \see documentation on IsLive.
-  class LivenessSmallBitVector {
-    SmallBitVector bits;
-
-  public:
-    LivenessSmallBitVector() : bits() {}
-
-    void init(unsigned numBits) {
-      assert(bits.size() == 0);
-      assert(numBits != 0);
-      bits.resize(numBits * 2);
-    }
-
-    unsigned size() const { return bits.size() / 2; }
-
-    // FIXME: specialize this for scalar liveness, which is the critical path
-    // for all OSSA utilities.
-    IsLive getLiveness(unsigned bitNo) const {
-      SmallVector<IsLive, 1> foundLiveness;
-      getLiveness(bitNo, bitNo + 1, foundLiveness);
-      return foundLiveness[0];
-    }
-
-    void getLiveness(unsigned startBitNo, unsigned endBitNo,
-                     SmallVectorImpl<IsLive> &resultingFoundLiveness) const {
-      unsigned actualStartBitNo = startBitNo * 2;
-      unsigned actualEndBitNo = endBitNo * 2;
-
-      // NOTE: We pad both before/after with Dead to ensure that we are
-      // returning an array that acts as a bit mask and thus can be directly
-      // compared against other such bitmasks. This invariant is used when
-      // computing boundaries.
-      for (unsigned i = 0; i != startBitNo; ++i) {
-        resultingFoundLiveness.push_back(Dead);
-      }
-      for (unsigned i = actualStartBitNo, e = actualEndBitNo; i != e; i += 2) {
-        if (!bits[i]) {
-          resultingFoundLiveness.push_back(Dead);
-          continue;
-        }
-
-        resultingFoundLiveness.push_back(bits[i + 1] ? LiveOut : LiveWithin);
-      }
-      for (unsigned i = endBitNo, e = size(); i != e; ++i) {
-        resultingFoundLiveness.push_back(Dead);
-      }
-    }
-
-    void setLiveness(unsigned startBitNo, unsigned endBitNo, IsLive isLive) {
-      for (unsigned i = startBitNo * 2, e = endBitNo * 2; i != e; i += 2) {
-        bits[i] = isLive & 1;
-        bits[i + 1] = isLive & 2;
-      }
-    }
-
-    void setLiveness(unsigned bitNo, IsLive isLive) {
-      setLiveness(bitNo, bitNo + 1, isLive);
-    }
-  };
-
 private:
-  /// Map all blocks in which current def is live to a SmallBitVector indicating
-  /// whether the value represented by said bit is also liveout of the block.
-  llvm::SmallDenseMap<SILBasicBlock *, LivenessSmallBitVector, 4> liveBlocks;
-
-  /// Number of bits of liveness to track. By default 1. Used to track multiple
-  /// liveness bits.
-  unsigned numBitsToTrack;
+  /// Map all blocks to an IsLive state.
+  BasicBlockBitfield liveBlocks;
 
   /// Optional vector of live blocks for clients that deterministically iterate.
-  SmallVectorImpl<SILBasicBlock *> *discoveredBlocks;
+  SmallVectorImpl<SILBasicBlock *> *discoveredBlocks = nullptr;
 
-  /// Once the first use has been seen, no definitions can be added.
-  SWIFT_ASSERT_ONLY_DECL(bool seenUse = false);
+  /// Once the first def has been initialized, uses can be added.
+  bool initializedFlag = false;
 
 public:
-  PrunedLiveBlocks(unsigned numBitsToTrack,
+  PrunedLiveBlocks(SILFunction *function,
                    SmallVectorImpl<SILBasicBlock *> *discoveredBlocks = nullptr)
-      : numBitsToTrack(numBitsToTrack), discoveredBlocks(discoveredBlocks) {
+      : liveBlocks(function, 2), discoveredBlocks(discoveredBlocks) {
     assert(!discoveredBlocks || discoveredBlocks->empty());
   }
 
-  unsigned getNumBitsToTrack() const { return numBitsToTrack; }
-
-  bool empty() const { return liveBlocks.empty(); }
-
-  void clear() {
-    liveBlocks.clear();
-    SWIFT_ASSERT_ONLY(seenUse = false);
+  PrunedLiveBlocks(PrunedLiveBlocks const &other,
+                   SmallVectorImpl<SILBasicBlock *> *discoveredBlocks = nullptr)
+      : liveBlocks(other.liveBlocks.getFunction(), 2),
+        discoveredBlocks(discoveredBlocks) {
+    assert(!discoveredBlocks || other.discoveredBlocks);
+    for (auto &block : *other.liveBlocks.getFunction()) {
+      liveBlocks.set(&block, other.liveBlocks.get(&block));
+    }
+    initializedFlag = other.initializedFlag;
   }
 
-  unsigned numLiveBlocks() const { return liveBlocks.size(); }
+  bool isInitialized() const { return initializedFlag; }
+
+  void initializeDiscoveredBlocks(
+      SmallVectorImpl<SILBasicBlock *> *discoveredBlocks) {
+    assert(!isInitialized() && "cannot reinitialize after blocks are live");
+
+    this->discoveredBlocks = discoveredBlocks;
+  }
 
   /// If the constructor was provided with a vector to populate, then this
   /// returns the list of all live blocks with no duplicates.
@@ -280,82 +224,55 @@ public:
     return *discoveredBlocks;
   }
 
-  void initializeDefBlock(SILBasicBlock *defBB, unsigned bitNo) {
-    markBlockLive(defBB, bitNo, LiveWithin);
-  }
-
-  void initializeDefBlock(SILBasicBlock *defBB, unsigned startBitNo,
-                          unsigned endBitNo) {
-    markBlockLive(defBB, startBitNo, endBitNo, LiveWithin);
+  void initializeDefBlock(SILBasicBlock *defBB) {
+    initializedFlag = true;
+    markBlockLive(defBB, LiveWithin);
   }
 
   /// Update this liveness result for a single use.
-  IsLive updateForUse(SILInstruction *user, unsigned bitNo) {
-    SmallVector<IsLive, 1> resultingLiveness;
-    updateForUse(user, bitNo, bitNo + 1, resultingLiveness);
-    return resultingLiveness[0];
-  }
+  ///
+  /// \p isUseBeforeDef is true if \p user occures before the first def in this
+  /// block. This indicates "liveness holes" inside the block, causing liveness
+  /// to propagate to predecessors.
+  IsLive updateForUse(SILInstruction *user, bool isUseBeforeDef) {
+    assert(isInitialized() && "at least one definition must be initialized");
 
-  /// Update this range of liveness results for a single use.
-  void updateForUse(SILInstruction *user, unsigned startBitNo,
-                    unsigned endBitNo,
-                    SmallVectorImpl<IsLive> &resultingLiveness);
-
-  IsLive getBlockLiveness(SILBasicBlock *bb, unsigned bitNo) const {
-    SmallVector<IsLive, 1> isLive;
-    getBlockLiveness(bb, bitNo, bitNo + 1, isLive);
-    return isLive[0];
-  }
-
-  // FIXME: This API should directly return the live bitset. The live bitset
-  // type should have an api for querying and iterating over the live fields.
-  void getBlockLiveness(SILBasicBlock *bb, unsigned startBitNo,
-                        unsigned endBitNo,
-                        SmallVectorImpl<IsLive> &foundLivenessInfo) const {
-    auto liveBlockIter = liveBlocks.find(bb);
-    if (liveBlockIter == liveBlocks.end()) {
-      for (unsigned i : range(numBitsToTrack)) {
-        (void)i;
-        foundLivenessInfo.push_back(Dead);
-      }
-      return;
+    auto *block = user->getParent();
+    if (!isUseBeforeDef) {
+      auto liveness = getBlockLiveness(block);
+      // If a block is already marked live, it must either "kill" liveness, or
+      // liveness was already propagated to its predecessors.
+      if (liveness != Dead)
+        return liveness;
     }
+    computeUseBlockLiveness(block);
+    return getBlockLiveness(block);
+  }
 
-    liveBlockIter->second.getLiveness(startBitNo, endBitNo, foundLivenessInfo);
+  IsLive getBlockLiveness(SILBasicBlock *bb) const {
+    assert(isInitialized());
+    return (IsLive)liveBlocks.get(bb);
   }
 
   llvm::StringRef getStringRef(IsLive isLive) const;
+
   void print(llvm::raw_ostream &OS) const;
+
   void dump() const;
 
 protected:
-  void markBlockLive(SILBasicBlock *bb, unsigned bitNo, IsLive isLive) {
-    markBlockLive(bb, bitNo, bitNo + 1, isLive);
-  }
-
-  void markBlockLive(SILBasicBlock *bb, unsigned startBitNo, unsigned endBitNo,
-                     IsLive isLive) {
+  void markBlockLive(SILBasicBlock *bb, IsLive isLive) {
     assert(isLive != Dead && "erasing live blocks isn't implemented.");
-    auto iterAndInserted =
-        liveBlocks.insert(std::make_pair(bb, LivenessSmallBitVector()));
-    if (iterAndInserted.second) {
-      // We initialize the size of the small bit vector here rather than in
-      // liveBlocks.insert above to prevent us from allocating upon failure if
-      // we have more than SmallBitVector's small size number of bits.
-      auto &insertedBV = iterAndInserted.first->getSecond();
-      insertedBV.init(numBitsToTrack);
-      insertedBV.setLiveness(startBitNo, endBitNo, isLive);
+    auto state = (IsLive)liveBlocks.get(bb);
+    liveBlocks.set(bb, state | isLive);
+    if (state == IsLive::Dead) {
       if (discoveredBlocks)
         discoveredBlocks->push_back(bb);
-    } else if (isLive == LiveOut) {
-      // Update the existing entry to be live-out.
-      iterAndInserted.first->getSecond().setLiveness(startBitNo, endBitNo,
-                                                     LiveOut);
     }
   }
 
-  void computeUseBlockLiveness(SILBasicBlock *userBB, unsigned startBitNo,
-                               unsigned endBitNo);
+private:
+  void computeUseBlockLiveness(SILBasicBlock *userBB);
 };
 
 /// If inner borrows are 'Contained', then liveness is fully described by the
@@ -372,8 +289,9 @@ protected:
 /// scope. Reborrows within nested borrows scopes are already summarized by the
 /// outer borrow scope.
 enum class InnerBorrowKind {
-  Contained, // any borrows are fully contained within this live range
-  Reborrowed // at least one immediately nested borrow is reborrowed
+  Contained,  // any borrows are fully contained within this live range
+  Reborrowed, // at least one immediately nested borrow is reborrowed
+  Escaped     // the end of the borrow scope is indeterminate
 };
 
 inline InnerBorrowKind meet(InnerBorrowKind lhs, InnerBorrowKind rhs) {
@@ -383,13 +301,13 @@ inline InnerBorrowKind meet(InnerBorrowKind lhs, InnerBorrowKind rhs) {
 /// Summarize reborrows and pointer escapes that affect a live range. Reborrows
 /// and pointer escapes that are encapsulated in a nested borrow don't affect
 /// the outer live range.
-struct SimpleLiveRangeSummary {
+struct LiveRangeSummary {
   InnerBorrowKind innerBorrowKind;
   AddressUseKind addressUseKind;
 
-  SimpleLiveRangeSummary(): innerBorrowKind(InnerBorrowKind::Contained),
-                            addressUseKind(AddressUseKind::NonEscaping)
-  {}
+  LiveRangeSummary()
+      : innerBorrowKind(InnerBorrowKind::Contained),
+        addressUseKind(AddressUseKind::NonEscaping) {}
 
   void meet(const InnerBorrowKind lhs) {
     innerBorrowKind = swift::meet(innerBorrowKind, lhs);
@@ -397,7 +315,7 @@ struct SimpleLiveRangeSummary {
   void meet(const AddressUseKind lhs) {
     addressUseKind = swift::meet(addressUseKind, lhs);
   }
-  void meet(const SimpleLiveRangeSummary lhs) {
+  void meet(const LiveRangeSummary lhs) {
     meet(lhs.innerBorrowKind);
     meet(lhs.addressUseKind);
   }
@@ -408,21 +326,27 @@ struct SimpleLiveRangeSummary {
 /// liveness boundary. Filtering out uses that are obviously not on the liveness
 /// boundary improves efficiency over tracking all uses.
 ///
-/// Additionally, all interesting uses that are potentially "lifetime-ending"
-/// are flagged. These instruction are included as interesting use points, even
-/// if they don't occur on the liveness boundary. Lifetime-ending uses that end
-/// up on the final liveness boundary may be used to end the lifetime. It is up
-/// to the client to determine which uses are potentially lifetime-ending. In
-/// OSSA, the lifetime-ending property might be determined by
-/// OwnershipConstraint::isLifetimeEnding(). In non-OSSA, it might be determined
-/// by deallocation. If a lifetime-ending use ends up within the liveness
-/// boundary, then it is up to the client to figure out how to "extend" the
-/// lifetime beyond those uses.
+/// The "interesting use" set flags potentially "lifetime-ending" uses. This
+/// merely caches Operand::isLifetimeEnding() for efficiency. It has no effect
+/// on liveness computation. These instructions are always included in the set
+/// of interesting use points, even if they don't occur on the liveness
+/// boundary. The client may later use that information to figure out how to
+/// "extend" a lifetime, for example by inserting copies.
 ///
-/// Note: a live-out block may contain a lifetime-ending use. This happens when
-/// the client is computing "extended" livenes, for example by ignoring
-/// copies. Lifetime ending uses are irrelevant for finding the liveness
-/// boundary.
+/// Consequently, a branch instruction may be marked as a non-lifetime-ending
+/// use, but modeled as as a use point in the predecessor block. This can
+/// confusingly result in liveness that ends *before* value's the lifetime ends:
+///
+///     left:           // live-within
+///       br merge(%)
+///     right:          // live-within
+///       br merge(%p)
+///     merge(%deadPhi) // dead
+///
+/// If deadPhi has guaranteed ownership, and has no outer adjacent phi that
+/// provides a separate borrow scope, then one would expect its phi operands to
+/// be live-out of the predecessors. visitInsertionPoints compensates by
+/// creating a "shared" insertion point in the merge block.
 ///
 /// Note: unlike OwnershipLiveRange, this represents a lifetime in terms of the
 /// CFG boundary rather that the use set, and, because it is "pruned", it only
@@ -430,6 +354,60 @@ struct SimpleLiveRangeSummary {
 /// necessarily include liveness up to destroy_value or end_borrow
 /// instructions.
 class PrunedLiveness {
+public:
+  /// A tristate describing how an instruction uses the value:
+  /// - non-ending: the value's lifetime does not end at the instruction;
+  ///               results from updateForUse(, lifetimeEnding: false)
+  /// - ending: the value's lifetime ends at the instruction; results from
+  ///           updateForUse(, lifetimeEnding: true)
+  /// - non-use: the instruction doesn't use the value but liveness was extended
+  ///            to it; results from extendToNonUse
+  ///
+  /// If an instruction is added to liveness with multiple LifetimeEnding
+  /// instances, the stored instance needs to be updated appropriately, taking
+  /// into account the instances that were already seen.
+  ///
+  /// For example, if Nonuse is seen after Ending, it is ignored: that the
+  /// instruction ends the lifetime takes priority: the instruction doesn't end
+  /// the lifetime of the value any less because liveness was extended to it.
+  ///
+  /// Similarly, if Ending is seen after NonEnding, it is ignored: that the
+  /// instruction ends the lifetime of a copy of the value can't change the fact
+  /// that liveness already extends _beyond_ the instruction because it was
+  /// already recognized as a non-ending use.
+  ///
+  /// This relationship of "overriding" is captured by the order of the cases in
+  /// LifetimeEnding::Value and which case overrides another is computed by
+  /// taking the meet--i.e. the lesser of the two cases overrides.
+  ///
+  /// Note: Taking the meet may not be appropriate for branch instructions
+  ///       which may need to be recognized as lifetime-ending when they have
+  ///       as uses both a reborrow and a guaranteed phi.
+  struct LifetimeEnding {
+    enum class Value {
+      // The instruction doesn't consume the value.
+      NonEnding,
+      // The instruction consumes the value.
+      Ending,
+      // The instruction doesn't use the value.
+      NonUse,
+    } value;
+
+    LifetimeEnding(Value value) : value(value) {}
+    operator Value() const { return value; }
+
+    static LifetimeEnding forUse(bool lifetimeEnding) {
+      return lifetimeEnding ? Value::Ending : Value::NonEnding;
+    }
+    bool isEnding() const { return value == Value::Ending; }
+
+    LifetimeEnding meet(LifetimeEnding const other) const {
+      return value < other.value ? *this : other;
+    }
+    void meetInPlace(LifetimeEnding const other) { *this = meet(other); }
+  };
+
+protected:
   PrunedLiveBlocks liveBlocks;
 
   // Map all "interesting" user instructions in this def's live range to a flag
@@ -441,23 +419,25 @@ class PrunedLiveness {
   // they may be the last use in the block.
   //
   // Non-lifetime-ending within a LiveOut block are uninteresting.
-  llvm::SmallMapVector<SILInstruction *, bool, 8> users;
+  llvm::SmallMapVector<SILInstruction *, LifetimeEnding, 8> users;
 
 public:
-  PrunedLiveness(SmallVectorImpl<SILBasicBlock *> *discoveredBlocks = nullptr)
-      : liveBlocks(1 /*num bits*/, discoveredBlocks) {}
+  PrunedLiveness(SILFunction *function,
+                 SmallVectorImpl<SILBasicBlock *> *discoveredBlocks = nullptr)
+      : liveBlocks(function, discoveredBlocks) {}
 
-  bool empty() const {
-    assert(!liveBlocks.empty() || users.empty());
-    return liveBlocks.empty();
+  PrunedLiveness(PrunedLiveness const &other,
+                 SmallVectorImpl<SILBasicBlock *> *discoveredBlocks = nullptr)
+      : liveBlocks(other.liveBlocks, discoveredBlocks), users(other.users) {}
+
+  bool isInitialized() const { return liveBlocks.isInitialized(); }
+
+  bool empty() const { return users.empty(); }
+
+  void initializeDiscoveredBlocks(
+      SmallVectorImpl<SILBasicBlock *> *discoveredBlocks) {
+    liveBlocks.initializeDiscoveredBlocks(discoveredBlocks);
   }
-
-  void clear() {
-    liveBlocks.clear();
-    users.clear();
-  }
-
-  unsigned numLiveBlocks() const { return liveBlocks.numLiveBlocks(); }
 
   /// If the constructor was provided with a vector to populate, then this
   /// returns the list of all live blocks with no duplicates.
@@ -466,32 +446,11 @@ public:
   }
 
   void initializeDefBlock(SILBasicBlock *defBB) {
-    liveBlocks.initializeDefBlock(defBB, 0);
+    liveBlocks.initializeDefBlock(defBB);
   }
 
-  /// For flexibility, \p lifetimeEnding is provided by the
-  /// caller. PrunedLiveness makes no assumptions about the def-use
-  /// relationships that generate liveness. For example, use->isLifetimeEnding()
-  /// cannot distinguish the end of the borrow scope that defines this extended
-  /// live range vs. a nested borrow scope within the extended live range.
-  void updateForUse(SILInstruction *user, bool lifetimeEnding);
-
-  /// Updates the liveness for a whole borrow scope, beginning at \p op.
-  /// Returns false if this cannot be done. This assumes that nested OSSA
-  /// lifetimes are complete.
-  InnerBorrowKind updateForBorrowingOperand(Operand *operand);
-
-  /// Update liveness for an interior pointer use. These are normally handled
-  /// like an instantaneous use. But if \p operand "borrows" a value for the
-  /// duration of a scoped address (store_borrow), then update liveness for the
-  /// entire scope. This assumes that nested OSSA lifetimes are complete.
-  AddressUseKind checkAndUpdateInteriorPointer(Operand *operand);
-
-  /// Update this liveness to extend across the given liveness.
-  void extendAcrossLiveness(PrunedLiveness &otherLiveness);
-
   PrunedLiveBlocks::IsLive getBlockLiveness(SILBasicBlock *bb) const {
-    return liveBlocks.getBlockLiveness(bb, 0);
+    return liveBlocks.getBlockLiveness(bb);
   }
 
   enum IsInterestingUser {
@@ -506,7 +465,82 @@ public:
     auto useIter = users.find(user);
     if (useIter == users.end())
       return NonUser;
-    return useIter->second ? LifetimeEndingUse : NonLifetimeEndingUse;
+    return useIter->second.isEnding() ? LifetimeEndingUse
+                                      : NonLifetimeEndingUse;
+  }
+
+  using ConstUserRange =
+      iterator_range<const std::pair<SILInstruction *, LifetimeEnding> *>;
+  ConstUserRange getAllUsers() const {
+    return llvm::make_range(users.begin(), users.end());
+  }
+
+  /// A namespace containing helper functors for use with various mapped
+  /// ranges. Intended to be used to hide these noise types when working in an
+  /// IDE.
+  struct RangeIterationHelpers {
+    struct MapFunctor {
+      SILInstruction *operator()(
+          const std::pair<SILInstruction *, LifetimeEnding> &pair) const {
+        // Strip off the const to ease use with other APIs.
+        return const_cast<SILInstruction *>(pair.first);
+      }
+    };
+
+    struct IsLifetimeEnding {
+      struct FilterFunctor {
+        bool operator()(
+            const std::pair<SILInstruction *, LifetimeEnding> &pair) const {
+          return pair.second.isEnding();
+        }
+      };
+
+      using MapFilterIter = llvm::mapped_iterator<
+          llvm::filter_iterator<
+              const std::pair<SILInstruction *, LifetimeEnding> *,
+              FilterFunctor>,
+          MapFunctor>;
+    };
+
+    struct NonLifetimeEnding {
+      struct FilterFunctor {
+        bool operator()(
+            const std::pair<SILInstruction *, LifetimeEnding> &pair) const {
+          return !pair.second.isEnding();
+        }
+      };
+
+      using MapFilterIter = llvm::mapped_iterator<
+          llvm::filter_iterator<
+              const std::pair<SILInstruction *, LifetimeEnding> *,
+              FilterFunctor>,
+          MapFunctor>;
+    };
+  };
+  using LifetimeEndingUserRange = llvm::iterator_range<
+      RangeIterationHelpers::IsLifetimeEnding::MapFilterIter>;
+
+  /// Return a range consisting of the current set of consuming users fed into
+  /// this PrunedLiveness instance.
+  LifetimeEndingUserRange getLifetimeEndingUsers() const {
+    return map_range(
+        llvm::make_filter_range(
+            getAllUsers(),
+            RangeIterationHelpers::IsLifetimeEnding::FilterFunctor()),
+        RangeIterationHelpers::MapFunctor());
+  }
+
+  using NonLifetimeEndingUserRange = llvm::iterator_range<
+      RangeIterationHelpers::NonLifetimeEnding::MapFilterIter>;
+
+  /// Return a range consisting of the current set of non lifetime ending users
+  /// fed into this PrunedLiveness instance.
+  NonLifetimeEndingUserRange getNonLifetimeEndingUsers() const {
+    return map_range(
+        llvm::make_filter_range(
+            getAllUsers(),
+            RangeIterationHelpers::NonLifetimeEnding::FilterFunctor()),
+        RangeIterationHelpers::MapFunctor());
   }
 
   void print(llvm::raw_ostream &OS) const;
@@ -565,12 +599,53 @@ protected:
     return static_cast<const LivenessWithDefs &>(*this);
   }
 
-  PrunedLiveRange(SmallVectorImpl<SILBasicBlock *> *discoveredBlocks = nullptr)
-      : PrunedLiveness(discoveredBlocks) {}
+  PrunedLiveRange(SILFunction *function,
+                  SmallVectorImpl<SILBasicBlock *> *discoveredBlocks = nullptr)
+      : PrunedLiveness(function, discoveredBlocks) {}
+
+  PrunedLiveRange(PrunedLiveRange const &other,
+                  SmallVectorImpl<SILBasicBlock *> *discoveredBlocks = nullptr)
+      : PrunedLiveness(other, discoveredBlocks) {}
+
+  LiveRangeSummary recursivelyUpdateForDef(SILValue initialDef,
+                                           ValueSet &visited,
+                                           SILValue value);
 
 public:
-  /// Update liveness for all direct uses of \p def.
-  SimpleLiveRangeSummary updateForDef(SILValue def);
+  /// Add \p inst to liveness which uses the def as indicated by \p usage.
+  void updateForUse(SILInstruction *inst, LifetimeEnding usage);
+
+  /// For flexibility, \p lifetimeEnding is provided by the
+  /// caller. PrunedLiveness makes no assumptions about the def-use
+  /// relationships that generate liveness. For example, use->isLifetimeEnding()
+  /// cannot distinguish the end of the borrow scope that defines this extended
+  /// live range vs. a nested borrow scope within the extended live range.
+  void updateForUse(SILInstruction *user, bool lifetimeEnding);
+
+  /// Adds \p inst which doesn't use the def to liveness.
+  ///
+  /// Different from calling updateForUse because it never overrides the value
+  /// \p lifetimeEnding stored for \p inst.
+  void extendToNonUse(SILInstruction *inst);
+
+  /// Updates the liveness for a whole borrow scope, beginning at \p op.
+  /// Returns false if this cannot be done. This assumes that nested OSSA
+  /// lifetimes are complete.
+  InnerBorrowKind updateForBorrowingOperand(Operand *operand);
+
+  /// Update liveness for an interior pointer use. These are normally handled
+  /// like an instantaneous use. But if \p operand "borrows" a value for the
+  /// duration of a scoped address (store_borrow), then update liveness for the
+  /// entire scope. This assumes that nested OSSA lifetimes are complete.
+  AddressUseKind checkAndUpdateInteriorPointer(Operand *operand);
+
+  /// Update this liveness to extend across the given liveness.
+  void extendAcrossLiveness(PrunedLiveness &otherLiveness);
+
+  /// Update liveness for all direct uses of \p def. Transitively follows
+  /// guaranteed forwards up to but not including guaranteed phis. If \p def is
+  /// used by a guaranteed phi return InnerBorrowKind::Reborrowed.
+  LiveRangeSummary updateForDef(SILValue def);
 
   /// Check if \p inst occurs in between the definition this def and the
   /// liveness boundary.
@@ -634,16 +709,19 @@ class SSAPrunedLiveness : public PrunedLiveRange<SSAPrunedLiveness> {
 
 public:
   SSAPrunedLiveness(
+      SILFunction *function,
       SmallVectorImpl<SILBasicBlock *> *discoveredBlocks = nullptr)
-      : PrunedLiveRange(discoveredBlocks) {}
+      : PrunedLiveRange(function, discoveredBlocks) {}
+
+  SSAPrunedLiveness(
+      SSAPrunedLiveness const &other,
+      SmallVectorImpl<SILBasicBlock *> *discoveredBlocks = nullptr)
+      : PrunedLiveRange(other, discoveredBlocks) {
+    def = other.def;
+    defInst = other.defInst;
+  }
 
   SILValue getDef() const { return def; }
-
-  void clear() {
-    def = SILValue();
-    defInst = nullptr;
-    PrunedLiveRange::clear();
-  }
 
   void initializeDef(SILValue def) {
     assert(!this->def && "reinitialization");
@@ -660,6 +738,9 @@ public:
   bool isDefBlock(SILBasicBlock *block) const {
     return def->getParentBlock() == block;
   }
+
+  /// In SSA, uses never occur before the single def.
+  bool isUserBeforeDef(SILInstruction *user) const { return false; }
 
   /// SSA implementation of computeBoundary.
   void findBoundariesInBlock(SILBasicBlock *block, bool isLiveOut,
@@ -679,7 +760,7 @@ public:
   /// jointly-post dominate if dead-end blocks are present. Nested scopes may
   /// also lack scope-ending instructions, so the liveness of their nested uses
   /// may be ignored.
-  SimpleLiveRangeSummary computeSimple() {
+  LiveRangeSummary computeSimple() {
     assert(def && "SSA def uninitialized");
     return updateForDef(def);
   }
@@ -693,34 +774,61 @@ class MultiDefPrunedLiveness : public PrunedLiveRange<MultiDefPrunedLiveness> {
   NodeSetVector defs;
   BasicBlockSet defBlocks;
 
-public:
-  MultiDefPrunedLiveness(
-      SILFunction *function,
-      SmallVectorImpl<SILBasicBlock *> *discoveredBlocks = nullptr)
-      : PrunedLiveRange(discoveredBlocks), defs(function), defBlocks(function) {
-  }
-
-  void clear() {
-    llvm_unreachable("multi-def liveness cannot be reused");
-  }
-
-  void initializeDef(SILNode *def) {
-    assert(isa<SILInstruction>(def) || isa<SILArgument>(def));
+  void initializeDefNode(SILNode *def) {
     defs.insert(def);
     auto *block = def->getParentBlock();
     defBlocks.insert(block);
     initializeDefBlock(block);
   }
 
+public:
+  MultiDefPrunedLiveness(
+      SILFunction *function,
+      SmallVectorImpl<SILBasicBlock *> *discoveredBlocks = nullptr)
+      : PrunedLiveRange(function, discoveredBlocks), defs(function),
+        defBlocks(function) {}
+
+  void initializeDef(SILInstruction *defInst) {
+    initializeDefNode(cast<SILNode>(defInst));
+  }
+
+  void initializeDef(SILArgument *defArg) { initializeDefNode(defArg); }
+
+  void initializeDef(SILValue value) {
+    if (auto arg = dyn_cast<SILArgument>(value)) {
+      initializeDefNode(arg);
+    } else {
+      initializeDef(value->getDefiningInstruction());
+    }
+  }
+
   bool isInitialized() const { return !defs.empty(); }
+
+  NodeSetVector::iterator defBegin() const { return defs.begin(); }
+  NodeSetVector::iterator defEnd() const { return defs.end(); }
 
   bool isDef(SILInstruction *inst) const {
     return defs.contains(cast<SILNode>(inst));
   }
 
+  bool isDef(SILArgument *arg) const {
+    return defs.contains(arg);
+  }
+
   bool isDefBlock(SILBasicBlock *block) const {
     return defBlocks.contains(block);
   }
+
+  /// Return true if \p user occurs before the first def in the same basic
+  /// block. In classical liveness dataflow terms, gen/kill conditions over all
+  /// users in 'bb' are:
+  ///
+  ///   Gen(bb)  |= !isDefBlock(bb) || isUserBeforeDef(bb)
+  ///   Kill(bb) &= isDefBlock(bb) && !isUserBeforeDef(bb)
+  ///
+  /// If 'bb' has no users, it is neither a Gen nor Kill. Otherwise, Gen and
+  /// Kill are complements.
+  bool isUserBeforeDef(SILInstruction *user) const;
 
   /// Multi-Def implementation of computeBoundary.
   void findBoundariesInBlock(SILBasicBlock *block, bool isLiveOut,
@@ -742,7 +850,7 @@ public:
   /// jointly-post dominate if dead-end blocks are present. Nested scopes may
   /// also lack scope-ending instructions, so the liveness of their nested uses
   /// may be ignored.
-  SimpleLiveRangeSummary computeSimple();
+  LiveRangeSummary computeSimple();
 };
 
 //===----------------------------------------------------------------------===//
@@ -755,21 +863,16 @@ class DiagnosticPrunedLiveness : public SSAPrunedLiveness {
   /// A side array that stores any non lifetime ending uses we find in live out
   /// blocks. This is used to enable our callers to emit errors on non-lifetime
   /// ending uses that extend liveness into a loop body.
-  SmallSetVector<SILInstruction *, 8> *nonLifetimeEndingUsesInLiveOut;
+  llvm::SmallSetVector<SILInstruction *, 8> *nonLifetimeEndingUsesInLiveOut;
 
 public:
   DiagnosticPrunedLiveness(
+      SILFunction *function,
       SmallVectorImpl<SILBasicBlock *> *discoveredBlocks = nullptr,
-      SmallSetVector<SILInstruction *, 8> *nonLifetimeEndingUsesInLiveOut =
+      llvm::SmallSetVector<SILInstruction *, 8> *nonLifetimeEndingUsesInLiveOut =
           nullptr)
-      : SSAPrunedLiveness(discoveredBlocks),
+      : SSAPrunedLiveness(function, discoveredBlocks),
         nonLifetimeEndingUsesInLiveOut(nonLifetimeEndingUsesInLiveOut) {}
-
-  void clear() {
-    SSAPrunedLiveness::clear();
-    if (nonLifetimeEndingUsesInLiveOut)
-      nonLifetimeEndingUsesInLiveOut->clear();
-  }
 
   void updateForUse(SILInstruction *user, bool lifetimeEnding);
 

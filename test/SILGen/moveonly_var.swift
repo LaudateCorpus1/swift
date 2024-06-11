@@ -1,22 +1,30 @@
-// RUN: %target-swift-emit-silgen -enable-experimental-move-only %s | %FileCheck %s
-// RUN: %target-swift-emit-sil -enable-experimental-move-only %s | %FileCheck %s
+// RUN: %target-swift-emit-silgen -enable-experimental-feature MoveOnlyClasses %s | %FileCheck %s
+// RUN: %target-swift-emit-sil -O -sil-verify-all -enable-experimental-feature MoveOnlyClasses %s | %FileCheck %s
 
 //////////////////
 // Declarations //
 //////////////////
 
+class OrdinaryClass {}
+
+@_moveOnly
+public enum MaybeKlass {
+    case just(Klass)
+    case none
+}
+
 @_moveOnly
 public class Klass {
     var intField: Int
-    var klsField: Klass?
+    var klsField: OrdinaryClass // FIXME(104504239): this is suppose to be MaybeKlass, or better yet, Optional<Klass>
 
     init() {
-        klsField = Klass()
+        klsField = OrdinaryClass()
         intField = 5
     }
 }
 
-public func nonConsumingUseKlass(_ k: Klass) {}
+public func nonConsumingUseKlass(_ k: borrowing Klass) {}
 
 ///////////
 // Tests //

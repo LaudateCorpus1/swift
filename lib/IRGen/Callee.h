@@ -78,6 +78,15 @@ namespace irgen {
                                 llvm::Value *storageAddress,
                                 const PointerAuthEntity &entity);
 
+    static PointerAuthInfo emit(IRGenFunction &IGF,
+                                clang::PointerAuthQualifier pointerAuthQual,
+                                llvm::Value *storageAddress);
+
+    static PointerAuthInfo emit(IRGenFunction &IGF,
+                                const PointerAuthSchema &schema,
+                                llvm::Value *storageAddress,
+                                llvm::ConstantInt *otherDiscriminator);
+
     static PointerAuthInfo forFunctionPointer(IRGenModule &IGM,
                                               CanSILFunctionType fnType);
 
@@ -175,7 +184,9 @@ namespace irgen {
       AsyncLetGetThrowing,
       AsyncLetFinish,
       TaskGroupWaitNext,
+      TaskGroupWaitAll,
       DistributedExecuteTarget,
+      KeyPathAccessor,
     };
 
   private:
@@ -226,7 +237,7 @@ namespace irgen {
     /// defined in the runtime.  Without this, we'll attempt to load
     /// the context size from an async FP symbol which the runtime
     /// doesn't actually emit.
-    Optional<Size> getStaticAsyncContextSize(IRGenModule &IGM) const;
+    std::optional<Size> getStaticAsyncContextSize(IRGenModule &IGM) const;
 
     /// Given that this is an async function, should we pass the
     /// continuation function pointer and context directly to it
@@ -247,8 +258,10 @@ namespace irgen {
       case SpecialKind::AsyncLetGetThrowing:
       case SpecialKind::AsyncLetFinish:
       case SpecialKind::TaskGroupWaitNext:
+      case SpecialKind::TaskGroupWaitAll:
         return true;
       case SpecialKind::DistributedExecuteTarget:
+      case SpecialKind::KeyPathAccessor:
         return false;
       }
       llvm_unreachable("covered switch");
@@ -277,6 +290,10 @@ namespace irgen {
       case SpecialKind::AsyncLetGetThrowing:
       case SpecialKind::AsyncLetFinish:
       case SpecialKind::TaskGroupWaitNext:
+      case SpecialKind::TaskGroupWaitAll:
+      // KeyPath accessor functions receive their generic arguments
+      // as part of indices buffer.
+      case SpecialKind::KeyPathAccessor:
         return true;
       case SpecialKind::DistributedExecuteTarget:
         return false;
@@ -319,6 +336,14 @@ namespace irgen {
     llvm::Type *awaitSignature = nullptr;
     bool useSignature = false;
 
+    // True when this function pointer points to a non-throwing foreign
+    // function.
+    bool isForeignNoThrow = false;
+
+    // True when this function pointer points to a foreign function that traps
+    // on exception in the always_inline thunk.
+    bool foreignCallCatchesExceptionInThunk = false;
+
     explicit FunctionPointer(Kind kind, llvm::Value *value,
                              const Signature &signature)
         : FunctionPointer(kind, value, PointerAuthInfo(), signature) {}
@@ -338,9 +363,6 @@ namespace irgen {
                              llvm::Type *awaitSignature = nullptr)
         : kind(kind), Value(value), SecondaryValue(secondaryValue),
           AuthInfo(authInfo), Sig(signature), awaitSignature(awaitSignature) {
-      // The function pointer should have function type.
-      assert(!value->getContext().supportsTypedPointers() ||
-             value->getType()->getNonOpaquePointerElementType()->isFunctionTy());
       // TODO: maybe assert similarity to signature.getType()?
       if (authInfo) {
         if (kind == Kind::Function) {
@@ -470,7 +492,7 @@ namespace irgen {
     /// Form a FunctionPointer whose Kind is ::Function.
     FunctionPointer getAsFunction(IRGenFunction &IGF) const;
 
-    Optional<Size> getStaticAsyncContextSize(IRGenModule &IGM) const {
+    std::optional<Size> getStaticAsyncContextSize(IRGenModule &IGM) const {
       return kind.getStaticAsyncContextSize(IGM);
     }
     bool shouldPassContinuationDirectly() const {
@@ -478,6 +500,24 @@ namespace irgen {
     }
     bool shouldSuppressPolymorphicArguments() const {
       return kind.shouldSuppressPolymorphicArguments();
+    }
+
+    void setForeignNoThrow() { isForeignNoThrow = true; }
+
+    bool canThrowForeignException() const {
+      return getForeignInfo().canThrow && !isForeignNoThrow;
+    }
+
+    void setForeignCallCatchesExceptionInThunk() {
+      foreignCallCatchesExceptionInThunk = true;
+    }
+
+    bool doesForeignCallCatchExceptionInThunk() {
+      return foreignCallCatchesExceptionInThunk;
+    }
+
+    bool shouldUseInvoke() const {
+      return canThrowForeignException() && !foreignCallCatchesExceptionInThunk;
     }
   };
 
@@ -542,7 +582,7 @@ namespace irgen {
       return Fn.getSignature();
     }
 
-    Optional<Size> getStaticAsyncContextSize(IRGenModule &IGM) const {
+    std::optional<Size> getStaticAsyncContextSize(IRGenModule &IGM) const {
       return Fn.getStaticAsyncContextSize(IGM);
     }
     bool shouldPassContinuationDirectly() const {
@@ -569,6 +609,7 @@ namespace irgen {
     /// Given that this callee is an ObjC method, return the receiver
     /// argument.  This might not be 'self' anymore.
     llvm::Value *getObjCMethodSelector() const;
+    bool isDirectObjCMethod() const;
   };
 
   FunctionPointer::Kind classifyFunctionPointerKind(SILFunction *fn);

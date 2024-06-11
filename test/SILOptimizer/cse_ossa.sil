@@ -1,4 +1,4 @@
-// RUN: %target-sil-opt -enable-sil-verify-all %s -cse | %FileCheck %s
+// RUN: %target-sil-opt -enable-sil-verify-all %s -update-borrowed-from -cse | %FileCheck %s
 sil_stage canonical
 
 import Builtin
@@ -1186,7 +1186,7 @@ bb0:
 
 // CHECK-LABEL: sil [ossa] @cse_mark_dependence2 :
 // CHECK: mark_dependence
-// CHECK-NOT: mark_dependence
+// CHECK: mark_dependence
 // CHECK-LABEL: } // end sil function 'cse_mark_dependence2'
 sil [ossa] @cse_mark_dependence2 : $@convention(thin) (@inout Builtin.Int64, @guaranteed Builtin.NativeObject) -> (Builtin.Int64, Builtin.Int64) {
 bb0(%0 : $*Builtin.Int64, %1 : @guaranteed $Builtin.NativeObject):

@@ -26,11 +26,11 @@
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/InstOptUtils.h"
-#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include <optional>
 
 STATISTIC(NumSunk, "Number of instructions sunk");
 STATISTIC(NumRefCountOpsSimplified, "Number of enum ref count ops simplified");
@@ -139,7 +139,7 @@ public:
 
   using iterator = decltype(ValueToCaseMap)::iterator;
   iterator begin() { return ValueToCaseMap.getItems().begin(); }
-  iterator end() { return ValueToCaseMap.getItems().begin(); }
+  iterator end() { return ValueToCaseMap.getItems().end(); }
 
   void clear() { ValueToCaseMap.clear(); }
 
@@ -564,6 +564,10 @@ bool BBEnumTagDataflowState::visitReleaseValueInst(ReleaseValueInst *RVI) {
   if (FindResult == ValueToCaseMap.end())
     return false;
 
+  // If the enum has a deinit, preserve the original release.
+  if (hasValueDeinit(RVI->getOperand()))
+    return false;
+
   // If we do not have any argument, just delete the release value.
   if (!(*FindResult)->second->hasAssociatedValues()) {
     RVI->eraseFromParent();
@@ -620,6 +624,10 @@ bool BBEnumTagDataflowState::hoistDecrementsIntoSwitchRegions(
                                 "list for release_value's operand. Bailing!\n");
       continue;
     }
+
+    // If the enum has a deinit, preserve the original release.
+    if (hasValueDeinit(Op))
+      return false;
 
     auto &EnumBBCaseList = (*R)->second;
     // If we don't have an enum tag for each predecessor of this BB, bail since
@@ -811,7 +819,7 @@ void BBEnumTagDataflowState::dump() const {
   llvm::dbgs() << "Dumping state for BB" << BB.get()->getDebugID() << "\n";
   llvm::dbgs() << "Block States:\n";
   for (auto &P : ValueToCaseMap) {
-    if (!P.hasValue()) {
+    if (!P) {
       llvm::dbgs() << "  Skipping blotted value.\n";
       continue;
     }
@@ -827,7 +835,7 @@ void BBEnumTagDataflowState::dump() const {
   llvm::dbgs() << "Predecessor States:\n";
   // For each (EnumValue, [(BB, EnumTag)]) that we are tracking...
   for (auto &P : EnumToEnumBBCaseListMap) {
-    if (!P.hasValue()) {
+    if (!P) {
       llvm::dbgs() << "  Skipping blotted value.\n";
       continue;
     }
@@ -948,7 +956,7 @@ enum OperandRelation {
 ///
 /// bb1:
 ///  %3 = unchecked_enum_data %0 : $Optional<X>, #Optional.Some!enumelt
-///  checked_cast_br [exact] %3 : $X to $X, bb4, bb5 // id: %4
+///  checked_cast_br [exact] X in %3 : $X to $X, bb4, bb5 // id: %4
 ///
 /// bb4(%10 : $X):                                    // Preds: bb1
 ///  strong_release %10 : $X
@@ -1057,7 +1065,7 @@ SILInstruction *findIdenticalInBlock(SILBasicBlock *BB, SILInstruction *Iden,
 /// to the successor instead of the whole instruction.
 /// Return None if no such operand could be found, otherwise return the index
 /// of a suitable operand.
-static llvm::Optional<unsigned>
+static std::optional<unsigned>
 cheaperToPassOperandsAsArguments(SILInstruction *First,
                                  SILInstruction *Second) {
   // This will further enable to sink strong_retain_unowned instructions,
@@ -1074,33 +1082,33 @@ cheaperToPassOperandsAsArguments(SILInstruction *First,
   auto *SecondStruct = dyn_cast<StructInst>(Second);
 
   if (!FirstStruct || !SecondStruct)
-    return None;
+    return std::nullopt;
 
   assert(FirstStruct->getNumOperands() == SecondStruct->getNumOperands() &&
          FirstStruct->getType() == SecondStruct->getType() &&
          "Types should be identical");
 
-  llvm::Optional<unsigned> DifferentOperandIndex;
+  std::optional<unsigned> DifferentOperandIndex;
 
   // Check operands.
   for (unsigned i = 0, e = First->getNumOperands(); i != e; ++i) {
     if (FirstStruct->getOperand(i) != SecondStruct->getOperand(i)) {
       // Only track one different operand for now
       if (DifferentOperandIndex)
-        return None;
+        return std::nullopt;
       DifferentOperandIndex = i;
     }
   }
 
   if (!DifferentOperandIndex)
-    return None;
+    return std::nullopt;
 
   // Found a different operand, now check to see if its type is something
   // cheap enough to sink.
   // TODO: Sink more than just integers.
   SILType ArgTy = FirstStruct->getOperand(*DifferentOperandIndex)->getType();
   if (!ArgTy.is<BuiltinIntegerType>())
-    return None;
+    return std::nullopt;
 
   return *DifferentOperandIndex;
 }
@@ -1184,7 +1192,7 @@ static bool sinkArgument(EnumCaseDataflowContext &Context, SILBasicBlock *BB, un
 
   // If the instructions are different, but only in terms of a cheap operand
   // then we can still sink it, and create new arguments for this operand.
-  llvm::Optional<unsigned> DifferentOperandIndex;
+  std::optional<unsigned> DifferentOperandIndex;
 
   // Check if the Nth argument in all predecessors is identical.
   for (auto P : BB->getPredecessorBlocks()) {
@@ -1230,7 +1238,7 @@ static bool sinkArgument(EnumCaseDataflowContext &Context, SILBasicBlock *BB, un
     Clones.push_back(SI);
   }
 
-  auto *Undef = SILUndef::get(FSI->getType(), *BB->getParent());
+  auto *Undef = SILUndef::get(FSI);
 
   // Delete the debug info of the instruction that we are about to sink.
   deleteAllDebugUses(FSI);
@@ -1508,6 +1516,10 @@ static bool tryToSinkRefCountAcrossSwitch(SwitchEnumInst *Switch,
       RCIA->getRCIdentityRoot(Switch->getOperand()))
     return false;
 
+  // If the enum has a deinit, preserve the original release.
+  assert(!hasValueDeinit(Ptr) &&
+         "enum with deinit is not RC-identical to its payload");
+
   // If S has a default case bail since the default case could represent
   // multiple cases.
   //
@@ -1577,6 +1589,10 @@ static bool tryToSinkRefCountAcrossSelectEnum(CondBranchInst *CondBr,
   if (RCIA->getRCIdentityRoot(Ptr) !=
       RCIA->getRCIdentityRoot(SEI->getEnumOperand()))
     return false;
+
+  // If the enum has a deinit, preserve the original release.
+  assert(!hasValueDeinit(Ptr) &&
+         "enum with deinit is not RC-identical to its payload");
 
   // Work out which enum element is the true branch, and which is false.
   // If the enum only has 2 values and its tag isn't the true branch, then we

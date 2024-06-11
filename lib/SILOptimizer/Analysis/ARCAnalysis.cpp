@@ -104,7 +104,7 @@ static bool canApplyOfBuiltinUseNonTrivialValues(BuiltinInst *BInst) {
   auto &II = BInst->getIntrinsicInfo();
   if (II.ID != llvm::Intrinsic::not_intrinsic) {
     auto attrs = II.getOrCreateAttributes(F->getASTContext());
-    if (attrs.hasFnAttr(llvm::Attribute::ReadNone)) {
+    if (attrs.getMemoryEffects().doesNotAccessMemory()) {
       for (auto &Op : BInst->getAllOperands()) {
         if (!Op.get()->getType().isTrivial(*F)) {
           return true;
@@ -176,6 +176,8 @@ bool swift::canUseObject(SILInstruction *Inst) {
   case SILInstructionKind::RawPointerToRefInst:
   case SILInstructionKind::UnconditionalCheckedCastInst:
   case SILInstructionKind::UncheckedBitwiseCastInst:
+  case SILInstructionKind::EndInitLetRefInst:
+  case SILInstructionKind::BeginDeallocRefInst:
     return false;
 
   // If we have a trivial bit cast between trivial types, it is not something
@@ -282,24 +284,14 @@ bool swift::mayHaveSymmetricInterference(SILInstruction *User, SILValue Ptr, Ali
   if (!canUseObject(User))
     return false;
 
-  // Check whether releasing this value can call deinit and interfere with User.
-  if (AA->mayValueReleaseInterfereWithInstruction(User, Ptr))
+  if (auto *LI = dyn_cast<LoadInst>(User)) {
+    return AA->isAddrVisibleFromObject(LI->getOperand(), Ptr);
+  }
+  if (auto *SI = dyn_cast<StoreInst>(User)) {
+    return AA->isAddrVisibleFromObject(SI->getDest(), Ptr);
+  }
+  if (User->mayReadOrWriteMemory())
     return true;
-
-  // If the user is a load or a store and we can prove that it does not access
-  // the object then return true.
-  // Notice that we need to check all of the values of the object.
-  if (isa<StoreInst>(User)) {
-    if (AA->mayWriteToMemory(User, Ptr))
-      return true;
-    return false;
-  }
-
-  if (isa<LoadInst>(User) ) {
-    if (AA->mayReadFromMemory(User, Ptr))
-      return true;
-    return false;
-  }
 
   // If we have a terminator instruction, see if it can use ptr. This currently
   // means that we first show that TI cannot indirectly use Ptr and then use
@@ -366,18 +358,15 @@ bool swift::mustGuaranteedUseValue(SILInstruction *User, SILValue Ptr,
 /// If \p Op has arc uses in the instruction range [Start, End), return the
 /// first such instruction. Otherwise return None. We assume that
 /// Start and End are both in the same basic block.
-Optional<SILBasicBlock::iterator>
-swift::
-valueHasARCUsesInInstructionRange(SILValue Op,
-                                  SILBasicBlock::iterator Start,
-                                  SILBasicBlock::iterator End,
-                                  AliasAnalysis *AA) {
+std::optional<SILBasicBlock::iterator> swift::valueHasARCUsesInInstructionRange(
+    SILValue Op, SILBasicBlock::iterator Start, SILBasicBlock::iterator End,
+    AliasAnalysis *AA) {
   assert(Start->getParent() == End->getParent() &&
          "Start and End should be in the same basic block");
 
   // If Start == End, then we have an empty range, return false.
   if (Start == End)
-    return None;
+    return std::nullopt;
 
   // Otherwise, until Start != End.
   while (Start != End) {
@@ -390,13 +379,13 @@ valueHasARCUsesInInstructionRange(SILValue Op,
   }
 
   // If all such instructions cannot use Op, return false.
-  return None;
+  return std::nullopt;
 }
 
 /// If \p Op has arc uses in the instruction range (Start, End], return the
 /// first such instruction. Otherwise return None. We assume that Start and End
 /// are both in the same basic block.
-Optional<SILBasicBlock::iterator>
+std::optional<SILBasicBlock::iterator>
 swift::valueHasARCUsesInReverseInstructionRange(SILValue Op,
                                                 SILBasicBlock::iterator Start,
                                                 SILBasicBlock::iterator End,
@@ -408,7 +397,7 @@ swift::valueHasARCUsesInReverseInstructionRange(SILValue Op,
 
   // If Start == End, then we have an empty range, return false.
   if (Start == End)
-    return None;
+    return std::nullopt;
 
   // Otherwise, until End == Start.
   while (Start != End) {
@@ -421,25 +410,23 @@ swift::valueHasARCUsesInReverseInstructionRange(SILValue Op,
   }
 
   // If all such instructions cannot use Op, return false.
-  return None;
+  return std::nullopt;
 }
 
 /// If \p Op has instructions in the instruction range (Start, End] which may
 /// decrement it, return the first such instruction. Returns None
 /// if no such instruction exists. We assume that Start and End are both in the
 /// same basic block.
-Optional<SILBasicBlock::iterator>
-swift::
-valueHasARCDecrementOrCheckInInstructionRange(SILValue Op,
-                                              SILBasicBlock::iterator Start,
-                                              SILBasicBlock::iterator End,
-                                              AliasAnalysis *AA) {
+std::optional<SILBasicBlock::iterator>
+swift::valueHasARCDecrementOrCheckInInstructionRange(
+    SILValue Op, SILBasicBlock::iterator Start, SILBasicBlock::iterator End,
+    AliasAnalysis *AA) {
   assert(Start->getParent() == End->getParent() &&
          "Start and End should be in the same basic block");
 
   // If Start == End, then we have an empty range, return nothing.
   if (Start == End)
-    return None;
+    return std::nullopt;
 
   // Otherwise, until Start != End.
   while (Start != End) {
@@ -453,7 +440,7 @@ valueHasARCDecrementOrCheckInInstructionRange(SILValue Op,
   }
 
   // If all such instructions cannot decrement Op, return nothing.
-  return None;
+  return std::nullopt;
 }
 
 bool
@@ -511,7 +498,7 @@ mayGuaranteedUseValue(SILInstruction *User, SILValue Ptr, AliasAnalysis *AA) {
   for (unsigned i : indices(Params)) {    
     if (!Params[i].isGuaranteed())
       continue;
-    SILValue Op = FAS.getArgument(i);
+    SILValue Op = FAS.getArgumentsWithoutIndirectResults()[i];
     if (!AA->isNoAlias(Op, Ptr))
       return true;
   }
@@ -941,8 +928,7 @@ void ConsumedArgToEpilogueReleaseMatcher::collectMatchingReleases(
     // we could make this more general by allowing for intervening non-arg
     // releases in the sense that we do not allow for race conditions in between
     // destructors.
-    if (!arg ||
-        !isOneOfConventions(arg->getArgumentConvention(), ArgumentConventions))
+    if (!isOneOfConventions(arg->getArgumentConvention(), ArgumentConventions))
       break;
 
     // Ok, we have a release on a SILArgument that has a consuming convention.

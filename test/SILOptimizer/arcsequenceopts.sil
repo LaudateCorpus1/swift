@@ -2,6 +2,8 @@
 // RUN: %target-sil-opt -enable-sil-verify-all -enable-loop-arc=1 -arc-sequence-opts %s | %FileCheck -check-prefix=CHECK -check-prefix=CHECK-LOOP %s
 // RUN: %target-sil-opt -enable-sil-verify-all -arc-loop-opts  %s | %FileCheck -check-prefix=CHECK -check-prefix=CHECK-LOOP %s
 
+// REQUIRES: swift_in_compiler
+
 sil_stage canonical
 
 import Builtin
@@ -46,6 +48,17 @@ class C {
   init()
   var w : FakeOptional<Builtin.NativeObject>
 }
+
+enum E {
+  case A(C)
+  case B
+}
+
+struct StructWithEnum {
+  @_hasStorage var e: E { get }
+  init(e: E)
+}
+
 
 sil @cls_use : $@convention(thin) (@owned Cls) -> ()
 
@@ -400,12 +413,14 @@ struct Int {
 }
 
 sil @guaranteed_call : $@convention(thin) (@guaranteed <τ_0_0> { var τ_0_0 } <Builtin.Int64>) -> () {
+[%0: noescape **]
 bb0(%0 : $<τ_0_0> { var τ_0_0 } <Builtin.Int64>):
   %1 = tuple ()
   return %1 : $()
 }
 
 sil @guaranteed_box_throwing_use : $@convention(thin) (@guaranteed <τ_0_0> { var τ_0_0 } <Builtin.Int64>) -> @error any Error {
+[%0: noescape **]
 bb0(%0 : $<τ_0_0> { var τ_0_0 } <Builtin.Int64>):
   %1 = tuple ()
   return %1 : $()
@@ -582,8 +597,9 @@ bb0(%0 : $RetainUser, %1 : $<τ_0_0> { var τ_0_0 } <Builtin.Int32>):
 // CHECK-LABEL: sil @remove_retain_release_over_no_release_func
 // CHECK-NOT: strong_retain
 // CHECK-NOT: strong_release
-sil @remove_retain_release_over_no_release_func : $@convention(thin) (Cls) -> () {
-bb0(%0 : $Cls):
+sil @remove_retain_release_over_no_release_func : $@convention(thin) () -> () {
+bb0:
+  %0 = alloc_ref $Cls
   %1 = function_ref @no_release_func : $@convention(thin) (Cls) -> ()
   strong_retain %0 : $Cls
   apply %1 (%0) : $@convention(thin) (Cls) -> ()
@@ -689,6 +705,8 @@ bb0(%0 : $Cls, %1 : $Cls):
 }
 
 sil @use_container : $@convention(thin) (@guaranteed Container) -> () {
+[%0: noescape **]
+[global: ]  
 bb0(%0 : $Container):
   %1 = ref_element_addr %0 : $Container, #Container.c
   %2 = load %1 : $*Cls
@@ -697,6 +715,7 @@ bb0(%0 : $Container):
 }
 
 sil @release_container : $@convention(thin) (Container) -> () {
+[%0: noescape **]
 bb0(%0 : $Container):
   strong_release %0 : $Container
   %r = tuple()
@@ -704,6 +723,8 @@ bb0(%0 : $Container):
 }
 
 sil @no_release_func : $@convention(thin) (Cls) -> () {
+[%0: noescape **]
+[global: ]  
 bb0(%0 : $Cls):
   %r = tuple()
   return %r : $()
@@ -2381,3 +2402,43 @@ bb0:
   %15 = tuple ()
   return %15 : $()
 }
+
+sil @closure : $@convention(thin) (@inout E, @guaranteed C) -> ()
+sil @call_closure : $@convention(method) (@guaranteed @noescape @callee_guaranteed (@inout E) -> (), @inout StructWithEnum) -> @out S2
+
+// CHECK-LABEL: sil @test_apply_with_out_arg :
+// CHECK:         retain_value
+// CHECK:         strong_release
+// CHECK:         release_value
+// CHECK:       } // end sil function 'test_apply_with_out_arg'
+sil @test_apply_with_out_arg : $@convention(method) (@guaranteed StructWithEnum) -> () {
+bb0(%0 : $StructWithEnum):
+  %1 = alloc_stack $StructWithEnum
+  store %0 to %1 : $*StructWithEnum
+  %3 = struct_element_addr %1 : $*StructWithEnum, #StructWithEnum.e
+  %4 = load %3 : $*E
+  retain_value %4 : $E
+  switch_enum %4 : $E, case #E.A!enumelt: bb1, default bb2
+
+
+bb1(%7 : $C):
+  %8 = alloc_stack $S2
+  %9 = function_ref @closure : $@convention(thin) (@inout E, @guaranteed C) -> ()
+  %10 = partial_apply [callee_guaranteed] [on_stack] %9(%7) : $@convention(thin) (@inout E, @guaranteed C) -> ()
+  %11 = function_ref @call_closure : $@convention(method) (@guaranteed @noescape @callee_guaranteed (@inout E) -> (), @inout StructWithEnum) -> @out S2
+  %12 = apply %11(%8, %10, %1) : $@convention(method) (@guaranteed @noescape @callee_guaranteed (@inout E) -> (), @inout StructWithEnum) -> @out S2
+  dealloc_stack %10 : $@noescape @callee_guaranteed (@inout E) -> ()
+  strong_release %7 : $C
+  dealloc_stack %8 : $*S2
+  br bb3
+
+bb2:
+  release_value %4 : $E
+  br bb3
+
+bb3:
+  dealloc_stack %1 : $*StructWithEnum
+  %21 = tuple ()
+  return %21 : $()
+}
+

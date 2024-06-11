@@ -18,7 +18,6 @@
 #define SWIFT_PARSE_PERSISTENTPARSERSTATE_H
 
 #include "swift/Basic/SourceLoc.h"
-#include "swift/Parse/LocalContext.h"
 
 namespace swift {
 
@@ -35,27 +34,22 @@ enum class IDEInspectionDelayedDeclKind {
 class IDEInspectionDelayedDeclState {
 public:
   IDEInspectionDelayedDeclKind Kind;
-  unsigned Flags;
   DeclContext *ParentContext;
   unsigned StartOffset;
   unsigned EndOffset;
   unsigned PrevOffset;
 
   IDEInspectionDelayedDeclState(IDEInspectionDelayedDeclKind Kind,
-                                unsigned Flags, DeclContext *ParentContext,
+                                DeclContext *ParentContext,
                                 unsigned StartOffset, unsigned EndOffset,
                                 unsigned PrevOffset)
-      : Kind(Kind), Flags(Flags), ParentContext(ParentContext),
-        StartOffset(StartOffset), EndOffset(EndOffset), PrevOffset(PrevOffset) {
-  }
+      : Kind(Kind), ParentContext(ParentContext), StartOffset(StartOffset),
+        EndOffset(EndOffset), PrevOffset(PrevOffset) {}
 };
 
 /// Parser state persistent across multiple parses.
 class PersistentParserState {
   std::unique_ptr<IDEInspectionDelayedDeclState> IDEInspectionDelayedDeclStat;
-
-  /// The local context for all top-level code.
-  TopLevelContext TopLevelCode;
 
 public:
   PersistentParserState();
@@ -64,7 +58,6 @@ public:
 
   void setIDEInspectionDelayedDeclState(SourceManager &SM, unsigned BufferID,
                                         IDEInspectionDelayedDeclKind Kind,
-                                        unsigned Flags,
                                         DeclContext *ParentContext,
                                         SourceRange BodyRange,
                                         SourceLoc PreviousLoc);
@@ -87,10 +80,6 @@ public:
   takeIDEInspectionDelayedDeclState() {
     assert(hasIDEInspectionDelayedDeclState());
     return std::move(IDEInspectionDelayedDeclStat);
-  }
-
-  TopLevelContext &getTopLevelContext() {
-    return TopLevelCode;
   }
 };
 

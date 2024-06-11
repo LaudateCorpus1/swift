@@ -223,6 +223,12 @@ extension _StringGuts {
     }
 
     let x = Unicode._WordBreakProperty(from: scalar1)
+    
+    // WB3a, handled here since we don't need to look up `y` for this
+    if x == .newlineCRLF {
+      return true
+    }
+    
     let y = Unicode._WordBreakProperty(from: scalar2)
 
     switch (x, y) {
@@ -232,9 +238,8 @@ extension _StringGuts {
     case (.any, .any):
       return true
 
-    // WB3a and WB3b
-    case (.newlineCRLF, _),
-         (_, .newlineCRLF):
+    // WB3b
+    case (_, .newlineCRLF):
       return true
 
     // WB3c
@@ -446,7 +451,14 @@ extension _StringGuts {
          (.zwj, _):
       if y != .format && y != .extend && y != .zwj {
         state.previousProperty = y
-        state.previousIndex = state.index
+
+        // If we already have a constraint in flight, then use that as our base
+        // previous index. Otherwise, use where we're at right now.
+        if let constraint = state.constraint {
+          state.previousIndex = constraint.index
+        } else {
+          state.previousIndex = state.index
+        }
       }
 
       return false

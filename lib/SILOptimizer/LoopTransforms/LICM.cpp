@@ -24,9 +24,9 @@
 #include "swift/SILOptimizer/Analysis/AliasAnalysis.h"
 #include "swift/SILOptimizer/Analysis/Analysis.h"
 #include "swift/SILOptimizer/Analysis/ArraySemantic.h"
+#include "swift/SILOptimizer/Analysis/BasicCalleeAnalysis.h"
 #include "swift/SILOptimizer/Analysis/DominanceAnalysis.h"
 #include "swift/SILOptimizer/Analysis/LoopAnalysis.h"
-#include "swift/SILOptimizer/Analysis/SideEffectAnalysis.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/CFGOptUtils.h"
@@ -166,31 +166,56 @@ static bool isOnlyLoadedAndStored(AliasAnalysis *AA, InstSet &SideEffectInsts,
 /// Returns true if the \p SideEffectInsts set contains any memory writes which
 /// may alias with any memory which is read by \p AI.
 /// Note: This function should only be called on a read-only apply!
-static bool mayWriteTo(AliasAnalysis *AA, SideEffectAnalysis *SEA,
+static bool mayWriteTo(AliasAnalysis *AA, BasicCalleeAnalysis *BCA,
                        InstSet &SideEffectInsts, ApplyInst *AI) {
-  FunctionSideEffects E;
-  SEA->getCalleeEffects(E, AI);
-  assert(E.getMemBehavior(RetainObserveKind::IgnoreRetains) <=
-         SILInstruction::MemoryBehavior::MayRead &&
-         "apply should only read from memory");
-  assert(!E.getGlobalEffects().mayRead() &&
-         "apply should not have global effects");
 
-  for (unsigned Idx = 0, End = AI->getNumArguments(); Idx < End; ++Idx) {
-    auto &ArgEffect = E.getParameterEffects()[Idx];
-    assert(!ArgEffect.mayRelease() && "apply should only read from memory");
-    if (!ArgEffect.mayRead())
-      continue;
+  if (BCA->getMemoryBehavior(FullApplySite::isa(AI), /*observeRetains*/true) ==
+      MemoryBehavior::None) {
+    return false;
+  }
 
-    SILValue Arg = AI->getArgument(Idx);
-
-    // Check if the memory addressed by the argument may alias any writes.
-    for (auto *I : SideEffectInsts) {
-      if (AA->mayWriteToMemory(I, Arg)) {
-        LLVM_DEBUG(llvm::dbgs() << "  mayWriteTo\n" << *I << " to "
-                                << *AI << "\n");
-        return true;
+  // Check if the memory addressed by the argument may alias any writes.
+  for (auto *inst : SideEffectInsts) {
+    switch (inst->getKind()) {
+      case SILInstructionKind::StoreInst: {
+        auto *si = cast<StoreInst>(inst);
+        if (si->getOwnershipQualifier() == StoreOwnershipQualifier::Assign)
+          return true;
+        if (AA->mayReadFromMemory(AI, si->getDest()))
+          return true;
+        break;
       }
+      case SILInstructionKind::CopyAddrInst: {
+        auto *ca = cast<CopyAddrInst>(inst);
+        if (!ca->isInitializationOfDest())
+          return true;
+        if (AA->mayReadFromMemory(AI, ca->getDest()))
+          return true;
+        break;
+      }
+      case SILInstructionKind::ApplyInst:
+      case SILInstructionKind::BeginApplyInst:
+      case SILInstructionKind::TryApplyInst: {
+        if (BCA->getMemoryBehavior(FullApplySite::isa(inst), /*observeRetains*/false) >
+            MemoryBehavior::MayRead)
+          return true;
+        break;
+      }
+      case SILInstructionKind::CondFailInst:
+      case SILInstructionKind::StrongRetainInst:
+      case SILInstructionKind::UnmanagedRetainValueInst:
+      case SILInstructionKind::RetainValueInst:
+      case SILInstructionKind::StrongRetainUnownedInst:
+      case SILInstructionKind::FixLifetimeInst:
+      case SILInstructionKind::KeyPathInst:
+      case SILInstructionKind::DeallocStackInst:
+      case SILInstructionKind::DeallocStackRefInst:
+      case SILInstructionKind::DeallocRefInst:
+        break;
+      default:
+        if (inst->mayWriteToMemory())
+          return true;
+        break;
     }
   }
   return false;
@@ -199,13 +224,15 @@ static bool mayWriteTo(AliasAnalysis *AA, SideEffectAnalysis *SEA,
 /// Returns true if \p sideEffectInst cannot be reordered with a call to a
 /// global initializer.
 static bool mayConflictWithGlobalInit(AliasAnalysis *AA,
-                    SILInstruction *sideEffectInst, ApplyInst *globalInitCall) {
+                    SILInstruction *sideEffectInst, SILInstruction *globalInitCall) {
   if (auto *SI = dyn_cast<StoreInst>(sideEffectInst)) {
     return AA->mayReadOrWriteMemory(globalInitCall, SI->getDest());
   }
   if (auto *LI = dyn_cast<LoadInst>(sideEffectInst)) {
     return AA->mayWriteToMemory(globalInitCall, LI->getOperand());
   }
+  if (isa<CondFailInst>(sideEffectInst))
+    return false;
   return true;
 }
 
@@ -214,7 +241,7 @@ static bool mayConflictWithGlobalInit(AliasAnalysis *AA,
 /// the call.
 static bool mayConflictWithGlobalInit(AliasAnalysis *AA,
                        InstSet &sideEffectInsts,
-                       ApplyInst *globalInitCall,
+                       SILInstruction *globalInitCall,
                        SILBasicBlock *preHeader, PostDominanceInfo *PD) {
   if (!PD->dominates(globalInitCall->getParent(), preHeader))
     return true;
@@ -238,7 +265,7 @@ static bool mayConflictWithGlobalInit(AliasAnalysis *AA,
 /// block).
 static bool mayConflictWithGlobalInit(AliasAnalysis *AA,
                        ArrayRef<SILInstruction *> sideEffectInsts,
-                       ApplyInst *globalInitCall) {
+                       SILInstruction *globalInitCall) {
   for (auto *seInst : sideEffectInsts) {
     assert(seInst->getParent() == globalInitCall->getParent());
     if (mayConflictWithGlobalInit(AA, seInst, globalInitCall))
@@ -477,6 +504,11 @@ hoistSpecialInstruction(std::unique_ptr<LoopNestSummary> &LoopSummary,
   bool Changed = false;
 
   for (auto *Inst : Special) {
+    if (isa<BeginAccessInst>(Inst) && LoopSummary->Loop->hasNoExitBlocks()) {
+      // If no exit block, don't try to hoist BeginAccess because
+      // sinking EndAccess would fail later.
+      continue;
+    }
     if (!hoistInstruction(DT, Inst, Loop, Preheader)) {
       continue;
     }
@@ -509,7 +541,7 @@ class LoopTreeOptimization {
   InstSet toDelete;
   SILLoopInfo *LoopInfo;
   AliasAnalysis *AA;
-  SideEffectAnalysis *SEA;
+  BasicCalleeAnalysis *BCA;
   DominanceInfo *DomTree;
   PostDominanceAnalysis *PDA;
   PostDominanceInfo *postDomTree = nullptr;
@@ -540,11 +572,11 @@ class LoopTreeOptimization {
 
 public:
   LoopTreeOptimization(SILLoop *TopLevelLoop, SILLoopInfo *LI,
-                       AliasAnalysis *AA, SideEffectAnalysis *SEA,
+                       AliasAnalysis *AA, BasicCalleeAnalysis *BCA,
                        DominanceInfo *DT, PostDominanceAnalysis *PDA,
                        AccessStorageAnalysis *ASA,
                        bool RunsOnHighLevelSil)
-      : LoopInfo(LI), AA(AA), SEA(SEA), DomTree(DT), PDA(PDA), ASA(ASA),
+      : LoopInfo(LI), AA(AA), BCA(BCA), DomTree(DT), PDA(PDA), ASA(ASA),
         Changed(false), RunsOnHighLevelSIL(RunsOnHighLevelSil) {
     // Collect loops for a recursive bottom-up traversal in the loop tree.
     BotUpWorkList.push_back(TopLevelLoop);
@@ -561,6 +593,8 @@ public:
 protected:
   /// Propagate the sub-loops' summaries up to the current loop.
   void propagateSummaries(std::unique_ptr<LoopNestSummary> &CurrSummary);
+
+  bool isSafeReadOnlyApply(BasicCalleeAnalysis *BCA, ApplyInst *AI);
 
   /// Collect a set of instructions that can be hoisted
   void analyzeCurrentLoop(std::unique_ptr<LoopNestSummary> &CurrSummary);
@@ -658,19 +692,22 @@ void LoopTreeOptimization::propagateSummaries(
   }
 }
 
-static bool isSafeReadOnlyApply(SideEffectAnalysis *SEA, ApplyInst *AI) {
-  FunctionSideEffects E;
-  SEA->getCalleeEffects(E, AI);
-
-  if (E.getGlobalEffects().mayRead()) {
-    // If we have Global effects,
-    // we don't know which memory is read in the callee.
-    // Therefore we bail for safety
-    return false;
+bool LoopTreeOptimization::isSafeReadOnlyApply(BasicCalleeAnalysis *BCA, ApplyInst *AI) {
+  if (auto ri = AI->getSingleResult()) {
+    // We don't balance CSE'd apply results which return an owned value.
+    if (ri.value().getConvention() != ResultConvention::Unowned)
+      return false;
   }
 
-  auto MB = E.getMemBehavior(RetainObserveKind::ObserveRetains);
-  return (MB <= SILInstruction::MemoryBehavior::MayRead);
+  if (RunsOnHighLevelSIL) {
+    // The array-property-opt needs this semantic call inside the loop.
+    // After high-level SIL we can hoist it (if it's not inlined already).
+    if (ArraySemanticsCall(AI, "array.props.isNativeTypeChecked"))
+      return false;
+  }
+
+  return BCA->getMemoryBehavior(AI, /*observeRetains*/false) <=
+         MemoryBehavior::MayRead;
 }
 
 static void checkSideEffects(swift::SILInstruction &Inst,
@@ -695,26 +732,31 @@ static bool canHoistUpDefault(SILInstruction *inst, SILLoop *Loop,
     return false;
   }
 
-  if (inst->getMemoryBehavior() == SILInstruction::MemoryBehavior::None) {
-    return true;
-  }
-
-  if (!RunsOnHighLevelSil) {
-    return false;
-  }
-
   // We can’t hoist everything that is hoist-able
   // The canHoist method does not do all the required analysis
   // Some of the work is done at COW Array Opt
   // TODO: Refactor COW Array Opt + canHoist - radar 41601468
   ArraySemanticsCall semCall(inst);
   switch (semCall.getKind()) {
-  case ArrayCallKind::kGetCount:
-  case ArrayCallKind::kGetCapacity:
-    return semCall.canHoist(Preheader->getTerminator(), DT);
-  default:
-    return false;
+    case ArrayCallKind::kGetCount:
+    case ArrayCallKind::kGetCapacity:
+      if (RunsOnHighLevelSil && semCall.canHoist(Preheader->getTerminator(), DT))
+        return true;
+      break;
+    case ArrayCallKind::kArrayPropsIsNativeTypeChecked:
+      // The array-property-opt needs this semantic call inside the loop.
+      // After high-level SIL we can hoist it (if it's not inlined already).
+      if (RunsOnHighLevelSil)
+        return false;
+      break;
+    default:
+      break;
   }
+
+  if (inst->getMemoryBehavior() == MemoryBehavior::None) {
+    return true;
+  }
+  return false;
 }
 
 // Check If all the end accesses of the given begin do not prevent hoisting
@@ -829,7 +871,12 @@ void LoopTreeOptimization::analyzeCurrentLoop(
 
   // Interesting instructions in the loop:
   SmallVector<ApplyInst *, 8> ReadOnlyApplies;
-  SmallVector<ApplyInst *, 8> globalInitCalls;
+
+  // Contains either:
+  // * an apply to the addressor of the global
+  // * a builtin "once" of the global initializer
+  SmallVector<SILInstruction *, 8> globalInitCalls;
+
   SmallVector<LoadInst *, 8> Loads;
   SmallVector<StoreInst *, 8> Stores;
   SmallVector<FixLifetimeInst *, 8> FixLifetimes;
@@ -874,7 +921,7 @@ void LoopTreeOptimization::analyzeCurrentLoop(
         break;
       case SILInstructionKind::ApplyInst: {
         auto *AI = cast<ApplyInst>(&Inst);
-        if (isSafeReadOnlyApply(SEA, AI)) {
+        if (isSafeReadOnlyApply(BCA, AI)) {
           ReadOnlyApplies.push_back(AI);
         } else if (SILFunction *callee = AI->getReferencedFunctionOrNull()) {
           // Calls to global inits are different because we don't care about
@@ -883,8 +930,8 @@ void LoopTreeOptimization::analyzeCurrentLoop(
               // Check against side-effects within the same block.
               // Side-effects in other blocks are checked later (after we
               // scanned all blocks of the loop).
-              !mayConflictWithGlobalInit(AA, sideEffectsInBlock, AI))
-            globalInitCalls.push_back(AI);
+              !mayConflictWithGlobalInit(AA, sideEffectsInBlock, &Inst))
+            globalInitCalls.push_back(&Inst);
         }
         // check for array semantics and side effects - same as default
         LLVM_FALLTHROUGH;
@@ -892,7 +939,18 @@ void LoopTreeOptimization::analyzeCurrentLoop(
       default:
         if (auto fullApply = FullApplySite::isa(&Inst)) {
           fullApplies.push_back(fullApply);
+        } else if (auto *bi = dyn_cast<BuiltinInst>(&Inst)) {
+          switch (bi->getBuiltinInfo().ID) {
+            case BuiltinValueKind::Once:
+            case BuiltinValueKind::OnceWithContext:
+              if (!mayConflictWithGlobalInit(AA, sideEffectsInBlock, &Inst))
+                globalInitCalls.push_back(&Inst);
+              break;
+            default:
+              break;
+          }
         }
+
         checkSideEffects(Inst, sideEffects, sideEffectsInBlock);
         if (canHoistUpDefault(&Inst, Loop, DomTree, RunsOnHighLevelSIL)) {
           HoistUp.insert(&Inst);
@@ -902,14 +960,20 @@ void LoopTreeOptimization::analyzeCurrentLoop(
     }
   }
 
-  for (auto *AI : ReadOnlyApplies) {
-    if (!mayWriteTo(AA, SEA, sideEffects, AI)) {
-      HoistUp.insert(AI);
+  // Avoid quadratic complexity in corner cases. Usually, this limit will not be exceeded.
+  if (ReadOnlyApplies.size() * sideEffects.size() < 8000) {
+    for (auto *AI : ReadOnlyApplies) {
+      if (!mayWriteTo(AA, BCA, sideEffects, AI)) {
+        HoistUp.insert(AI);
+      }
     }
   }
-  for (auto *LI : Loads) {
-    if (!mayWriteTo(AA, sideEffects, LI)) {
-      HoistUp.insert(LI);
+  // Avoid quadratic complexity in corner cases. Usually, this limit will not be exceeded.
+  if (Loads.size() * sideEffects.size() < 8000) {
+    for (auto *LI : Loads) {
+      if (!mayWriteTo(AA, sideEffects, LI)) {
+        HoistUp.insert(LI);
+      }
     }
   }
 
@@ -918,7 +982,7 @@ void LoopTreeOptimization::analyzeCurrentLoop(
       postDomTree = PDA->get(Preheader->getParent());
     }
     if (postDomTree->getRootNode()) {
-      for (ApplyInst *ginitCall : globalInitCalls) {
+      for (SILInstruction *ginitCall : globalInitCalls) {
         // Check against side effects which are "before" (i.e. post-dominated
         // by) the global initializer call.
         if (!mayConflictWithGlobalInit(AA, sideEffects, ginitCall, Preheader,
@@ -984,8 +1048,13 @@ computeInnerAccessPath(AccessPath::PathNode outerPath,
   if (outerPath == innerPath)
     return true;
 
-  if (!isa<StructElementAddrInst>(innerAddress)
-      && !isa<TupleElementAddrInst>(innerAddress)) {
+  auto *sea = dyn_cast<StructElementAddrInst>(innerAddress);
+
+  if (sea && sea->getStructDecl()->hasUnreferenceableStorage()) {
+    return false;
+  }
+
+  if (!sea && !isa<TupleElementAddrInst>(innerAddress)) {
     return false;
   }
   assert(ProjectionIndex(innerAddress).Index
@@ -1317,7 +1386,7 @@ hoistLoadsAndStores(AccessPath accessPath, SILLoop *loop) {
 
   // Set all stored values as available values in the ssaUpdater.
   // If there are multiple stores in a block, only the last one counts.
-  Optional<SILLocation> loc;
+  std::optional<SILLocation> loc;
   for (SILInstruction *I : LoadsAndStores) {
     if (auto *SI = isStoreToAccess(I, accessPath)) {
       loc = SI->getLoc();
@@ -1330,7 +1399,8 @@ hoistLoadsAndStores(AccessPath accessPath, SILLoop *loop) {
 
       if (!storeAddr) {
         storeAddr = SI->getDest();
-        ssaUpdater.initialize(storeAddr->getType().getObjectType(),
+        ssaUpdater.initialize(storeAddr->getFunction(),
+                              storeAddr->getType().getObjectType(),
                               storeAddr->getOwnershipKind());
       } else if (SI->getDest()->getType() != storeAddr->getType()) {
         // This transformation assumes that the values of all stores in the loop
@@ -1471,7 +1541,7 @@ public:
     DominanceAnalysis *DA = PM->getAnalysis<DominanceAnalysis>();
     PostDominanceAnalysis *PDA = PM->getAnalysis<PostDominanceAnalysis>();
     AliasAnalysis *AA = PM->getAnalysis<AliasAnalysis>(F);
-    SideEffectAnalysis *SEA = PM->getAnalysis<SideEffectAnalysis>();
+    BasicCalleeAnalysis *BCA = PM->getAnalysis<BasicCalleeAnalysis>();
     AccessStorageAnalysis *ASA = getAnalysis<AccessStorageAnalysis>();
     DominanceInfo *DomTree = nullptr;
 
@@ -1480,7 +1550,7 @@ public:
 
     for (auto *TopLevelLoop : *LoopInfo) {
       if (!DomTree) DomTree = DA->get(F);
-      LoopTreeOptimization Opt(TopLevelLoop, LoopInfo, AA, SEA, DomTree, PDA,
+      LoopTreeOptimization Opt(TopLevelLoop, LoopInfo, AA, BCA, DomTree, PDA,
                                ASA, RunsOnHighLevelSil);
       Changed |= Opt.optimize();
     }

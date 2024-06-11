@@ -75,7 +75,7 @@ static bool isUnitTest(const ValueDecl *D) {
     return false;
 
   // 6. ...and starts with "test".
-  if (FD->getBaseIdentifier().str().startswith("test"))
+  if (FD->getBaseIdentifier().str().starts_with("test"))
     return true;
 
   return false;
@@ -243,6 +243,7 @@ SymbolInfo index::getSymbolInfoForDecl(const Decl *D) {
     case DeclKind::TopLevelCode:
     case DeclKind::IfConfig:
     case DeclKind::PoundDiagnostic:
+    case DeclKind::Missing:
     case DeclKind::MissingMember:
     case DeclKind::Module:
     case DeclKind::OpaqueType:
@@ -266,6 +267,7 @@ SymbolInfo index::getSymbolInfoForDecl(const Decl *D) {
 SymbolSubKind index::getSubKindForAccessor(AccessorKind AK) {
   switch (AK) {
   case AccessorKind::Get:    return SymbolSubKind::AccessorGetter;
+  case AccessorKind::DistributedGet:    return SymbolSubKind::AccessorGetter;
   case AccessorKind::Set:    return SymbolSubKind::AccessorSetter;
   case AccessorKind::WillSet:   return SymbolSubKind::SwiftAccessorWillSet;
   case AccessorKind::DidSet:    return SymbolSubKind::SwiftAccessorDidSet;
@@ -274,6 +276,7 @@ SymbolSubKind index::getSubKindForAccessor(AccessorKind AK) {
     return SymbolSubKind::SwiftAccessorMutableAddressor;
   case AccessorKind::Read:      return SymbolSubKind::SwiftAccessorRead;
   case AccessorKind::Modify:    return SymbolSubKind::SwiftAccessorModify;
+  case AccessorKind::Init:      return SymbolSubKind::SwiftAccessorInit;
   }
 
   llvm_unreachable("Unhandled AccessorKind in switch.");

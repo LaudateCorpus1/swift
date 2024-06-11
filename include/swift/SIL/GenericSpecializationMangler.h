@@ -14,6 +14,7 @@
 #define SWIFT_SIL_UTILS_GENERICSPECIALIZATIONMANGLER_H
 
 #include "swift/AST/ASTMangler.h"
+#include "swift/AST/Effects.h"
 #include "swift/Basic/NullablePtr.h"
 #include "swift/Demangling/Demangler.h"
 #include "swift/SIL/SILFunction.h"
@@ -36,7 +37,7 @@ protected:
   /// The specialization pass.
   SpecializationPass Pass;
 
-  IsSerialized_t Serialized;
+  swift::SerializedKind_t Serialized;
 
   /// The original function which is specialized.
   SILFunction *Function;
@@ -45,13 +46,16 @@ protected:
   llvm::SmallVector<char, 32> ArgOpStorage;
   llvm::raw_svector_ostream ArgOpBuffer;
 
+  // Effects that are removed from the original function in this specialization.
+  PossibleEffects RemovedEffects;
+
 protected:
-  SpecializationMangler(SpecializationPass P, IsSerialized_t Serialized,
+  SpecializationMangler(SpecializationPass P, swift::SerializedKind_t Serialized,
                         SILFunction *F)
       : Pass(P), Serialized(Serialized), Function(F),
         ArgOpBuffer(ArgOpStorage) {}
 
-  SpecializationMangler(SpecializationPass P, IsSerialized_t Serialized,
+  SpecializationMangler(SpecializationPass P, swift::SerializedKind_t Serialized,
                         std::string functionName)
       : Pass(P), Serialized(Serialized), Function(nullptr),
         FunctionName(functionName), ArgOpBuffer(ArgOpStorage) {}
@@ -84,11 +88,12 @@ class GenericSpecializationMangler : public SpecializationMangler {
                                       SubstitutionMap subs);
 
 public:
-  GenericSpecializationMangler(SILFunction *F, IsSerialized_t Serialized)
+  GenericSpecializationMangler(SILFunction *F, swift::SerializedKind_t Serialized)
       : SpecializationMangler(SpecializationPass::GenericSpecializer,
                               Serialized, F) {}
 
-  std::string mangleNotReabstracted(SubstitutionMap subs);
+  std::string mangleNotReabstracted(SubstitutionMap subs,
+                                    bool metatyeParamsRemoved);
 
   /// Mangle a generic specialization with re-abstracted parameters.
   ///
@@ -98,7 +103,7 @@ public:
   /// This is the default for generic specializations.
   ///
   /// \param alternativeMangling   true for specialized functions with a
-  ///                              differet resilience expansion.
+  ///                              different resilience expansion.
   /// \param metatyeParamsRemoved  true if non-generic metatype parameters are
   ///                              removed in the specialized function.
   std::string mangleReabstracted(SubstitutionMap subs, bool alternativeMangling,

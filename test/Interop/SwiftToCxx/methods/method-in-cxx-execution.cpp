@@ -63,5 +63,22 @@ int main() {
 // CHECK-NEXT: PassStructInClassMethod.retStruct 2;
 // CHECK-NEXT: -578, 2, -100, 42, 67, -10101
   }
+
+  {
+    LargeStruct::staticMethod();
+// CHECK-NEXT: LargeStruct.staticMethod;
+    auto largeStruct = ClassWithMethods::staticFinalClassMethod(9075);
+// CHECK-NEXT: ClassWithMethods.staticFinalClassMethod;
+    largeStruct.dump();
+// CHECK-NEXT: 1, -1, -9075, -2, 9075, -456 
+  }
+
+  {
+    auto x = ClassWithNonFinalMethods::classClassMethod(3);
+    assert(x == 5);
+    ClassWithNonFinalMethods::staticClassMethod();
+  }
+// CHECK-NEXT: ClassWithNonFinalMethods.classClassMethod;
+// CHECK-NEXT: ClassWithNonFinalMethods.staticClassMethod;
   return 0;
 }

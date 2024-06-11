@@ -94,9 +94,9 @@ public:
   DifferentiableFuncTypeInfo(ArrayRef<DifferentiableFuncFieldInfo> fields,
                              unsigned explosionSize, llvm::Type *ty, Size size,
                              SpareBitVector &&spareBits, Alignment align,
-                             IsPOD_t isPOD, IsFixedSize_t alwaysFixedSize)
+                             IsTriviallyDestroyable_t isTriviallyDestroyable, IsFixedSize_t alwaysFixedSize)
       : super(fields, explosionSize, ty, size, std::move(spareBits), align,
-              isPOD, alwaysFixedSize) {}
+              isTriviallyDestroyable, IsCopyable, alwaysFixedSize) {}
 
   Address projectFieldAddress(IRGenFunction &IGF, Address addr, SILType T,
                               const DifferentiableFuncFieldInfo &field) const {
@@ -117,9 +117,11 @@ public:
     }
   }
 
-  TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
-                                        SILType T) const override {
-    if (!IGM.getOptions().ForceStructTypeLayouts || !areFieldsABIAccessible()) {
+  TypeLayoutEntry
+  *buildTypeLayoutEntry(IRGenModule &IGM,
+                        SILType T,
+                        bool useStructLayouts) const override {
+    if (!useStructLayouts || !areFieldsABIAccessible()) {
       return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T);
     }
 
@@ -130,19 +132,22 @@ public:
     std::vector<TypeLayoutEntry *> fields;
     for (auto &field : getFields()) {
       auto fieldTy = field.getType(IGM, T);
-      fields.push_back(field.getTypeInfo().buildTypeLayoutEntry(IGM, fieldTy));
+      fields.push_back(field.getTypeInfo().buildTypeLayoutEntry(IGM, fieldTy, useStructLayouts));
     }
 
-    if (fields.size() == 1) {
-      return fields[0];
-    }
+    // if (fields.size() == 1) {
+    //   return fields[0];
+    // }
 
-    return IGM.typeLayoutCache.getOrCreateAlignedGroupEntry(fields, 1);
+    return IGM.typeLayoutCache.getOrCreateAlignedGroupEntry(
+        fields, T, getBestKnownAlignment().getValue(), *this);
   }
 
-  llvm::NoneType getNonFixedOffsets(IRGenFunction &IGF) const { return None; }
-  llvm::NoneType getNonFixedOffsets(IRGenFunction &IGF, SILType T) const {
-    return None;
+  std::nullopt_t getNonFixedOffsets(IRGenFunction &IGF) const {
+    return std::nullopt;
+  }
+  std::nullopt_t getNonFixedOffsets(IRGenFunction &IGF, SILType T) const {
+    return std::nullopt;
   }
 };
 
@@ -177,7 +182,7 @@ public:
                  StructLayout &&layout, unsigned explosionSize) {
     return DifferentiableFuncTypeInfo::create(
         fields, explosionSize, layout.getType(), layout.getSize(),
-        std::move(layout.getSpareBits()), layout.getAlignment(), layout.isPOD(),
+        std::move(layout.getSpareBits()), layout.getAlignment(), layout.isTriviallyDestroyable(),
         layout.isAlwaysFixedSize());
   }
 
@@ -206,7 +211,7 @@ public:
   }
 
   StructLayout performLayout(ArrayRef<const TypeInfo *> fieldTypes) {
-    return StructLayout(IGM, /*decl=*/nullptr, LayoutKind::NonHeapObject,
+    return StructLayout(IGM, /*type=*/std::nullopt, LayoutKind::NonHeapObject,
                         LayoutStrategy::Universal, fieldTypes);
   }
 };
@@ -265,10 +270,10 @@ class LinearFuncTypeInfo final
 public:
   LinearFuncTypeInfo(ArrayRef<LinearFuncFieldInfo> fields,
                      unsigned explosionSize, llvm::Type *ty, Size size,
-                     SpareBitVector &&spareBits, Alignment align, IsPOD_t isPOD,
+                     SpareBitVector &&spareBits, Alignment align, IsTriviallyDestroyable_t isTriviallyDestroyable,
                      IsFixedSize_t alwaysFixedSize)
       : super(fields, explosionSize, ty, size, std::move(spareBits), align,
-              isPOD, alwaysFixedSize) {}
+              isTriviallyDestroyable, IsCopyable, alwaysFixedSize) {}
 
   Address projectFieldAddress(IRGenFunction &IGF, Address addr, SILType T,
                               const LinearFuncFieldInfo &field) const {
@@ -289,9 +294,11 @@ public:
     }
   }
 
-  TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
-                                        SILType T) const override {
-    if (!IGM.getOptions().ForceStructTypeLayouts || !areFieldsABIAccessible()) {
+  TypeLayoutEntry
+  *buildTypeLayoutEntry(IRGenModule &IGM,
+                        SILType T,
+                        bool useStructLayouts) const override {
+    if (!useStructLayouts || !areFieldsABIAccessible()) {
       return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T);
     }
 
@@ -302,19 +309,22 @@ public:
     std::vector<TypeLayoutEntry *> fields;
     for (auto &field : getFields()) {
       auto fieldTy = field.getType(IGM, T);
-      fields.push_back(field.getTypeInfo().buildTypeLayoutEntry(IGM, fieldTy));
+      fields.push_back(field.getTypeInfo().buildTypeLayoutEntry(IGM, fieldTy, useStructLayouts));
     }
 
-    if (fields.size() == 1) {
-      return fields[0];
-    }
+    // if (fields.size() == 1) {
+    //   return fields[0];
+    // }
 
-    return IGM.typeLayoutCache.getOrCreateAlignedGroupEntry(fields, 1);
+    return IGM.typeLayoutCache.getOrCreateAlignedGroupEntry(
+        fields, T, getBestKnownAlignment().getValue(), *this);
   }
 
-  llvm::NoneType getNonFixedOffsets(IRGenFunction &IGF) const { return None; }
-  llvm::NoneType getNonFixedOffsets(IRGenFunction &IGF, SILType T) const {
-    return None;
+  std::nullopt_t getNonFixedOffsets(IRGenFunction &IGF) const {
+    return std::nullopt;
+  }
+  std::nullopt_t getNonFixedOffsets(IRGenFunction &IGF, SILType T) const {
+    return std::nullopt;
   }
 };
 
@@ -343,7 +353,7 @@ public:
                                      unsigned explosionSize) {
     return LinearFuncTypeInfo::create(
         fields, explosionSize, layout.getType(), layout.getSize(),
-        std::move(layout.getSpareBits()), layout.getAlignment(), layout.isPOD(),
+        std::move(layout.getSpareBits()), layout.getAlignment(), layout.isTriviallyDestroyable(),
         layout.isAlwaysFixedSize());
   }
 
@@ -373,7 +383,7 @@ public:
   }
 
   StructLayout performLayout(ArrayRef<const TypeInfo *> fieldTypes) {
-    return StructLayout(IGM, /*decl=*/nullptr, LayoutKind::NonHeapObject,
+    return StructLayout(IGM, /*type=*/std::nullopt, LayoutKind::NonHeapObject,
                         LayoutStrategy::Universal, fieldTypes);
   }
 };

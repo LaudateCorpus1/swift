@@ -107,6 +107,16 @@ function(get_bootstrapping_swift_lib_dir bs_lib_dir bootstrapping)
     elseif("${bootstrapping}" STREQUAL "")
       get_bootstrapping_path(bs_lib_dir ${lib_dir} "1")
     endif()
+  elseif(BOOTSTRAPPING_MODE STREQUAL "HOSTTOOLS")
+    if(SWIFT_HOST_VARIANT_SDK MATCHES "LINUX|ANDROID|OPENBSD|FREEBSD")
+      # Compiler's INSTALL_RPATH is set to libs in the build directory
+      # For building stdlib, use stdlib in the builder's resource directory
+      # because the runtime may not be built yet.
+      # FIXME: This assumes the ABI hasn't changed since the builder.
+      get_filename_component(swift_bin_dir ${CMAKE_Swift_COMPILER} DIRECTORY)
+      get_filename_component(swift_dir ${swift_bin_dir} DIRECTORY)
+      set(bs_lib_dir "${swift_dir}/lib/swift/${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_LIB_SUBDIR}")
+    endif()
   endif()
   set(bs_lib_dir ${bs_lib_dir} PARENT_SCOPE)
 endfunction()
@@ -161,14 +171,10 @@ function(swift_create_post_build_symlink target)
     ""
     ${ARGN})
 
-  if("${CMAKE_SYSTEM_NAME}" STREQUAL "Windows")
-    if(CS_IS_DIRECTORY)
-      set(cmake_symlink_option "copy_directory")
-    else()
-      set(cmake_symlink_option "copy_if_different")
-    endif()
+  if(CS_IS_DIRECTORY)
+    set(cmake_symlink_option "${SWIFT_COPY_OR_SYMLINK_DIR}")
   else()
-      set(cmake_symlink_option "create_symlink")
+    set(cmake_symlink_option "${SWIFT_COPY_OR_SYMLINK}")
   endif()
 
   add_custom_command(TARGET "${target}" POST_BUILD
@@ -185,11 +191,17 @@ endfunction()
 # to ensure that `swiftc` forwards to the standalone driver when invoked.
 function(swift_create_early_driver_copies target)
   # Early swift-driver is built adjacent to the compiler (swift build dir)
-  set(driver_bin_dir "${CMAKE_BINARY_DIR}/../earlyswiftdriver-${SWIFT_HOST_VARIANT}-${SWIFT_HOST_VARIANT_ARCH}/release/bin")
+  if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+    set(driver_package_configuration_dir "release")
+  else()
+    set(driver_package_configuration_dir "debug")
+  endif()
+  
+  set(driver_bin_dir "${CMAKE_BINARY_DIR}/../earlyswiftdriver-${SWIFT_HOST_VARIANT}-${SWIFT_HOST_VARIANT_ARCH}/${driver_package_configuration_dir}/bin")
   set(swift_bin_dir "${SWIFT_RUNTIME_OUTPUT_INTDIR}")
   # If early swift-driver wasn't built, nothing to do here.
   if(NOT EXISTS "${driver_bin_dir}/swift-driver" OR NOT EXISTS "${driver_bin_dir}/swift-help")
-      message(STATUS "Skipping creating early SwiftDriver symlinks - no early SwiftDriver build found.")
+      message(STATUS "Skipping creating early SwiftDriver symlinks - no early SwiftDriver build found at: ${driver_bin_dir}.")
       return()
   endif()
 

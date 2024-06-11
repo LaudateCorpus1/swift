@@ -185,7 +185,8 @@ func NonVoidReturn1() -> Int {
 }
 
 func NonVoidReturn2() -> Int {
-  return + // expected-error {{unary operator cannot be separated from its operand}} {{11-1=}} expected-error {{expected expression in 'return' statement}}
+  // FIXME: Bad diagnostic
+  return + // expected-error {{unary operator cannot be separated from its operand}} {{11-+1:1=}} expected-error {{expected expression in 'return' statement}}
 }
 
 func VoidReturn1() {
@@ -238,9 +239,9 @@ func DoStmt() {
 
 
 func DoWhileStmt1() {
+  // expected-note@+2 {{did you mean 'repeat-while' statement?}} {{3-5=repeat}}
+  // expected-note@+1 {{did you mean separate 'do' and 'while' statements?}} {{+1:5-5=\n}}
   do { // expected-error {{'do-while' statement is not allowed}}
-  // expected-note@-1 {{did you mean 'repeat-while' statement?}} {{3-5=repeat}}
-  // expected-note@-2 {{did you mean separate 'do' and 'while' statements?}} {{5-5=\n}}
   } while true
 }
 
@@ -270,12 +271,13 @@ func RepeatWhileStmt1() {
 }
 
 func RepeatWhileStmt2() {
-  repeat // expected-error {{expected '{' after 'repeat'}} expected-error {{expected 'while' after body of 'repeat' statement}}
+  repeat // expected-error@+1 {{expected expression}}
 }
 
 func RepeatWhileStmt4() {
+  // FIXME: Bad diagnostic
   repeat {
-  } while + // expected-error {{unary operator cannot be separated from its operand}} {{12-1=}} expected-error {{expected expression in 'repeat-while' condition}}
+  } while + // expected-error {{unary operator cannot be separated from its operand}} {{12-+1:1=}} expected-error {{expected expression in 'repeat-while' condition}}
 }
 
 func brokenSwitch(_ x: Int) -> Int {
@@ -300,7 +302,7 @@ func breakContinue(_ x : Int) -> Int {
 Outer:
   for _ in 0...1000 {
 
-  Switch: // expected-error {{switch must be exhaustive}} expected-note{{do you want to add a default clause?}}
+  Switch: // expected-error {{switch must be exhaustive}} expected-note{{add a default clause}}
   switch x {
     case 42: break Outer
     case 97: continue Outer
@@ -409,7 +411,7 @@ func matching_pattern_recursion(zs: [Int]) { // expected-note {{'zs' declared he
   }
 
   switch 42 {
-  case {
+  case { // expected-error {{expression pattern of type '() -> ()' cannot match values of type 'Int'}}
       for i in ws { // expected-error {{cannot find 'ws' in scope; did you mean 'zs'?}}
       }
     }: break
@@ -525,7 +527,7 @@ func fn(x: Int) {
 }
 
 func bad_if() {
-  if 1 {} // expected-error {{type 'Int' cannot be used as a boolean; test for '!= 0' instead}}
+  if 1 {} // expected-error {{integer literal value '1' cannot be used as a boolean; did you mean 'true'?}} {{6-7=true}}
   if (x: false) {} // expected-error {{cannot convert value of type '(x: Bool)' to expected condition type 'Bool'}}
   if (x: 1) {} // expected-error {{cannot convert value of type '(x: Int)' to expected condition type 'Bool'}}
   if nil {} // expected-error {{'nil' is not compatible with expected condition type 'Bool'}}
@@ -564,33 +566,33 @@ outerLoop: repeat { // expected-note {{'outerLoop' declared here}}
   continue outerloop // expected-error {{cannot find label 'outerloop' in scope; did you mean 'outerLoop'?}} {{12-21=outerLoop}}
 } while true
 
-outerLoop1: for _ in [1] { // expected-note {{did you mean 'outerLoop1'?}} {{11-20=outerLoop1}}
-  outerLoop2: for _ in [1] { // expected-note {{did you mean 'outerLoop2'?}} {{11-20=outerLoop2}}
+outerLoop1: for _ in [1] { // expected-note {{did you mean 'outerLoop1'?}} {{+2:11-20=outerLoop1}}
+  outerLoop2: for _ in [1] { // expected-note {{did you mean 'outerLoop2'?}} {{+1:11-20=outerLoop2}}
     break outerloop // expected-error {{cannot find label 'outerloop' in scope}}
   }
 }
-outerLoop1: for _ in [1] { // expected-note {{did you mean 'outerLoop1'?}} {{14-23=outerLoop1}}
-  outerLoop2: for _ in [1] { // expected-note {{did you mean 'outerLoop2'?}} {{14-23=outerLoop2}}
+outerLoop1: for _ in [1] { // expected-note {{did you mean 'outerLoop1'?}} {{+2:14-23=outerLoop1}}
+  outerLoop2: for _ in [1] { // expected-note {{did you mean 'outerLoop2'?}} {{+1:14-23=outerLoop2}}
     continue outerloop // expected-error {{cannot find label 'outerloop' in scope}}
   }
 }
-outerLoop1: while true { // expected-note {{did you mean 'outerLoop1'?}} {{11-20=outerLoop1}}
-  outerLoop2: while true { // expected-note {{did you mean 'outerLoop2'?}} {{11-20=outerLoop2}}
+outerLoop1: while true { // expected-note {{did you mean 'outerLoop1'?}} {{+2:11-20=outerLoop1}}
+  outerLoop2: while true { // expected-note {{did you mean 'outerLoop2'?}} {{+1:11-20=outerLoop2}}
     break outerloop // expected-error {{cannot find label 'outerloop' in scope}}
   }
 }
-outerLoop1: while true { // expected-note {{did you mean 'outerLoop1'?}} {{14-23=outerLoop1}}
-  outerLoop2: while true { // expected-note {{did you mean 'outerLoop2'?}} {{14-23=outerLoop2}}
+outerLoop1: while true { // expected-note {{did you mean 'outerLoop1'?}} {{+2:14-23=outerLoop1}}
+  outerLoop2: while true { // expected-note {{did you mean 'outerLoop2'?}} {{+1:14-23=outerLoop2}}
     continue outerloop // expected-error {{cannot find label 'outerloop' in scope}}
   }
 }
-outerLoop1: repeat { // expected-note {{did you mean 'outerLoop1'?}} {{11-20=outerLoop1}}
-  outerLoop2: repeat { // expected-note {{did you mean 'outerLoop2'?}} {{11-20=outerLoop2}}
+outerLoop1: repeat { // expected-note {{did you mean 'outerLoop1'?}} {{+2:11-20=outerLoop1}}
+  outerLoop2: repeat { // expected-note {{did you mean 'outerLoop2'?}} {{+1:11-20=outerLoop2}}
     break outerloop // expected-error {{cannot find label 'outerloop' in scope}}
   } while true
 } while true
-outerLoop1: repeat { // expected-note {{did you mean 'outerLoop1'?}} {{14-23=outerLoop1}}
-  outerLoop2: repeat { // expected-note {{did you mean 'outerLoop2'?}} {{14-23=outerLoop2}}
+outerLoop1: repeat { // expected-note {{did you mean 'outerLoop1'?}} {{+2:14-23=outerLoop1}}
+  outerLoop2: repeat { // expected-note {{did you mean 'outerLoop2'?}} {{+1:14-23=outerLoop2}}
     continue outerloop // expected-error {{cannot find label 'outerloop' in scope}}
   } while true
 } while true

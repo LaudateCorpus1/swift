@@ -67,7 +67,19 @@ extension Clock {
   ///          await someWork()
   ///       }
   @available(SwiftStdlib 5.7, *)
+  @_alwaysEmitIntoClient
+  @_allowFeatureSuppression(OptionalIsolatedParameters)
   public func measure(
+    isolation: isolated (any Actor)? = #isolation,
+    _ work: () async throws -> Void
+  ) async rethrows -> Instant.Duration {
+    try await measure(work)
+  }
+
+  @available(SwiftStdlib 5.7, *)
+  @_unsafeInheritExecutor
+  @usableFromInline
+  internal func measure(
     _ work: () async throws -> Void
   ) async rethrows -> Instant.Duration {
     let start = now
@@ -76,6 +88,24 @@ extension Clock {
     return start.duration(to: end)
   }
 }
+
+#if !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
+@available(SwiftStdlib 5.7, *)
+extension Clock {
+  /// Suspends for the given duration.
+  ///
+  /// Prefer to use the `sleep(until:tolerance:)` method on `Clock` if you have
+  /// access to an absolute instant.
+  @available(SwiftStdlib 5.7, *)
+  @_alwaysEmitIntoClient
+  public func sleep(
+    for duration: Instant.Duration,
+    tolerance: Instant.Duration? = nil
+  ) async throws {
+    try await sleep(until: now.advanced(by: duration), tolerance: tolerance)
+  }
+}
+#endif
 
 enum _ClockID: Int32 {
   case continuous = 1

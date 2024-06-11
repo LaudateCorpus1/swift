@@ -240,7 +240,7 @@ struct G<T> {
 func wump<T>(to: T, _ body: (G<T>) -> ()) {}
 
 wump(to: 0, { $0[] = 0 })
-// expected-error@-1 {{missing argument for parameter #1 in call}}
+// expected-error@-1 {{missing argument for parameter #1 in subscript}}
 
 // https://github.com/apple/swift/issues/56129
 
@@ -301,4 +301,12 @@ func test_incorrect_inout_at_assignment_source() {
     s.prop = &str // expected-error {{'&' may only be used to pass an argument to inout parameter}}
     s.prop = &val // expected-error {{'&' may only be used to pass an argument to inout parameter}}
   }
+}
+
+// rdar://100369066 - type of expression is ambiguous when `&` is used incorrectly
+func test_invalid_inout_with_restrictions(lhs: inout any BinaryInteger, rhs: any BinaryInteger) {
+  lhs = &rhs // expected-error {{'&' may only be used to pass an argument to inout parameter}}
+
+  var other: (any BinaryInteger)? = nil
+  other = &rhs // expected-error {{'&' may only be used to pass an argument to inout parameter}}
 }

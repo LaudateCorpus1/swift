@@ -122,9 +122,32 @@ std::string swift::nameForMetadata(const Metadata *type,
   return result;
 }
 
+std::string MetadataOrPack::nameForMetadata() const {
+  if (isNull())
+    return "<<nullptr>>";
+
+  if (isMetadata())
+    return ::nameForMetadata(getMetadata());
+
+  std::string result = "Pack{";
+  MetadataPackPointer pack = getMetadataPack();
+  for (size_t i = 0, e = pack.getNumElements(); i < e; ++i) {
+    if (i != 0)
+      result += ", ";
+    result += ::nameForMetadata(pack.getElements()[i]);
+  }
+  result += "}";
+
+  return result;
+}
+
 #else // SWIFT_STDLIB_HAS_TYPE_PRINTING
 
 std::string swift::nameForMetadata(const Metadata *type, bool qualified) {
+  return "<<< type printer not available >>>";
+}
+
+std::string MetadataOrPack::nameForMetadata() const {
   return "<<< type printer not available >>>";
 }
 
@@ -496,7 +519,7 @@ bool swift::_conformsToProtocol(const OpaqueValue *value,
                                 const WitnessTable **conformance) {
   // Look up the witness table for protocols that need them.
   if (protocol.needsWitnessTable()) {
-    auto witness = swift_conformsToProtocol(type, protocol.getSwiftProtocol());
+    auto witness = swift_conformsToProtocolCommon(type, protocol.getSwiftProtocol());
     if (!witness)
       return false;
     if (conformance)
@@ -663,6 +686,40 @@ findDynamicValueAndType(OpaqueValue *value, const Metadata *type,
       return findDynamicValueAndType(innerValue, innerType,
                                      outValue, outType, inoutCanTake, false,
                                      isTargetExistentialMetatype);
+    }
+    }
+  }
+
+  case MetadataKind::ExtendedExistential: {
+    auto *existentialType = cast<ExtendedExistentialTypeMetadata>(type);
+
+    switch (existentialType->Shape->Flags.getSpecialKind()) {
+    case ExtendedExistentialTypeShape::SpecialKind::None: {
+      auto opaqueContainer =
+	reinterpret_cast<OpaqueExistentialContainer *>(value);
+      auto innerValue = const_cast<OpaqueValue *>(opaqueContainer->projectValue());
+      auto innerType = opaqueContainer->Type;
+      return findDynamicValueAndType(innerValue, innerType,
+                                     outValue, outType, inoutCanTake, false,
+                                     isTargetExistentialMetatype);
+    }
+    case ExtendedExistentialTypeShape::SpecialKind::Class: {
+      auto classContainer =
+        reinterpret_cast<ClassExistentialContainer *>(value);
+      outType = swift_getObjectType((HeapObject *)classContainer->Value);
+      outValue = reinterpret_cast<OpaqueValue *>(&classContainer->Value);
+      return;
+    }
+    case ExtendedExistentialTypeShape::SpecialKind::Metatype: {
+      auto srcExistentialContainer =
+        reinterpret_cast<ExistentialMetatypeContainer *>(value);
+      outType = swift_getMetatypeMetadata(srcExistentialContainer->Value);
+      outValue = reinterpret_cast<OpaqueValue *>(&srcExistentialContainer->Value);
+      return;
+    }
+    case ExtendedExistentialTypeShape::SpecialKind::ExplicitLayout: {
+      swift_unreachable("Extended Existential with explicit layout not yet implemented");
+      return;
     }
     }
   }
@@ -1326,7 +1383,7 @@ extern "C" const StructDescriptor NOMINAL_TYPE_DESCR_SYM(SS);
 static const _ObjectiveCBridgeableWitnessTable *
 swift_conformsToObjectiveCBridgeable(const Metadata *T) {
   return reinterpret_cast<const _ObjectiveCBridgeableWitnessTable *>
-    (swift_conformsToProtocol(T, &PROTOCOL_DESCR_SYM(s21_ObjectiveCBridgeable)));
+    (swift_conformsToProtocolCommon(T, &PROTOCOL_DESCR_SYM(s21_ObjectiveCBridgeable)));
 }
 
 static const _ObjectiveCBridgeableWitnessTable *

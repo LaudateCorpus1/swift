@@ -1,5 +1,5 @@
-// RUN: %target-sil-opt -opt-mode=none  -enable-sil-verify-all %s -compute-side-effects -ssa-destroy-hoisting | %FileCheck %s --check-prefix=CHECK --check-prefix=CHECKDEB --check-prefix=CHECK-DEB
-// RUN: %target-sil-opt -opt-mode=speed -enable-sil-verify-all %s -compute-side-effects -ssa-destroy-hoisting | %FileCheck %s --check-prefix=CHECK --check-prefix=CHECKOPT --check-prefix=CHECK-OPT
+// RUN: %target-sil-opt -opt-mode=none  -enable-sil-verify-all %s -compute-side-effects -destroy-addr-hoisting | %FileCheck %s --check-prefix=CHECK --check-prefix=CHECKDEB --check-prefix=CHECK-DEB
+// RUN: %target-sil-opt -opt-mode=speed -enable-sil-verify-all %s -compute-side-effects -destroy-addr-hoisting | %FileCheck %s --check-prefix=CHECK --check-prefix=CHECKOPT --check-prefix=CHECK-OPT
 //
 // TODO: migrate the remaining tests from destroy_hoisting.sil.
 
@@ -60,6 +60,11 @@ struct I {
   var value: Builtin.Int64
 }
 
+struct Slice {
+    var _startIndex: I
+    var _guts: AnyObject
+}
+
 typealias TXXI = (X, X, I)
 
 struct SXXI {
@@ -73,6 +78,9 @@ struct STXXITXXII {
   var txxi_2: TXXI
   var i: I
 }
+
+@_moveOnly struct MoS {}
+@_moveOnly struct MoE {}
 
 sil @unknown : $@convention(thin) () -> ()
 sil @use_S : $@convention(thin) (@in_guaranteed S) -> ()
@@ -594,7 +602,7 @@ sil [ossa] @nohoist_over_end_apply_use : $@convention(thin) (@inout X, @owned X)
 entry(%addr : $*X, %instance : @owned $X):
   %coro = function_ref @coro : $@yield_once @convention(thin) (@inout X) -> @yields ()
   (%empty, %continuation) = begin_apply %coro(%addr) : $@yield_once @convention(thin) (@inout X) -> @yields ()
-  end_apply %continuation
+  end_apply %continuation as $()
   %retval = tuple ()
   store %instance to [assign] %addr : $*X
   return %retval : $()
@@ -1073,6 +1081,61 @@ entry(%instance : @owned $AnyObject):
     return %cast : $X
 }
 
+// Don't fold a destroy_addr into a copy_addr of the whole aggregate if there
+// is an access to some trivial subobject afterwards.
+// CHECK-LABEL: sil [ossa] @nofold_destroy_addr_into_whole_with_later_trivial_subobject_use : {{.*}} {
+// CHECK:         destroy_addr
+// CHECK-LABEL: } // end sil function 'nofold_destroy_addr_into_whole_with_later_trivial_subobject_use'
+sil [ossa] @nofold_destroy_addr_into_whole_with_later_trivial_subobject_use : $@convention(thin) (@in Slice) -> (@out Slice) {
+bb0(%out : $*Slice, %4 : $*Slice):
+  copy_addr %4 to [init] %out : $*Slice
+  %8 = alloc_stack $I
+  %9 = struct_element_addr %4 : $*Slice, #Slice._startIndex
+  copy_addr %9 to [init] %8 : $*I
+  destroy_addr %4 : $*Slice
+  dealloc_stack %8 : $*I
+  %19 = tuple ()
+  return %19 : $()
+}
+
+// Like fold_struct_enclosing_tuples_leaf_fields_mixed_insts but with an access
+// of a trivial field afterwards.
+// CHECK-LABEL: sil [ossa] @nofold_struct_enclosing_tuples_leaf_fields_mixed_insts_with_later_trivial_subobject : {{.*}} {
+// CHECK:         load [trivial]
+// CHECK:         destroy_addr {{%[^,]+}} : $*STXXITXXII
+// CHECK-LABEL: } // end sil function 'nofold_struct_enclosing_tuples_leaf_fields_mixed_insts_with_later_trivial_subobject'
+sil [ossa] @nofold_struct_enclosing_tuples_leaf_fields_mixed_insts_with_later_trivial_subobject : $@convention(thin) (@owned STXXITXXII) -> @owned (X, X) {
+entry(%instance : @owned $STXXITXXII):
+    %addr = alloc_stack $STXXITXXII
+    %txxi_1_alone = alloc_stack $X
+    %txxi_2_alone = alloc_stack $X
+    store %instance to [init] %addr : $*STXXITXXII
+    %txxi_1_addr = struct_element_addr %addr : $*STXXITXXII, #STXXITXXII.txxi_1
+    %txxi_2_addr = struct_element_addr %addr : $*STXXITXXII, #STXXITXXII.txxi_2
+    %txxi_1_x_0_addr = tuple_element_addr %txxi_1_addr : $*(X, X, I), 0
+    %txxi_1_x_1_addr = tuple_element_addr %txxi_1_addr : $*(X, X, I), 1
+    %txxi_2_x_0_addr = tuple_element_addr %txxi_2_addr : $*(X, X, I), 0
+    %txxi_2_x_1_addr = tuple_element_addr %txxi_2_addr : $*(X, X, I), 1
+    %trivial = struct_element_addr %addr : $*STXXITXXII, #STXXITXXII.i
+
+    copy_addr %txxi_1_x_0_addr to [init] %txxi_1_alone : $*X
+    %x1x1 = load [copy] %txxi_1_x_1_addr : $*X
+    copy_addr %txxi_2_x_0_addr to [init] %txxi_2_alone : $*X
+    %x2x1 = load [copy] %txxi_2_x_1_addr : $*X
+    %i = load [trivial] %trivial : $*I
+    destroy_addr %addr : $*STXXITXXII
+    %barrier = function_ref @unknown : $@convention(thin) () -> ()
+    apply %barrier() : $@convention(thin) () -> ()
+
+    destroy_addr %txxi_1_alone : $*X
+    destroy_addr %txxi_2_alone : $*X
+    dealloc_stack %txxi_2_alone : $*X
+    dealloc_stack %txxi_1_alone : $*X
+    dealloc_stack %addr : $*STXXITXXII
+    %retval = tuple (%x1x1 : $X, %x2x1 : $X)
+    return %retval : $(X, X)
+}
+
 // CHECK-LABEL: sil [ossa] @hoist_over_apply_of_non_barrier_fn : {{.*}} {
 // CHECK:         destroy_addr
 // CHECK:         apply
@@ -1084,4 +1147,55 @@ entry(%addr : $*X):
   destroy_addr %addr : $*X
   %retval = tuple ()
   return %retval : $()
+}
+
+// Even though the apply of %empty is not a deinit barrier (c.f.
+// hoist_over_apply_of_non_barrier_fn), verify that the destroy_addr is not
+// hoisted, because MoS is move-only.
+// CHECK-LABEL: sil [ossa] @dont_move_destroy_addr_of_moveonly_struct : {{.*}} {
+// CHECK:       {{bb[0-9]+}}([[ADDR:%[^,]+]] :
+// CHECK:         apply
+// CHECK:         destroy_addr [[ADDR]]
+// CHECK-LABEL: } // end sil function 'dont_move_destroy_addr_of_moveonly_struct'
+sil [ossa] @dont_move_destroy_addr_of_moveonly_struct : $@convention(thin) (@in MoS) -> () {
+entry(%addr : $*MoS):
+  %empty = function_ref @empty : $@convention(thin) () -> ()
+  apply %empty() : $@convention(thin) () -> ()
+  destroy_addr %addr : $*MoS
+  %retval = tuple ()
+  return %retval : $()
+}
+
+// CHECK-LABEL: sil [ossa] @dont_move_destroy_addr_of_moveonly_enum : {{.*}} {
+// CHECK:       {{bb[0-9]+}}([[ADDR:%[^,]+]] :
+// CHECK:         apply
+// CHECK:         destroy_addr [[ADDR]]
+// CHECK-LABEL: } // end sil function 'dont_move_destroy_addr_of_moveonly_enum'
+sil [ossa] @dont_move_destroy_addr_of_moveonly_enum : $@convention(thin) (@in MoE) -> () {
+entry(%addr : $*MoE):
+  %empty = function_ref @empty : $@convention(thin) () -> ()
+  apply %empty() : $@convention(thin) () -> ()
+  destroy_addr %addr : $*MoE
+  %retval = tuple ()
+  return %retval : $()
+}
+
+sil @getPointer : $@convention(thin) () -> Builtin.RawPointer
+
+struct Nontrivial {
+  var guts: Builtin.AnyObject
+}
+
+sil [ossa] @rdar121327964 : $@convention(method) (@owned Nontrivial) -> () {
+bb0(%0 : @owned $Nontrivial):
+  %6 = function_ref @getPointer : $@convention(thin) () -> Builtin.RawPointer
+  %7 = apply %6() : $@convention(thin) () -> Builtin.RawPointer
+  %8 = pointer_to_address %7 : $Builtin.RawPointer to [strict] $*Nontrivial
+  %9 = copy_value %0 : $Nontrivial
+  %10 = begin_access [modify] [dynamic] %8 : $*Nontrivial
+  store %9 to [assign] %10 : $*Nontrivial
+  end_access %10 : $*Nontrivial
+  destroy_value %0 : $Nontrivial
+  %14 = tuple ()
+  return %14 : $()
 }

@@ -20,6 +20,7 @@
 #include "swift/Runtime/EnvironmentVariables.h"
 #include "swift/Threading/Once.h"
 #include "swift/shims/RuntimeShims.h"
+#include "swift/shims/Target.h"
 #include <stdint.h>
 
 // If this is an Apple OS, use the Apple binary compatibility rules
@@ -60,6 +61,11 @@ static enum sdk_test isAppAtLeast(dyld_build_version_t version) {
 static enum sdk_test isAppAtLeastSpring2021() {
     const dyld_build_version_t spring_2021_os_versions = {0xffffffff, 0x007e50301};
     return isAppAtLeast(spring_2021_os_versions);
+}
+
+static enum sdk_test isAppAtLeastFall2023() {
+    const dyld_build_version_t fall_2023_os_versions = {0xffffffff, 0x007e70901};
+    return isAppAtLeast(fall_2023_os_versions);
 }
 #endif
 
@@ -189,7 +195,85 @@ bool useLegacyOptionalNilInjectionInCasting() {
 // by that protocol.
 bool useLegacyObjCBoxingInCasting() {
 #if BINARY_COMPATIBILITY_APPLE
-  return true; // For now, continue using the legacy behavior on Apple OSes
+  switch (isAppAtLeastFall2023()) {
+  case oldOS: return true; // Legacy behavior on old OS
+  case oldApp: return true; // Legacy behavior for old apps
+  case newApp: return false; // New behavior for new apps
+  }
+#else
+  return false; // Always use the new behavior on non-Apple OSes
+#endif
+}
+
+// Should casting be strict about protocol conformance when
+// unboxing values that were boxed for Obj-C use?
+
+// Similar to `useLegacyObjCBoxingInCasting()`, but
+// this applies to the case where you have already boxed
+// some Swift non-reference-type into a `__SwiftValue`
+// and are now casting to a protocol.
+
+// For example, this cast
+// `x as! AnyObject as? NSCopying`
+// always succeeded with the legacy semantics.
+
+bool useLegacySwiftValueUnboxingInCasting() {
+#if BINARY_COMPATIBILITY_APPLE
+  switch (isAppAtLeastFall2023()) {
+  case oldOS: return true; // Legacy behavior on old OS
+  case oldApp: return true; // Legacy behavior for old apps
+  case newApp: return false; // New behavior for new apps
+  }
+#else
+  return false; // Always use the new behavior on non-Apple OSes
+#endif
+}
+
+// Controls how ObjC -hashValue and -isEqual are handled
+// by Swift objects.
+// There are two basic semantics:
+// * pointer: -hashValue returns pointer, -isEqual: tests pointer equality
+// * proxy: -hashValue calls on Hashable conformance, -isEqual: calls Equatable conformance
+//
+// Legacy handling:
+// * Swift struct/enum values that implement Hashable: proxy -hashValue and -isEqual:
+// * Swift struct/enum values that implement Equatable but not Hashable: pointer semantics
+// * Swift class values regardless of hashable/Equatable support: pointer semantics
+//
+// New behavior:
+// * Swift struct/enum/class values that implement Hashable: proxy -hashValue and -isEqual:
+// * Swift struct/enum/class values that implement Equatable but not Hashable: proxy -isEqual:, constant -hashValue
+// * All other cases: pointer semantics
+//
+bool useLegacySwiftObjCHashing() {
+#if BINARY_COMPATIBILITY_APPLE
+  return true; // For now, legacy behavior on Apple OSes
+#elif SWIFT_TARGET_OS_DARWIN
+  return true; // For now, use legacy behavior on open-source builds for Apple platforms
+#else
+  return false; // Always use the new behavior on non-Apple OSes
+#endif
+}
+
+// Controls legacy mode for the 'swift_task_isCurrentExecutorImpl' runtime function.
+//
+// In "legacy" / "no crash" mode:
+// * The `swift_task_isCurrentExecutorImpl` cannot crash
+// * This means cases where no "current" executor is present cannot be diagnosed correctly
+//    * The runtime can NOT use 'SerialExecutor/checkIsolated'
+//    * The runtime can NOT use 'dispatch_precondition' which is able ot handle some dispatch and main actor edge cases
+//
+// New behavior in "swift6" "crash" mode:
+// * The 'swift_task_isCurrentExecutorImpl' will CRASH rather than return 'false'
+// * This allows the method to invoke 'SerialExecutor/checkIsolated'
+//   * Which is allowed to call 'dispatch_precondition' and handle "on dispatch queue but not on Swift executor" cases
+//
+// FIXME(concurrency): Once the release is announced, adjust the logic detecting the SDKs
+bool swift_bincompat_useLegacyNonCrashingExecutorChecks() {
+#if BINARY_COMPATIBILITY_APPLE
+  return true; // For now, legacy behavior on Apple OSes
+#elif SWIFT_TARGET_OS_DARWIN
+  return true; // For now, use legacy behavior on open-source builds for Apple platforms
 #else
   return false; // Always use the new behavior on non-Apple OSes
 #endif

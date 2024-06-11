@@ -1,4 +1,5 @@
-// RUN: %target-swift-emit-ir -enable-experimental-move-only %s | %FileCheck -check-prefix=IR %s
+// TODO: re-enable the simplification passes once rdar://104875010 is fixed
+// RUN: %target-swift-emit-ir -enable-experimental-feature MoveOnlyEnumDeinits -Xllvm -sil-disable-pass=simplification %s | %FileCheck -check-prefix=IR %s
 
 // Test that makes sure that at IRGen time we properly handle conditional
 // releases for trivial and non-trivial move only types. The SIL/SILGen part of
@@ -6,7 +7,10 @@
 // we can test on other platforms the other behavior.
 
 // REQUIRES: asserts
-// REQUIRES: CPU=x86_64
+// REQUIRES: CODEGENERATOR=X86
+
+// rdar://107495541 Test needs to be updated for 32bit.
+// REQUIRES: PTRSIZE=64
 
 //////////////////////
 // Misc Declaration //
@@ -62,16 +66,25 @@ var value: Bool { false }
 //////////////////
 
 // IR-LABEL: define {{.*}}swiftcc void @"$s16moveonly_deinits24testIntPairWithoutDeinityyF"()
-// IR: br i1 {{%.*}}, label %[[BB1:[0-9]+]], label %[[BB2:[0-9]+]]
+// IR:   [[ALLOCA:%.*]] = alloca [[TYPE:%T16moveonly_deinits20IntPairWithoutDeinitV]]
+// IR:   br i1 {{%.*}}, label %[[BB1:[0-9]+]], label %[[BB2:[0-9]+]]
 //
 // IR: [[BB1]]:
-// IR-NEXT:   call swiftcc void @"$s16moveonly_deinits27consumeIntPairWithoutDeinityyAA0defG0VnF"
+// IR-NEXT:   [[GEP:%.*]] = getelementptr inbounds [[TYPE]], ptr [[ALLOCA]], i32 0, i32 0
+// IR-NEXT:   [[GEP2:%.*]] = getelementptr inbounds %TSi, ptr [[GEP]], i32 0, i32 0
+// IR-NEXT:   [[LHS:%.*]] = load i64, ptr [[GEP2]]
+// IR-NEXT:   [[GEP:%.*]] = getelementptr inbounds [[TYPE]], ptr [[ALLOCA]], i32 0, i32 1
+// IR-NEXT:   [[GEP2:%.*]] = getelementptr inbounds %TSi, ptr [[GEP]], i32 0, i32 0
+// IR-NEXT:   [[RHS:%.*]] = load i64, ptr [[GEP2]]
+// IR-NEXT:   call swiftcc void @"$s16moveonly_deinits27consumeIntPairWithoutDeinityyAA0defG0VnF"(i64 [[LHS]], i64 [[RHS]])
 // IR-NEXT:   br label %[[CONT:[0-9]+]]
 //
 // IR: [[BB2]]:
+// IR-NEXT:   call ptr @"$s16moveonly_deinits20IntPairWithoutDeinitVWOh"(ptr [[ALLOCA]])
 // IR-NEXT:   br label %[[CONT]]
 //
 // IR: [[CONT]]:
+// IR-NEXT: @llvm.lifetime.end
 // IR-NEXT: ret void
 // IR-NEXT: }
 public func testIntPairWithoutDeinit() {
@@ -82,17 +95,31 @@ public func testIntPairWithoutDeinit() {
 }
 
 // IR-LABEL: define {{.*}}swiftcc void @"$s16moveonly_deinits21testIntPairWithDeinityyF"()
+// IR: [[ALLOCA:%.*]] = alloca [[TYPE:%T16moveonly_deinits17IntPairWithDeinitV]]
 // IR: br i1 {{%.*}}, label %[[BB1:[0-9]+]], label %[[BB2:[0-9]+]]
 //
 // IR: [[BB1]]:
+// IR-NEXT:   [[GEP:%.*]] = getelementptr inbounds [[TYPE]], ptr [[ALLOCA]], i32 0, i32 0
+// IR-NEXT:   [[GEP2:%.*]] = getelementptr inbounds %TSi, ptr [[GEP]], i32 0, i32 0
+// IR-NEXT:   [[LHS:%.*]] = load i64, ptr [[GEP2]]
+// IR-NEXT:   [[GEP:%.*]] = getelementptr inbounds [[TYPE]], ptr [[ALLOCA]], i32 0, i32 1
+// IR-NEXT:   [[GEP2:%.*]] = getelementptr inbounds %TSi, ptr [[GEP]], i32 0, i32 0
+// IR-NEXT:   [[RHS:%.*]] = load i64, ptr [[GEP2]]
 // IR-NEXT:  call swiftcc void @"$s16moveonly_deinits24consumeIntPairWithDeinityyAA0defG0VnF"(
 // IR-NEXT:  br label %[[CONT:[0-9]+]]
 //
 // IR: [[BB2]]:
-// IR-NEXT:  call swiftcc void @"$s16moveonly_deinits17IntPairWithDeinitVfD"(
+// IR-NEXT:   [[GEP:%.*]] = getelementptr inbounds [[TYPE]], ptr [[ALLOCA]], i32 0, i32 0
+// IR-NEXT:   [[GEP2:%.*]] = getelementptr inbounds %TSi, ptr [[GEP]], i32 0, i32 0
+// IR-NEXT:   [[LHS:%.*]] = load i64, ptr [[GEP2]]
+// IR-NEXT:   [[GEP:%.*]] = getelementptr inbounds [[TYPE]], ptr [[ALLOCA]], i32 0, i32 1
+// IR-NEXT:   [[GEP2:%.*]] = getelementptr inbounds %TSi, ptr [[GEP]], i32 0, i32 0
+// IR-NEXT:   [[RHS:%.*]] = load i64, ptr [[GEP2]]
+// IR-NEXT:  call swiftcc void @"$s16moveonly_deinits17IntPairWithDeinitVfD"(i64 [[LHS]], i64 [[RHS]])
 // IR-NEXT:  br label %[[CONT]]
 //
 // IR: [[CONT]]
+// IR-NEXT: @llvm.lifetime.end
 // IR-NEXT: ret void
 // IR-NEXT: }
 public func testIntPairWithDeinit() {
@@ -103,18 +130,23 @@ public func testIntPairWithDeinit() {
 }
 
 // IR-LABEL: define {{.*}}swiftcc void @"$s16moveonly_deinits26testKlassPairWithoutDeinityyF"()
-// IR: br i1 {{%.*}}, label %[[BB1:[0-9]+]], label %[[BB2:[0-9]+]]
+// IR:   [[ALLOCA:%.*]] = alloca [[TYPE:%T16moveonly_deinits22KlassPairWithoutDeinitV]]
+// IR:   br i1 {{%.*}}, label %[[BB1:[0-9]+]], label %[[BB2:[0-9]+]]
 //
 // IR: [[BB1]]:
-// IR-NEXT:   call swiftcc void @"$s16moveonly_deinits29consumeKlassPairWithoutDeinityyAA0defG0VnF"
+// IR-NEXT:   [[GEP:%.*]] = getelementptr inbounds [[TYPE]], ptr [[ALLOCA]], i32 0, i32 0
+// IR-NEXT:   [[LHS:%.*]] = load ptr, ptr [[GEP]]
+// IR-NEXT:   [[GEP:%.*]] = getelementptr inbounds [[TYPE]], ptr [[ALLOCA]], i32 0, i32 1
+// IR-NEXT:   [[RHS:%.*]] = load ptr, ptr [[GEP]]
+// IR-NEXT:   call swiftcc void @"$s16moveonly_deinits29consumeKlassPairWithoutDeinityyAA0defG0VnF"(ptr [[LHS]], ptr [[RHS]])
 // IR-NEXT:   br label %[[CONT:[0-9]+]]
 //
 // IR: [[BB2]]:
-// IR-NEXT:   call void bitcast {{.*}} @swift_release
-// IR-NEXT:   call void bitcast {{.*}} @swift_release
+// IR-NEXT:   call ptr @"$s16moveonly_deinits22KlassPairWithoutDeinitVWOh"(ptr [[ALLOCA]])
 // IR-NEXT:   br label %[[CONT]]
 //
 // IR: [[CONT]]:
+// IR-NEXT: call void
 // IR-NEXT: ret void
 // IR-NEXT: }
 public func testKlassPairWithoutDeinit() {
@@ -125,17 +157,27 @@ public func testKlassPairWithoutDeinit() {
 }
 
 // IR-LABEL: define {{.*}}swiftcc void @"$s16moveonly_deinits23testKlassPairWithDeinityyF"()
-// IR: br i1 {{%.*}}, label %[[BB1:[0-9]+]], label %[[BB2:[0-9]+]]
+// IR:   [[ALLOCA:%.*]] = alloca [[TYPE:%T16moveonly_deinits19KlassPairWithDeinitV]]
+// IR:   br i1 {{%.*}}, label %[[BB1:[0-9]+]], label %[[BB2:[0-9]+]]
 //
 // IR: [[BB1]]:
-// IR-NEXT:  call swiftcc void @"$s16moveonly_deinits26consumeKlassPairWithDeinityyAA0defG0VnF"(
+// IR-NEXT:   [[GEP:%.*]] = getelementptr inbounds [[TYPE]], ptr [[ALLOCA]], i32 0, i32 0
+// IR-NEXT:   [[LHS:%.*]] = load ptr, ptr [[GEP]]
+// IR-NEXT:   [[GEP:%.*]] = getelementptr inbounds [[TYPE]], ptr [[ALLOCA]], i32 0, i32 1
+// IR-NEXT:   [[RHS:%.*]] = load ptr, ptr [[GEP]]
+// IR-NEXT:  call swiftcc void @"$s16moveonly_deinits26consumeKlassPairWithDeinityyAA0defG0VnF"(ptr [[LHS]], ptr [[RHS]])
 // IR-NEXT:  br label %[[CONT:[0-9]+]]
 //
 // IR: [[BB2]]:
-// IR-NEXT:  call swiftcc void @"$s16moveonly_deinits19KlassPairWithDeinitVfD"(
+// IR-NEXT:   [[GEP:%.*]] = getelementptr inbounds [[TYPE]], ptr [[ALLOCA]], i32 0, i32 0
+// IR-NEXT:   [[LHS:%.*]] = load ptr, ptr [[GEP]]
+// IR-NEXT:   [[GEP:%.*]] = getelementptr inbounds [[TYPE]], ptr [[ALLOCA]], i32 0, i32 1
+// IR-NEXT:   [[RHS:%.*]] = load ptr, ptr [[GEP]]
+// IR-NEXT:  call swiftcc void @"$s16moveonly_deinits19KlassPairWithDeinitVfD"(ptr [[LHS]], ptr [[RHS]])
 // IR-NEXT:  br label %[[CONT]]
 //
 // IR: [[CONT]]
+// IR-NEXT: @llvm.lifetime.end
 // IR-NEXT: ret void
 // IR-NEXT: }
 public func testKlassPairWithDeinit() {
@@ -191,16 +233,22 @@ func consumeKlassEnumPairWithDeinit(_ x: __owned KlassEnumPairWithDeinit) { }
 ////////////////
 
 // IR-LABEL: define {{.*}}swiftcc void @"$s16moveonly_deinits28testIntEnumPairWithoutDeinityyF"()
-// IR: br i1 {{%.*}}, label %[[BB1:[0-9]+]], label %[[BB2:[0-9]+]]
+// IR:   [[ALLOCA:%.*]] = alloca [[TYPE:%T16moveonly_deinits24IntEnumPairWithoutDeinitO]]
+// IR:   br i1 {{%.*}}, label %[[BB1:[0-9]+]], label %[[BB2:[0-9]+]]
 //
 // IR: [[BB1]]:
-// IR-NEXT:   call swiftcc void @"$s16moveonly_deinits31consumeIntEnumPairWithoutDeinityyAA0defgH0OnF"
+// IR-NEXT:  [[LHS:%.*]] = load i64, ptr [[ALLOCA]]
+// IR-NEXT:  [[GEP:%.*]] = getelementptr inbounds [[TYPE]], ptr [[ALLOCA]], i32 0, i32 1
+// IR-NEXT:  [[RHS:%.*]] = load i1, ptr [[GEP]]
+// IR-NEXT:  [[RHS_ZEXT:%.*]] = zext i1 [[RHS]]
+// IR-NEXT:   call swiftcc void @"$s16moveonly_deinits31consumeIntEnumPairWithoutDeinityyAA0defgH0OnF"(i64 [[LHS]], i8 [[RHS_ZEXT]])
 // IR-NEXT:   br label %[[CONT:[0-9]+]]
 //
 // IR: [[BB2]]:
 // IR-NEXT:   br label %[[CONT]]
 //
 // IR: [[CONT]]:
+// IR-NEXT: call void @llvm.lifetime.end
 // IR-NEXT: ret void
 // IR-NEXT: }
 public func testIntEnumPairWithoutDeinit() {
@@ -211,17 +259,27 @@ public func testIntEnumPairWithoutDeinit() {
 }
 
 // IR-LABEL: define {{.*}}swiftcc void @"$s16moveonly_deinits25testIntEnumPairWithDeinityyF"()
-// IR: br i1 {{%.*}}, label %[[BB1:[0-9]+]], label %[[BB2:[0-9]+]]
+// IR:   [[ALLOCA:%.*]] = alloca [[TYPE:%T16moveonly_deinits21IntEnumPairWithDeinitO]]
+// IR:   br i1 {{%.*}}, label %[[BB1:[0-9]+]], label %[[BB2:[0-9]+]]
 //
 // IR: [[BB1]]:
-// IR-NEXT:  call swiftcc void @"$s16moveonly_deinits28consumeIntEnumPairWithDeinityyAA0defgH0OnF"(
+// IR-NEXT:  [[LHS:%.*]] = load i64, ptr [[ALLOCA]]
+// IR-NEXT:  [[GEP:%.*]] = getelementptr inbounds [[TYPE]], ptr [[ALLOCA]], i32 0, i32 1
+// IR-NEXT:  [[RHS:%.*]] = load i1, ptr [[GEP]]
+// IR-NEXT:  [[RHS_ZEXT:%.*]] = zext i1 [[RHS]]
+// IR-NEXT:  call swiftcc void @"$s16moveonly_deinits28consumeIntEnumPairWithDeinityyAA0defgH0OnF"(i64 [[LHS]], i8 [[RHS_ZEXT]])
 // IR-NEXT:  br label %[[CONT:[0-9]+]]
 //
 // IR: [[BB2]]:
-// IR-NEXT:  call swiftcc void @"$s16moveonly_deinits21IntEnumPairWithDeinitOfD"(
+// IR-NEXT:  [[LHS:%.*]] = load i64, ptr [[ALLOCA]]
+// IR-NEXT:  [[GEP:%.*]] = getelementptr inbounds [[TYPE]], ptr [[ALLOCA]], i32 0, i32 1
+// IR-NEXT:  [[RHS:%.*]] = load i1, ptr [[GEP]]
+// IR-NEXT:  [[RHS_ZEXT:%.*]] = zext i1 [[RHS]]
+// IR-NEXT:  call swiftcc void @"$s16moveonly_deinits21IntEnumPairWithDeinitOfD"(i64 [[LHS]], i8 [[RHS_ZEXT]])
 // IR-NEXT:  br label %[[CONT]]
 //
 // IR: [[CONT]]
+// IR-NEXT: @llvm.lifetime.end
 // IR-NEXT: ret void
 // IR-NEXT: }
 public func testIntEnumPairWithDeinit() {
@@ -232,19 +290,20 @@ public func testIntEnumPairWithDeinit() {
 }
 
 // IR-LABEL: define {{.*}}swiftcc void @"$s16moveonly_deinits30testKlassEnumPairWithoutDeinityyF"()
-// IR: br i1 {{%.*}}, label %[[BB1:[0-9]+]], label %[[BB2:[0-9]+]]
+// IR:   [[ALLOCA:%.*]] = alloca [[TYPE:%T16moveonly_deinits26KlassEnumPairWithoutDeinitO]]
+// IR:   br i1 {{%.*}}, label %[[BB1:[0-9]+]], label %[[BB2:[0-9]+]]
 //
 // IR: [[BB1]]:
-// IR-NEXT:   call swiftcc void @"$s16moveonly_deinits33consumeKlassEnumPairWithoutDeinityyAA0defgH0OnF"
-// IR-NEXT:   br label %[[CONT:[0-9]+]]
+// IR-NEXT:  [[VALUE:%.*]] = load i64, ptr [[ALLOCA]]
+// IR-NEXT:  call swiftcc void @"$s16moveonly_deinits33consumeKlassEnumPairWithoutDeinityyAA0defgH0OnF"(i64 [[VALUE]])
+// IR-NEXT:  br label %[[CONT:[0-9]+]]
 //
 // IR: [[BB2]]:
-// IR-NEXT:   and i64
-// IR-NEXT:   inttoptr i64
-// IR-NEXT:   call void{{.*}} @swift_release
+// IR-NEXT: call ptr @"$s16moveonly_deinits26KlassEnumPairWithoutDeinitOWOh"(ptr [[ALLOCA]])
 // IR-NEXT:   br label %[[CONT]]
 //
 // IR: [[CONT]]:
+// IR-NEXT: @llvm.lifetime.end
 // IR-NEXT: ret void
 // IR-NEXT: }
 public func testKlassEnumPairWithoutDeinit() {
@@ -255,7 +314,7 @@ public func testKlassEnumPairWithoutDeinit() {
 }
 
 // SILGEN-LABEL: sil [ossa] @$s16moveonly_deinits27testKlassEnumPairWithDeinityyF : $@convention(thin) () -> () {
-// SILGEN: [[VALUE:%.*]] = mark_must_check [no_implicit_copy] {{%.*}}
+// SILGEN: [[VALUE:%.*]] = mark_unresolved_non_copyable_value [consumable_and_assignable] {{%.*}}
 // SILGEN: cond_br {{%.*}}, bb1, bb2
 //
 // SILGEN: bb1:
@@ -291,17 +350,21 @@ public func testKlassEnumPairWithoutDeinit() {
 // SIL: } // end sil function '$s16moveonly_deinits27testKlassEnumPairWithDeinityyF'
 
 // IR-LABEL: define {{.*}}swiftcc void @"$s16moveonly_deinits27testKlassEnumPairWithDeinityyF"()
-// IR: br i1 {{%.*}}, label %[[BB1:[0-9]+]], label %[[BB2:[0-9]+]]
+// IR:  [[ALLOCA:%.*]] = alloca [[TYPE:%T16moveonly_deinits23KlassEnumPairWithDeinitO]]
+// IR:  br i1 {{%.*}}, label %[[BB1:[0-9]+]], label %[[BB2:[0-9]+]]
 //
 // IR: [[BB1]]:
-// IR-NEXT:  call swiftcc void @"$s16moveonly_deinits30consumeKlassEnumPairWithDeinityyAA0defgH0OnF"(
+// IR-NEXT:  [[LOAD:%.*]] = load i64, ptr [[ALLOCA]]
+// IR-NEXT:  call swiftcc void @"$s16moveonly_deinits30consumeKlassEnumPairWithDeinityyAA0defgH0OnF"(i64 [[LOAD]])
 // IR-NEXT:  br label %[[CONT:[0-9]+]]
 //
 // IR: [[BB2]]:
-// IR-NEXT:  call swiftcc void @"$s16moveonly_deinits23KlassEnumPairWithDeinitOfD"(
+// IR-NEXT:  [[LOAD:%.*]] = load i64, ptr [[ALLOCA]]
+// IR-NEXT:  call swiftcc void @"$s16moveonly_deinits23KlassEnumPairWithDeinitOfD"(i64 [[LOAD]])
 // IR-NEXT:  br label %[[CONT]]
 //
 // IR: [[CONT]]
+// IR-NEXT: @llvm.lifetime.end
 // IR-NEXT: ret void
 // IR-NEXT: }
 public func testKlassEnumPairWithDeinit() {
@@ -310,3 +373,52 @@ public func testKlassEnumPairWithDeinit() {
         consumeKlassEnumPairWithDeinit(f)
     }
 }
+
+struct EmptyMoveOnlyWithDeinit: ~Copyable {
+  deinit {}
+}
+
+struct EnclosesEmptyMoveOnlyWithDeinit: ~Copyable {
+  var stored: EmptyMoveOnlyWithDeinit
+}
+
+// IR-LABEL: define {{.*}}swiftcc void @"$s16moveonly_deinits35testEnclosesEmptyMoveOnlyWithDeinityyF"()
+func testEnclosesEmptyMoveOnlyWithDeinit() {
+  // CHECK-NOT: ret
+  // CHECK: call swiftcc void @"$s16moveonly_deinits23EmptyMoveOnlyWithDeinitVfD"()
+  _ = EnclosesEmptyMoveOnlyWithDeinit(stored: EmptyMoveOnlyWithDeinit())
+}
+
+enum ESingle: ~Copyable {
+  case a(EmptyMoveOnlyWithDeinit)
+}
+
+struct OtherEmptyMoveOnlyWithDeinit: ~Copyable {
+  deinit {}
+}
+
+enum EMulti: ~Copyable {
+  case a(EmptyMoveOnlyWithDeinit)
+  case b(OtherEmptyMoveOnlyWithDeinit)
+}
+
+
+// IR-LABEL: define {{.*}} swiftcc void @"$s16moveonly_deinits14testSingleEnumyyF"()
+func testSingleEnum() {
+  // IR: call swiftcc void @"$s16moveonly_deinits23EmptyMoveOnlyWithDeinitVfD"()
+  _ = ESingle.a(EmptyMoveOnlyWithDeinit())
+}
+
+
+// IR-LABEL: define {{.*}}swiftcc void @"$s16moveonly_deinits13testMultiEnumyyF"()
+func testMultiEnum() {
+  // IR: call void @"$s16moveonly_deinits6EMultiOWOe"(i1 true)
+  _ = EMulti.b(OtherEmptyMoveOnlyWithDeinit())
+}
+
+// IR-LABEL: define {{.*}}void @"$s16moveonly_deinits6EMultiOWOe"
+// IR: br i1
+// IR: 1:
+// IR:  call swiftcc void @"$s16moveonly_deinits23EmptyMoveOnlyWithDeinitVfD"()
+// IR: 2:
+// IR:  call swiftcc void @"$s16moveonly_deinits28OtherEmptyMoveOnlyWithDeinitVfD"()

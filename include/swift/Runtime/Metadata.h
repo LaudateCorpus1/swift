@@ -18,7 +18,7 @@
 #define SWIFT_RUNTIME_METADATA_H
 
 #include "swift/ABI/Metadata.h"
-#include "swift/Reflection/Records.h"
+#include "swift/RemoteInspection/Records.h"
 #include "swift/Runtime/Once.h"
 #include "swift/shims/Visibility.h"
 
@@ -313,21 +313,36 @@ swift_getGenericMetadata(MetadataRequest request,
 ///   - installing new v-table entries and overrides; and
 ///   - registering the class with the runtime under ObjC interop.
 /// Most of this work can be achieved by calling swift_initClassMetadata.
-SWIFT_RETURNS_NONNULL SWIFT_NODISCARD SWIFT_RUNTIME_EXPORT
+SWIFT_EXTERN_C SWIFT_RETURNS_NONNULL SWIFT_NODISCARD SWIFT_RUNTIME_EXPORT_ATTRIBUTE
 ClassMetadata *
 swift_allocateGenericClassMetadata(const ClassDescriptor *description,
                                    const void *arguments,
                                    const GenericClassMetadataPattern *pattern);
 
+SWIFT_EXTERN_C SWIFT_RETURNS_NONNULL SWIFT_NODISCARD SWIFT_RUNTIME_EXPORT_ATTRIBUTE
+ClassMetadata *
+swift_allocateGenericClassMetadataWithLayoutString(
+    const ClassDescriptor *description,
+    const void *arguments,
+    const GenericClassMetadataPattern *pattern);
+
 /// Allocate a generic value metadata object.  This is intended to be
 /// called by the metadata instantiation function of a generic struct or
 /// enum.
-SWIFT_RETURNS_NONNULL SWIFT_NODISCARD SWIFT_RUNTIME_EXPORT
+SWIFT_EXTERN_C SWIFT_RETURNS_NONNULL SWIFT_NODISCARD SWIFT_RUNTIME_EXPORT_ATTRIBUTE
 ValueMetadata *
 swift_allocateGenericValueMetadata(const ValueTypeDescriptor *description,
                                    const void *arguments,
                                    const GenericValueMetadataPattern *pattern,
                                    size_t extraDataSize);
+
+SWIFT_EXTERN_C SWIFT_RETURNS_NONNULL SWIFT_NODISCARD SWIFT_RUNTIME_EXPORT_ATTRIBUTE
+ValueMetadata *
+swift_allocateGenericValueMetadataWithLayoutString(
+    const ValueTypeDescriptor *description,
+    const void *arguments,
+    const GenericValueMetadataPattern *pattern,
+    size_t extraDataSize);
 
 /// Check that the given metadata has the right state.
 SWIFT_RUNTIME_EXPORT SWIFT_CC(swift)
@@ -354,6 +369,12 @@ swift_getWitnessTable(const ProtocolConformanceDescriptor *conformance,
                       const Metadata *type,
                       const void * const *instantiationArgs);
 
+SWIFT_RUNTIME_EXPORT
+const RelativeWitnessTable *
+swift_getWitnessTableRelative(const ProtocolConformanceDescriptor *conformance,
+                      const Metadata *type,
+                      const void * const *instantiationArgs);
+
 /// Retrieve an associated type witness from the given witness table.
 ///
 /// \param wtable The witness table.
@@ -369,7 +390,13 @@ MetadataResponse swift_getAssociatedTypeWitness(
                                           const Metadata *conformingType,
                                           const ProtocolRequirement *reqBase,
                                           const ProtocolRequirement *assocType);
-
+SWIFT_RUNTIME_EXPORT SWIFT_CC(swift)
+MetadataResponse swift_getAssociatedTypeWitnessRelative(
+                                          MetadataRequest request,
+                                          RelativeWitnessTable *wtable,
+                                          const Metadata *conformingType,
+                                          const ProtocolRequirement *reqBase,
+                                          const ProtocolRequirement *assocType);
 /// Retrieve an associated conformance witness table from the given witness
 /// table.
 ///
@@ -388,6 +415,28 @@ const WitnessTable *swift_getAssociatedConformanceWitness(
                                   const ProtocolRequirement *reqBase,
                                   const ProtocolRequirement *assocConformance);
 
+SWIFT_RUNTIME_EXPORT SWIFT_CC(swift)
+const RelativeWitnessTable *swift_getAssociatedConformanceWitnessRelative(
+                                  RelativeWitnessTable *wtable,
+                                  const Metadata *conformingType,
+                                  const Metadata *assocType,
+                                  const ProtocolRequirement *reqBase,
+                                  const ProtocolRequirement *assocConformance);
+
+/// Compare two witness tables, which may involving checking the
+/// contents of their conformance descriptors.
+///
+/// Runtime availability: Swift 5.4
+///
+/// \param lhs The first protocol witness table to compare.
+/// \param rhs The second protocol witness table to compare.
+///
+/// \returns true if both witness tables describe the same conformance, false otherwise.
+SWIFT_RUNTIME_EXPORT
+SWIFT_CC(swift)
+bool swift_compareWitnessTables(const WitnessTable *lhs,
+                                const WitnessTable *rhs);
+
 /// Determine whether two protocol conformance descriptors describe the same
 /// conformance of a type to a protocol.
 ///
@@ -402,6 +451,36 @@ SWIFT_CC(swift)
 bool swift_compareProtocolConformanceDescriptors(
     const ProtocolConformanceDescriptor *lhs,
     const ProtocolConformanceDescriptor *rhs);
+
+/// Allocate a metadata pack on the heap, unless this pack is already on the
+/// heap.
+///
+/// Metadata packs are uniqued by pointer equality on their elements.
+///
+/// \param ptr A pack pointer, where the least significant bit indicates if
+/// it is already on the heap.
+/// \param count The number of metadata pointers in the pack.
+///
+/// \returns a metadata pack allocated on the heap, with the least significant
+/// bit set to true.
+SWIFT_RUNTIME_EXPORT SWIFT_CC(swift)
+const Metadata * const *
+swift_allocateMetadataPack(const Metadata * const *ptr, size_t count);
+
+/// Allocate a witness table pack on the heap, unless this pack is already on
+/// the heap.
+///
+/// Witness table packs are not uniqued.
+///
+/// \param ptr A pack pointer, where the least significant bit indicates if
+/// it is already on the heap.
+/// \param count The number of witness table pointers in the pack.
+///
+/// \returns a witness table pack allocated on the heap, with the least
+/// significant bit set to true.
+SWIFT_RUNTIME_EXPORT SWIFT_CC(swift)
+const WitnessTable * const *
+swift_allocateWitnessTablePack(const WitnessTable * const *ptr, size_t count);
 
 /// Fetch a uniqued metadata for a function type.
 SWIFT_RUNTIME_EXPORT
@@ -424,6 +503,14 @@ swift_getFunctionTypeMetadataGlobalActor(
     FunctionTypeFlags flags, FunctionMetadataDifferentiabilityKind diffKind,
     const Metadata *const *parameters, const uint32_t *parameterFlags,
     const Metadata *result, const Metadata *globalActor);
+
+SWIFT_RUNTIME_EXPORT
+const FunctionTypeMetadata *
+swift_getExtendedFunctionTypeMetadata(
+    FunctionTypeFlags flags, FunctionMetadataDifferentiabilityKind diffKind,
+    const Metadata *const *parameters, const uint32_t *parameterFlags,
+    const Metadata *result, const Metadata *globalActor,
+    ExtendedFunctionTypeFlags extFlags, const Metadata *thrownError);
 
 SWIFT_RUNTIME_EXPORT
 const FunctionTypeMetadata *
@@ -579,6 +666,45 @@ void swift_initStructMetadata(StructMetadata *self,
                               const TypeLayout * const *fieldTypes,
                               uint32_t *fieldOffsets);
 
+SWIFT_RUNTIME_EXPORT
+void swift_initStructMetadataWithLayoutString(StructMetadata *self,
+                                              StructLayoutFlags flags,
+                                              size_t numFields,
+                                              const uint8_t *const *fieldTypes,
+                                              const uint8_t *fieldTags,
+                                              uint32_t *fieldOffsets);
+
+enum LayoutStringFlags : uint64_t {
+  Empty = 0,
+  // TODO: Track other useful information tha can be used to optimize layout
+  //       strings, like different reference kinds contained in the string
+  //       number of ref counting operations (maybe up to 4), so we can
+  //       use witness functions optimized for these cases.
+  HasRelativePointers = (1ULL << 63),
+};
+
+inline bool operator&(LayoutStringFlags a, LayoutStringFlags b) {
+  return (uint64_t(a) & uint64_t(b)) != 0;
+}
+inline LayoutStringFlags operator|(LayoutStringFlags a, LayoutStringFlags b) {
+  return LayoutStringFlags(uint64_t(a) | uint64_t(b));
+}
+inline LayoutStringFlags &operator|=(LayoutStringFlags &a, LayoutStringFlags b) {
+  return a = (a | b);
+}
+
+SWIFT_RUNTIME_STDLIB_INTERNAL
+size_t _swift_refCountBytesForMetatype(const Metadata *type);
+
+struct LayoutStringWriter;
+
+SWIFT_RUNTIME_STDLIB_INTERNAL
+void _swift_addRefCountStringForMetatype(LayoutStringWriter &writer,
+                                         LayoutStringFlags &flags,
+                                         const Metadata *fieldType,
+                                         size_t &fullOffset,
+                                         size_t &previousFieldOffset);
+
 /// Allocate the metadata for a class and copy fields from the given pattern.
 /// The final size of the metadata is calculated at runtime from the metadata
 /// bounds in the class descriptor.
@@ -656,6 +782,13 @@ swift_updateClassMetadata2(ClassMetadata *self,
                            size_t numFields,
                            const TypeLayout * const *fieldTypes,
                            size_t *fieldOffsets);
+
+SWIFT_RUNTIME_EXPORT SWIFT_CC(swift)
+Class
+swift_updatePureObjCClassMetadata(Class self,
+                                  ClassLayoutFlags flags,
+                                  size_t numFields,
+                                  const TypeLayout * const *fieldTypes);
 #endif
 
 /// Given class metadata, a class descriptor and a method descriptor, look up
@@ -853,6 +986,11 @@ SWIFT_CC(swift)
 SWIFT_RUNTIME_STDLIB_INTERNAL MetadataResponse
 getSuperclassMetadata(MetadataRequest request, const ClassMetadata *self);
 
+SWIFT_CC(swift)
+SWIFT_RUNTIME_STDLIB_SPI
+bool _swift_class_isSubclass(const Metadata *subclass,
+                             const Metadata *superclass);
+
 #if !NDEBUG
 /// Verify that the given metadata pointer correctly roundtrips its
 /// mangled name through the demangler.
@@ -899,6 +1037,41 @@ void swift_enableDynamicReplacementScope(const DynamicReplacementScope *scope);
 
 SWIFT_RUNTIME_EXPORT
 void swift_disableDynamicReplacementScope(const DynamicReplacementScope *scope);
+
+/// A struct containing pointers to all of the type descriptors in the
+/// Concurrency runtime which have standard manglings.
+struct ConcurrencyStandardTypeDescriptors {
+#define STANDARD_TYPE(KIND, MANGLING, TYPENAME)
+#define STANDARD_TYPE_CONCURRENCY(KIND, MANGLING, TYPENAME)                    \
+  const ContextDescriptor * __ptrauth_swift_type_descriptor TYPENAME;
+#include "swift/Demangling/StandardTypesMangling.def"
+};
+
+/// Register the type descriptors with standard manglings from the Concurrency
+/// runtime. The passed-in struct must be immortal.
+SWIFT_RUNTIME_STDLIB_SPI
+void _swift_registerConcurrencyStandardTypeDescriptors(
+    const ConcurrencyStandardTypeDescriptors *descriptors);
+
+/// Initialize the value witness table for a struct using the provided like type
+/// as the basis for the layout.
+SWIFT_RUNTIME_EXPORT
+void swift_initRawStructMetadata(StructMetadata *self,
+                                 StructLayoutFlags flags,
+                                 const TypeLayout *likeType,
+                                 int32_t count);
+
+/// Check if the given generic arguments are valid inputs for the generic type
+/// context and if so call the metadata access function and return the metadata.
+///
+/// Note: This expects the caller to heap allocate all pack pointers within the
+/// generic arguments via 'swift_allocateMetadataPack'.
+SWIFT_RUNTIME_STDLIB_SPI
+SWIFT_CC(swift)
+const Metadata *_swift_instantiateCheckedGenericMetadata(
+    const TypeContextDescriptor *context,
+    const void * const *genericArgs,
+    size_t genericArgsSize);
 
 #pragma clang diagnostic pop
 

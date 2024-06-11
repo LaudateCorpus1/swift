@@ -18,11 +18,12 @@
 #ifndef SWIFT_SEMA_CONSTRAINTLOCATOR_H
 #define SWIFT_SEMA_CONSTRAINTLOCATOR_H
 
-#include "swift/Basic/Debug.h"
-#include "swift/Basic/LLVM.h"
 #include "swift/AST/ASTNode.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Debug.h"
+#include "swift/Basic/LLVM.h"
+#include "swift/Basic/NullablePtr.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/PointerIntPair.h"
@@ -46,15 +47,15 @@ class ProtocolConformance;
 /// specified error messages when the conversion fails.
 ///
 enum ContextualTypePurpose : uint8_t {
-  CTP_Unused,           ///< No contextual type is specified.
-  CTP_Initialization,   ///< Pattern binding initialization.
-  CTP_ReturnStmt,       ///< Value specified to a 'return' statement.
-  CTP_ReturnSingleExpr, ///< Value implicitly returned from a function.
-  CTP_YieldByValue,     ///< By-value yield operand.
-  CTP_YieldByReference, ///< By-reference yield operand.
-  CTP_ThrowStmt,        ///< Value specified to a 'throw' statement.
-  CTP_EnumCaseRawValue, ///< Raw value specified for "case X = 42" in enum.
-  CTP_DefaultParameter, ///< Default value in parameter 'foo(a : Int = 42)'.
+  CTP_Unused,            ///< No contextual type is specified.
+  CTP_Initialization,    ///< Pattern binding initialization.
+  CTP_ReturnStmt,        ///< Value specified to a 'return' statement.
+  CTP_YieldByValue,      ///< By-value yield operand.
+  CTP_YieldByReference,  ///< By-reference yield operand.
+  CTP_ThrowStmt,         ///< Value specified to a 'throw' statement.
+  CTP_DiscardStmt,       ///< Value specified to a 'discard' statement.
+  CTP_EnumCaseRawValue,  ///< Raw value specified for "case X = 42" in enum.
+  CTP_DefaultParameter,  ///< Default value in parameter 'foo(a : Int = 42)'.
 
   /// Default value in @autoclosure parameter
   /// 'foo(a : @autoclosure () -> Int = 42)'.
@@ -84,6 +85,9 @@ enum ContextualTypePurpose : uint8_t {
   CTP_WrappedProperty,  ///< Property type expected to match 'wrappedValue' type
   CTP_ComposedPropertyWrapper, ///< Composed wrapper type expected to match
                                ///< former 'wrappedValue' type
+
+  CTP_SingleValueStmtBranch, ///< The contextual type for a branch in a single
+                             ///< value statement expression.
 
   CTP_ExprPattern,      ///< `~=` operator application associated with expression
                         /// pattern.
@@ -158,10 +162,10 @@ public:
     /// Attempts to cast the path element to a specific \c LocatorPathElt
     /// subclass, returning \c None if unsuccessful.
     template <class T>
-    Optional<T> getAs() const {
+    std::optional<T> getAs() const {
       if (auto *result = dyn_cast<T>(this))
         return *result;
-      return None;
+      return std::nullopt;
     }
 
     /// Cast the path element to a specific \c LocatorPathElt subclass.
@@ -212,8 +216,8 @@ public:
   /// subcomponent.
   ArrayRef<PathElement> getPath() const {
     // FIXME: Alignment.
-    return llvm::makeArrayRef(reinterpret_cast<const PathElement *>(this + 1),
-                              numPathElements);
+    return llvm::ArrayRef(reinterpret_cast<const PathElement *>(this + 1),
+                          numPathElements);
   }
 
   unsigned getSummaryFlags() const { return summaryFlags; }
@@ -243,7 +247,7 @@ public:
 
   /// Determine whether given locator points to the keypath value
   bool isKeyPathValue() const;
-  
+
   /// Determine whether given locator points to the choice picked as
   /// as result of the key path dynamic member lookup operation.
   bool isResultOfKeyPathDynamicMemberLookup() const;
@@ -264,6 +268,9 @@ public:
   /// a key path component.
   bool isForKeyPathComponentResult() const;
 
+  /// Determine whether this locator points to a key path component.
+  bool isForKeyPathComponent() const;
+
   /// Determine whether this locator points to the generic parameter.
   bool isForGenericParameter() const;
 
@@ -280,6 +287,10 @@ public:
   /// Determine whether this locator points to the contextual type.
   bool isForContextualType() const;
 
+  /// Determine whether this locator points to the contextual type for a given
+  /// purpose.
+  bool isForContextualType(ContextualTypePurpose ctp) const;
+
   /// Determine whether this locator points to the assignment expression.
   bool isForAssignment() const;
 
@@ -291,6 +302,33 @@ public:
 
   /// Determine whether this locator is for a result builder body result type.
   bool isForResultBuilderBodyResult() const;
+
+  /// Determine whether this locator is for a macro expansion.
+  bool isForMacroExpansion() const;
+
+  /// Whether this locator identifies a conjunction for the branches of a
+  /// SingleValueStmtExpr.
+  bool isForSingleValueStmtConjunction() const;
+
+  /// Whether this locator identifies a conjunction for the branches of a
+  /// SingleValueStmtExpr, or a conjunction for one of the BraceStmts itself.
+  bool isForSingleValueStmtConjunctionOrBrace() const;
+
+  /// Whether this locator identifies a conversion for a SingleValueStmtExpr
+  /// branch.
+  bool isForSingleValueStmtBranch() const;
+
+  /// If the locator in question is for a pattern match, returns the pattern,
+  /// otherwise \c nullptr.
+  NullablePtr<Pattern> getPatternMatch() const;
+
+  /// Whether the locator in question is for a pattern match.
+  bool isForPatternMatch() const;
+
+  /// Returns true if \p locator is ending with either of the following
+  ///  - Member
+  ///  - Member -> KeyPathDynamicMember
+  bool isMemberRef() const;
 
   /// Determine whether this locator points directly to a given expression.
   template <typename E> bool directlyAt() const {
@@ -311,10 +349,10 @@ public:
   /// \c LocatorPathElt subclass, returning \c None if either unsuccessful or
   /// the locator has no path elements.
   template <class T>
-  Optional<T> getFirstElementAs() const {
+  std::optional<T> getFirstElementAs() const {
     auto path = getPath();
     if (path.empty())
-      return None;
+      return std::nullopt;
 
     return path[0].getAs<T>();
   }
@@ -340,10 +378,10 @@ public:
   /// \c LocatorPathElt subclass, returning \c None if either unsuccessful or
   /// the locator has no path elements.
   template <class T>
-  Optional<T> getLastElementAs() const {
+  std::optional<T> getLastElementAs() const {
     auto path = getPath();
     if (path.empty())
-      return None;
+      return std::nullopt;
 
     return path.back().getAs<T>();
   }
@@ -367,7 +405,7 @@ public:
   /// \param iter A reference to an iterator which will be used to iterate
   /// over the locator's path.
   template <class T>
-  Optional<T> findFirst(PathIterator &iter) const {
+  std::optional<T> findFirst(PathIterator &iter) const {
     auto path = getPath();
     auto end = path.end();
     assert(iter >= path.begin() && iter <= end);
@@ -375,14 +413,14 @@ public:
     for (; iter != end; ++iter)
       if (auto elt = iter->getAs<T>())
         return elt;
-    return None;
+    return std::nullopt;
   }
 
   /// Attempts to find the first element in the locator's path that is a
   /// specific \c LocatorPathElt subclass, returning \c None if no such element
   /// exists.
   template <class T>
-  Optional<T> findFirst() const {
+  std::optional<T> findFirst() const {
     auto iter = getPath().begin();
     return findFirst<T>(iter);
   }
@@ -394,7 +432,7 @@ public:
   /// \param iter A reference to a reverse iterator which will be used to
   /// iterate over the locator's path.
   template <class T>
-  Optional<T> findLast(PathReverseIterator &iter) const {
+  std::optional<T> findLast(PathReverseIterator &iter) const {
     auto path = getPath();
     auto end = path.rend();
     assert(iter >= path.rbegin() && iter <= end);
@@ -402,14 +440,14 @@ public:
     for (; iter != end; ++iter)
       if (auto elt = iter->getAs<T>())
         return elt;
-    return None;
+    return std::nullopt;
   }
 
   /// Attempts to find the last element in the locator's path that is a
   /// specific \c LocatorPathElt subclass, returning \c None if no such element
   /// exists.
   template <class T>
-  Optional<T> findLast() const {
+  std::optional<T> findLast() const {
     auto iter = getPath().rbegin();
     return findLast<T>(iter);
   }
@@ -622,6 +660,20 @@ public:
   }
 };
 
+class LocatorPathElt::GenericType : public StoredPointerElement<TypeBase> {
+public:
+  GenericType(Type type)
+      : StoredPointerElement(PathElementKind::GenericType, type.getPointer()) {
+    assert(type->getDesugaredType()->is<BoundGenericType>());
+  }
+
+  Type getType() const { return getStoredPointer(); }
+
+  static bool classof(const LocatorPathElt *elt) {
+    return elt->getKind() == PathElementKind::GenericType;
+  }
+};
+
 /// Abstract superclass for any kind of tuple element.
 class LocatorPathElt::AnyTupleElement : public StoredIntegerElement<1> {
 protected:
@@ -684,21 +736,6 @@ public:
 
   static bool classof(const LocatorPathElt *elt) {
     return elt->getKind() == ConstraintLocator::PackElement;
-  }
-};
-
-class LocatorPathElt::OpenedPackElement final
-    : public StoredPointerElement<GenericEnvironment> {
-public:
-  OpenedPackElement(GenericEnvironment *env)
-      : StoredPointerElement(PathElementKind::OpenedPackElement, env) {}
-
-  GenericEnvironment *getGenericEnvironment() const {
-    return getStoredPointer();
-  }
-
-  static bool classof(const LocatorPathElt *elt) {
-    return elt->getKind() == PathElementKind::OpenedPackElement;
   }
 };
 
@@ -771,19 +808,6 @@ public:
   }
 };
 
-class LocatorPathElt::ClosureBody final : public StoredIntegerElement<1> {
-  public:
-  ClosureBody(bool hasExplicitReturn = false)
-    : StoredIntegerElement(ConstraintLocator::ClosureBody, hasExplicitReturn) {}
-
-  /// Indicates whether body of the closure has any `return` statements.
-  bool hasExplicitReturn() const { return bool(getValue()); }
-
-  static bool classof(const LocatorPathElt *elt) {
-    return elt->getKind() == ConstraintLocator::ClosureBody;
-  }
-};
-
 class LocatorPathElt::Witness final : public StoredPointerElement<ValueDecl> {
 public:
   Witness(ValueDecl *witness)
@@ -793,18 +817,6 @@ public:
 
   static bool classof(const LocatorPathElt *elt) {
     return elt->getKind() == PathElementKind::Witness;
-  }
-};
-
-class LocatorPathElt::ProtocolRequirement final : public StoredPointerElement<ValueDecl> {
-public:
-  ProtocolRequirement(ValueDecl *decl)
-      : StoredPointerElement(PathElementKind::ProtocolRequirement, decl) {}
-
-  ValueDecl *getDecl() const { return getStoredPointer(); }
-
-  static bool classof(const LocatorPathElt *elt) {
-    return elt->getKind() == PathElementKind::ProtocolRequirement;
   }
 };
 
@@ -895,6 +907,22 @@ public:
 
   static bool classof(const LocatorPathElt *elt) {
     return elt->getKind() == ConstraintLocator::TernaryBranch;
+  }
+};
+
+/// A particular result of a ThenStmt at a given index in a SingleValueStmtExpr.
+/// The stored index corresponds to the \c getResultExprs array.
+class LocatorPathElt::SingleValueStmtResult final
+    : public StoredIntegerElement<1> {
+public:
+  SingleValueStmtResult(unsigned exprIdx)
+      : StoredIntegerElement(ConstraintLocator::SingleValueStmtResult,
+                             exprIdx) {}
+
+  unsigned getIndex() const { return getValue(); }
+
+  static bool classof(const LocatorPathElt *elt) {
+    return elt->getKind() == ConstraintLocator::SingleValueStmtResult;
   }
 };
 
@@ -1009,22 +1037,6 @@ public:
   }
 };
 
-class LocatorPathElt::KeyPathType final
-    : public StoredPointerElement<TypeBase> {
-public:
-  KeyPathType(Type valueType)
-      : StoredPointerElement(PathElementKind::KeyPathType,
-                             valueType.getPointer()) {
-    assert(valueType);
-  }
-
-  Type getValueType() const { return getStoredPointer(); }
-
-  static bool classof(const LocatorPathElt *elt) {
-    return elt->getKind() == PathElementKind::KeyPathType;
-  }
-};
-
 class LocatorPathElt::ConstructorMemberType final
     : public StoredIntegerElement<1> {
 public:
@@ -1136,6 +1148,22 @@ public:
   }
 };
 
+class LocatorPathElt::PackExpansionType final
+    : public StoredPointerElement<swift::PackExpansionType> {
+public:
+  PackExpansionType(swift::PackExpansionType *openedPackExpansionTy)
+      : StoredPointerElement(PathElementKind::PackExpansionType,
+                             openedPackExpansionTy) {
+    assert(openedPackExpansionTy);
+  }
+
+  swift::PackExpansionType *getOpenedType() const { return getStoredPointer(); }
+
+  static bool classof(const LocatorPathElt *elt) {
+    return elt->getKind() == PathElementKind::PackExpansionType;
+  }
+};
+
 namespace details {
   template <typename CustomPathElement>
   class PathElement {
@@ -1178,7 +1206,7 @@ class ConstraintLocatorBuilder {
     previous;
 
   /// The current path element, if there is one.
-  Optional<LocatorPathElt> element;
+  std::optional<LocatorPathElt> element;
 
   /// The current set of flags.
   unsigned summaryFlags;
@@ -1206,7 +1234,16 @@ public:
     return ConstraintLocatorBuilder(this, newElt, newFlags);
   }
 
-  /// Determine whether this builder has an empty path.
+  /// Determine whether this locator builder points directly to a
+  /// given expression.
+  template <typename E>
+  bool directlyAt() const {
+    if (auto *expr = getAnchor().dyn_cast<Expr *>())
+      return isa<E>(expr) && !last();
+    return false;
+  }
+
+  /// Determine whether this builder has an empty path (no new elements).
   bool hasEmptyPath() const {
     return !element;
   }
@@ -1242,6 +1279,37 @@ public:
       return requirement && kind == requirement->getRequirementKind();
     }
     return false;
+  }
+
+  std::optional<std::pair</*witness=*/ValueDecl *, GenericTypeParamType *>>
+  isForWitnessGenericParameterRequirement() const {
+    SmallVector<LocatorPathElt, 2> path;
+    getLocatorParts(path);
+
+    // -> witness -> generic env -> requirement
+    if (path.size() < 3)
+      return std::nullopt;
+
+    GenericTypeParamType *GP = nullptr;
+    if (auto reqLoc =
+            path.back().getAs<LocatorPathElt::TypeParameterRequirement>()) {
+      path.pop_back();
+      if (auto openedGeneric =
+              path.back().getAs<LocatorPathElt::OpenedGeneric>()) {
+        auto signature = openedGeneric->getSignature();
+        auto requirement = signature.getRequirements()[reqLoc->getIndex()];
+        GP = requirement.getFirstType()->getAs<GenericTypeParamType>();
+      }
+    }
+
+    if (!GP)
+      return std::nullopt;
+
+    auto witness = path.front().getAs<LocatorPathElt::Witness>();
+    if (!witness)
+      return std::nullopt;
+
+    return std::make_pair(witness->getDecl(), GP);
   }
 
   /// Checks whether this locator is describing an argument application for a
@@ -1304,7 +1372,7 @@ public:
   Expr *trySimplifyToExpr() const;
 
   /// Retrieve the last element in the path, if there is one.
-  Optional<LocatorPathElt> last() const {
+  std::optional<LocatorPathElt> last() const {
     // If we stored a path element here, grab it.
     if (element) return *element;
 
@@ -1315,11 +1383,12 @@ public:
     // Next, check the constraint locator itself.
     if (auto locator = previous.dyn_cast<ConstraintLocator *>()) {
       auto path = locator->getPath();
-      if (path.empty()) return None;
+      if (path.empty())
+        return std::nullopt;
       return path.back();
     }
 
-    return None;
+    return std::nullopt;
   }
 
   /// Check whether this locator has the given locator path element

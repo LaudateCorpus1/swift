@@ -20,19 +20,20 @@
 #ifndef SWIFT_TYPE_H
 #define SWIFT_TYPE_H
 
+#include "swift/AST/LayoutConstraint.h"
+#include "swift/AST/PrintOptions.h"
+#include "swift/AST/TypeAlignments.h"
+#include "swift/Basic/ArrayRefView.h"
+#include "swift/Basic/Compiler.h"
+#include "swift/Basic/Debug.h"
+#include "swift/Basic/LLVM.h"
+#include "swift/Basic/OptionSet.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/STLExtras.h"
-#include "swift/Basic/Debug.h"
-#include "swift/Basic/LLVM.h"
-#include "swift/Basic/ArrayRefView.h"
-#include "swift/AST/LayoutConstraint.h"
-#include "swift/AST/PrintOptions.h"
-#include "swift/AST/TypeAlignments.h"
-#include "swift/Basic/OptionSet.h"
-#include "swift/Basic/Compiler.h"
 #include <functional>
+#include <optional>
 #include <string>
 
 namespace swift {
@@ -43,6 +44,7 @@ class ClassDecl;
 class CanType;
 class EnumDecl;
 class GenericSignatureImpl;
+class InFlightSubstitution;
 class ModuleDecl;
 class NominalTypeDecl;
 class GenericTypeDecl;
@@ -82,15 +84,6 @@ struct MapTypeOutOfContext {
 struct QueryTypeSubstitutionMap {
   const TypeSubstitutionMap &substitutions;
 
-  Type operator()(SubstitutableType *type) const;
-};
-
-/// A function object suitable for use as a \c TypeSubstitutionFn that
-/// queries an underlying \c TypeSubstitutionMap, or returns the original type
-/// if no match was found.
-struct QueryTypeSubstitutionMapOrIdentity {
-  const TypeSubstitutionMap &substitutions;
-  
   Type operator()(SubstitutableType *type) const;
 };
 
@@ -150,7 +143,11 @@ enum class SubstFlags {
   /// Map member types to their desugared witness type.
   DesugarMemberTypes = 0x02,
   /// Substitute types involving opaque type archetypes.
-  SubstituteOpaqueArchetypes = 0x04
+  SubstituteOpaqueArchetypes = 0x04,
+  /// Don't increase pack expansion level for free pack references.
+  /// Do not introduce new usages of this flag.
+  /// FIXME: Remove this.
+  PreservePackExpansionLevel = 0x08,
 };
 
 /// Options for performing substitutions into a type.
@@ -166,7 +163,7 @@ struct SubstOptions : public OptionSet<SubstFlags> {
   /// conformance with the state \c CheckingTypeWitnesses.
   GetTentativeTypeWitness getTentativeTypeWitness;
 
-  SubstOptions(llvm::NoneType) : OptionSet(None) { }
+  SubstOptions(std::nullopt_t) : OptionSet(std::nullopt) {}
 
   SubstOptions(SubstFlags flags) : OptionSet(flags) { }
 
@@ -208,7 +205,7 @@ enum class ForeignRepresentableKind : uint8_t {
 /// therefore, the result type is in covariant position relative to the function
 /// type.
 struct TypePosition final {
-  enum : uint8_t { Covariant, Contravariant, Invariant };
+  enum : uint8_t { Covariant, Contravariant, Invariant, Shape };
 
 private:
   decltype(Covariant) kind;
@@ -218,6 +215,7 @@ public:
 
   TypePosition flipped() const {
     switch (kind) {
+    case Shape:
     case Invariant:
       return *this;
     case Covariant:
@@ -289,7 +287,8 @@ public:
   /// than \c getAs when the transform is intended to preserve sugar.
   ///
   /// \returns the result of transforming the type.
-  Type transformRec(llvm::function_ref<Optional<Type>(TypeBase *)> fn) const;
+  Type
+  transformRec(llvm::function_ref<std::optional<Type>(TypeBase *)> fn) const;
 
   /// Transform the given type by recursively applying the user-provided
   /// function to each node.
@@ -306,7 +305,15 @@ public:
   /// \returns the result of transforming the type.
   Type transformWithPosition(
       TypePosition pos,
-      llvm::function_ref<Optional<Type>(TypeBase *, TypePosition)> fn) const;
+      llvm::function_ref<std::optional<Type>(TypeBase *, TypePosition)> fn)
+      const;
+
+  /// Transform free pack element references, that is, those not captured by a
+  /// pack expansion.
+  ///
+  /// This is the 'map' counterpart to TypeBase::getTypeParameterPacks().
+  Type transformTypeParameterPacks(
+      llvm::function_ref<std::optional<Type>(SubstitutableType *)> fn) const;
 
   /// Look through the given type and its children and apply fn to them.
   void visit(llvm::function_ref<void (Type)> fn) const {
@@ -326,7 +333,7 @@ public:
   ///
   /// \returns the substituted type, or a null type if an error occurred.
   Type subst(SubstitutionMap substitutions,
-             SubstOptions options=None) const;
+             SubstOptions options = std::nullopt) const;
 
   /// Replace references to substitutable types with new, concrete types and
   /// return the substituted result.
@@ -339,9 +346,14 @@ public:
   /// \param options Options that affect the substitutions.
   ///
   /// \returns the substituted type, or a null type if an error occurred.
-  Type subst(TypeSubstitutionFn substitutions,
-             LookupConformanceFn conformances,
-             SubstOptions options=None) const;
+  Type subst(TypeSubstitutionFn substitutions, LookupConformanceFn conformances,
+             SubstOptions options = std::nullopt) const;
+
+  /// Apply an in-flight substitution to this type.
+  ///
+  /// This should generally not be used outside of the substitution
+  /// subsystem.
+  Type subst(InFlightSubstitution &subs) const;
 
   bool isPrivateStdlibType(bool treatNonBuiltinProtocolsAsPublic = true) const;
 
@@ -388,7 +400,7 @@ public:
   /// that can express the join, or Any if the only join would be a
   /// more-general existential type, or None if we cannot yet compute a
   /// correct join but one better than Any may exist.
-  static Optional<Type> join(Type first, Type second);
+  static std::optional<Type> join(Type first, Type second);
 
   friend llvm::hash_code hash_value(Type T) {
     return llvm::hash_value(T.getPointer());
@@ -498,6 +510,9 @@ public:
   bool isAnyExistentialType() const {
     return isAnyExistentialTypeImpl(*this);
   }
+
+  /// Is this type the error existential, 'any Error'?
+  bool isErrorExistentialType() const;
 
   /// Break an existential down into a set of constraints.
   ExistentialLayout getExistentialLayout();
@@ -650,17 +665,6 @@ inline CanTypeWrapper<X> dyn_cast_or_null(CanTypeWrapper<P> type) {
   return CanTypeWrapper<X>(dyn_cast_or_null<X>(type.getPointer()));
 }
 
-template <typename T>
-inline T *staticCastHelper(const Type &Ty) {
-  // The constructor of the ArrayRef<Type> must guarantee this invariant.
-  // XXX -- We use reinterpret_cast instead of static_cast so that files
-  // can avoid including Types.h if they want to.
-  return reinterpret_cast<T*>(Ty.getPointer());
-}
-/// TypeArrayView allows arrays of 'Type' to have a static type.
-template <typename T>
-using TypeArrayView = ArrayRefView<Type, T*, staticCastHelper,
-                                   /*AllowOrigAccess*/true>;
 } // end namespace swift
 
 namespace llvm {

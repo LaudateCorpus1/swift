@@ -190,7 +190,7 @@ SILDeclRef getBridgeFromObjectiveC(CanType NativeType,
   auto Conformance = ConformanceRef.getConcrete();
   // _unconditionallyBridgeFromObjectiveC
   DeclName Name(Ctx, Ctx.getIdentifier("_unconditionallyBridgeFromObjectiveC"),
-                llvm::makeArrayRef(Identifier()));
+                llvm::ArrayRef(Identifier()));
   auto *Requirement = dyn_cast_or_null<FuncDecl>(
       Proto->getSingleRequirement(Name));
   if (!Requirement)
@@ -319,10 +319,8 @@ CanSILFunctionType BridgedProperty::getOutlinedFunctionType(SILModule &M) {
   auto ExtInfo = SILFunctionType::ExtInfo::getThin();
   auto FunctionType = SILFunctionType::get(
       nullptr, ExtInfo, SILCoroutineKind::None,
-      ParameterConvention::Direct_Unowned, Parameters, /*yields*/ {},
-      Results, None,
-      SubstitutionMap(), SubstitutionMap(),
-      M.getASTContext());
+      ParameterConvention::Direct_Unowned, Parameters, /*yields*/ {}, Results,
+      std::nullopt, SubstitutionMap(), SubstitutionMap(), M.getASTContext());
   return FunctionType;
 }
 
@@ -343,7 +341,8 @@ BridgedProperty::outline(SILModule &M) {
 
   auto *Fun = FuncBuilder.getOrCreateFunction(
       ObjCMethod->getLoc(), name, SILLinkage::Shared, FunctionType, IsNotBare,
-      IsNotTransparent, IsSerialized, IsNotDynamic, IsNotDistributed);
+      IsNotTransparent, IsSerialized, IsNotDynamic, IsNotDistributed,
+      IsNotRuntimeAccessible);
   bool NeedsDefinition = Fun->empty();
 
   if (Release) {
@@ -1073,7 +1072,8 @@ ObjCMethodCall::outline(SILModule &M) {
 
   auto *Fun = FuncBuilder.getOrCreateFunction(
       ObjCMethod->getLoc(), name, SILLinkage::Shared, FunctionType, IsNotBare,
-      IsNotTransparent, IsSerialized, IsNotDynamic, IsNotDistributed);
+      IsNotTransparent, IsSerialized, IsNotDynamic, IsNotDistributed,
+      IsNotRuntimeAccessible);
   bool NeedsDefinition = Fun->empty();
 
   // Call the outlined function.
@@ -1238,7 +1238,7 @@ bool ObjCMethodCall::matchInstSequence(SILBasicBlock::iterator I) {
   // from the outlined function with the bridged result (only the suffix is
   // different: MethodNameTem...n_ vs MethodNameTem...b_).
   if (OutlinedName.size() == CurrentName.size() &&
-      CurrentName.startswith(
+      CurrentName.starts_with(
           StringRef(OutlinedName.c_str(), OutlinedName.size() - 2)))
     return false;
 
@@ -1289,10 +1289,8 @@ CanSILFunctionType ObjCMethodCall::getOutlinedFunctionType(SILModule &M) {
   }
   auto FunctionType = SILFunctionType::get(
       nullptr, ExtInfo, SILCoroutineKind::None,
-      ParameterConvention::Direct_Unowned, Parameters, {},
-      Results, None,
-      SubstitutionMap(), SubstitutionMap(),
-      M.getASTContext());
+      ParameterConvention::Direct_Unowned, Parameters, {}, Results,
+      std::nullopt, SubstitutionMap(), SubstitutionMap(), M.getASTContext());
   return FunctionType;
 }
 

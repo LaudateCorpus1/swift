@@ -20,7 +20,7 @@ var d4 : () -> Int = { d2 }  // expected-error{{function 'd2' was used as a prop
 
 if #available(macOS 12.0, iOS 15.0, watchOS 8.0, tvOS 15.0, *) {
   var e0 : [Int]
-  e0[] // expected-error {{missing argument for parameter #1 in call}} {{6-6=<#Int#>}}
+  e0[] // expected-error {{missing argument for parameter #1 in subscript}} {{6-6=<#Int#>}}
 }
 
 var f0 : [Float]
@@ -204,4 +204,21 @@ func rdar94888357() {
   }
 
   let _ = S<String, String>("") // expected-error {{generic type 'S' specialized with too many type parameters (got 2, but expected 1)}}
+}
+
+// https://github.com/apple/swift/issues/68417
+enum E {
+  subscript(x: inout Int) -> Bool { true } // expected-error {{'inout' may only be used on function or initializer parameters}}
+  case c(x: inout Int) // expected-error {{'inout' may only be used on function or initializer parameters}}
+  func d(x: inout Int ...) {} // expected-error {{'inout' must not be used on variadic parameters}}
+  func e(x: inout Int) {} // ok
+  init(x: inout Int) {} // ok
+}
+
+do {
+  struct Test {
+    init(_: inout Int...) {} // expected-error {{'inout' must not be used on variadic parameters}}
+    func test(_: inout String...) {} // expected-error {{'inout' must not be used on variadic parameters}}
+    subscript(_: inout Double...) -> Bool { true } // expected-error {{'inout' may only be used on function or initializer parameters}}
+  }
 }

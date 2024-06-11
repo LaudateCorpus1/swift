@@ -182,6 +182,7 @@ public struct _BridgeableMetatype: _ObjectiveCBridgeable {
   }
 }
 
+extension _BridgeableMetatype: Sendable {}
 
 //===--- Bridging facilities written in Objective-C -----------------------===//
 // Functions that must discover and possibly use an arbitrary type's
@@ -589,7 +590,8 @@ extension UnsafeRawPointer {
   }
 }
 
-extension AutoreleasingUnsafeMutablePointer { }
+@available(*, unavailable)
+extension AutoreleasingUnsafeMutablePointer: Sendable { }
 
 internal struct _CocoaFastEnumerationStackBuf {
   // Clang uses 16 pointers.  So do we.

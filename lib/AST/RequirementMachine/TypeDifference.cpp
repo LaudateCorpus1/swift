@@ -159,13 +159,16 @@ namespace {
       bool rhsAbstract = rhsType->isTypeParameter();
 
       if (lhsAbstract && rhsAbstract) {
+        // FIXME: same-element requirements
+        assert(lhsType->isParameterPack() == rhsType->isParameterPack());
+
         unsigned lhsIndex = RewriteContext::getGenericParamIndex(lhsType);
         unsigned rhsIndex = RewriteContext::getGenericParamIndex(rhsType);
 
         auto lhsTerm = LHSSubstitutions[lhsIndex];
         auto rhsTerm = RHSSubstitutions[rhsIndex];
 
-        Optional<int> compare = lhsTerm.compare(rhsTerm, Context);
+        std::optional<int> compare = lhsTerm.compare(rhsTerm, Context);
         if (*compare < 0) {
           SameTypesOnLHS.emplace_back(rhsIndex, lhsTerm);
         } else if (compare > 0) {
@@ -308,7 +311,7 @@ swift::rewriting::buildTypeDifference(
   auto type = symbol.getConcreteType();
   auto substitutions = symbol.getSubstitutions();
 
-  Type resultType = type.transformRec([&](Type t) -> Optional<Type> {
+  Type resultType = type.transformRec([&](Type t) -> std::optional<Type> {
     if (t->is<GenericTypeParamType>()) {
       unsigned index = RewriteContext::getGenericParamIndex(t);
 
@@ -322,36 +325,38 @@ swift::rewriting::buildTypeDifference(
           auto concreteSymbol = pair.second;
           auto concreteType = concreteSymbol.getConcreteType();
 
-          return concreteType.transformRec([&](Type t) -> Optional<Type> {
+          return concreteType.transformRec([&](Type t) -> std::optional<Type> {
             if (t->is<GenericTypeParamType>()) {
               unsigned index = RewriteContext::getGenericParamIndex(t);
               Term substitution = concreteSymbol.getSubstitutions()[index];
               return nextSubstitution(substitution);
             }
 
-            assert(!t->is<DependentMemberType>());
-            return None;
+            // DependentMemberType with ErrorType base is OK.
+            assert(!t->isTypeParameter());
+            return std::nullopt;
           });
         }
       }
 
-      assert(!t->is<DependentMemberType>());
       return nextSubstitution(substitutions[index]);
     }
 
-    return None;
+    // DependentMemberType with ErrorType base is OK.
+    assert(!t->isTypeParameter());
+    return std::nullopt;
   });
 
   auto resultSymbol = [&]() {
     switch (symbol.getKind()) {
     case Symbol::Kind::Superclass:
-      return Symbol::forSuperclass(CanType(resultType),
+      return Symbol::forSuperclass(resultType->getCanonicalType(),
                                    resultSubstitutions, ctx);
     case Symbol::Kind::ConcreteType:
-      return Symbol::forConcreteType(CanType(resultType),
+      return Symbol::forConcreteType(resultType->getCanonicalType(),
                                      resultSubstitutions, ctx);
     case Symbol::Kind::ConcreteConformance:
-      return Symbol::forConcreteConformance(CanType(resultType),
+      return Symbol::forConcreteConformance(resultType->getCanonicalType(),
                                             resultSubstitutions,
                                             symbol.getProtocol(),
                                             ctx);
@@ -415,14 +420,14 @@ const TypeDifference &RewriteSystem::getTypeDifference(unsigned index) const {
 ///
 /// See the comment at the top of TypeDifference in TypeDifference.h for a
 /// description of the actual transformations.
-bool
-RewriteSystem::computeTypeDifference(Term baseTerm, Symbol lhs, Symbol rhs,
-                                     Optional<unsigned> &lhsDifferenceID,
-                                     Optional<unsigned> &rhsDifferenceID) {
+bool RewriteSystem::computeTypeDifference(
+    Term baseTerm, Symbol lhs, Symbol rhs,
+    std::optional<unsigned> &lhsDifferenceID,
+    std::optional<unsigned> &rhsDifferenceID) {
   assert(lhs.getKind() == rhs.getKind());
 
-  lhsDifferenceID = None;
-  rhsDifferenceID = None;
+  lhsDifferenceID = std::nullopt;
+  rhsDifferenceID = std::nullopt;
 
   // Fast path if there's nothing to do.
   if (lhs == rhs)

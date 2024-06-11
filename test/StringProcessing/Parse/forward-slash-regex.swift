@@ -1,5 +1,5 @@
 // RUN: %target-typecheck-verify-swift -enable-bare-slash-regex -disable-availability-checking -typo-correction-limit 0
-// REQUIRES: swift_in_compiler
+// REQUIRES: swift_swift_parser
 // REQUIRES: concurrency
 
 prefix operator /
@@ -121,6 +121,7 @@ do {
 } // expected-error {{expected expression after operator}}
 
 _ = /x/??/x/ // expected-error {{'/' is not a postfix unary operator}}
+// expected-error@-1 2 {{cannot use optional chaining on non-optional value of type 'Regex<Substring>'}}
 
 _ = /x/ ... /y/ // expected-error {{referencing operator function '...' on 'Comparable' requires that 'Regex<Substring>' conform to 'Comparable'}}
 
@@ -130,7 +131,6 @@ _ = /x/.../y/
 
 _ = /x/...
 // expected-error@-1 {{unary operator '...' cannot be applied to an operand of type 'Regex<Substring>'}}
-// expected-note@-2 {{overloads for '...' exist with these partially matching parameter lists}}
 
 do {
   _ = /x /...
@@ -168,7 +168,7 @@ func testSubscript(_ x: S) {
   x[/x/]
   x[/x /]
   // expected-error@-1:9 {{expected expression after operator}}
-  // expected-error@-2 {{missing argument for parameter #1 in call}}
+  // expected-error@-2 {{missing argument for parameter #1 in subscript}}
 
   _ = x[/] / 2
 }
@@ -263,8 +263,7 @@ default:
 
 do {} catch /x/ {}
 // expected-error@-1 {{expression pattern of type 'Regex<Substring>' cannot match values of type 'any Error'}}
-// expected-error@-2 {{binary operator '~=' cannot be applied to two 'any Error' operands}}
-// expected-warning@-3 {{'catch' block is unreachable because no errors are thrown in 'do' block}}
+// expected-warning@-2 {{'catch' block is unreachable because no errors are thrown in 'do' block}}
 
 switch /x/ {
 default:

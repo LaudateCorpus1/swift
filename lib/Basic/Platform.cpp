@@ -13,7 +13,7 @@
 #include "swift/Basic/Platform.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSwitch.h"
-#include "llvm/ADT/Triple.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/Support/VersionTuple.h"
 
 using namespace swift;
@@ -35,6 +35,10 @@ bool swift::tripleIsWatchSimulator(const llvm::Triple &triple) {
 bool swift::tripleIsMacCatalystEnvironment(const llvm::Triple &triple) {
   return triple.isiOS() && !triple.isTvOS() &&
       triple.getEnvironment() == llvm::Triple::MacABI;
+}
+
+bool swift::tripleIsVisionSimulator(const llvm::Triple &triple) {
+  return triple.isXROS() && triple.isSimulatorEnvironment();
 }
 
 bool swift::tripleInfersSimulatorEnvironment(const llvm::Triple &triple) {
@@ -79,7 +83,7 @@ bool swift::triplesAreValidForZippering(const llvm::Triple &target,
   return false;
 }
 
-const Optional<llvm::VersionTuple>
+const std::optional<llvm::VersionTuple>
 swift::minimumAvailableOSVersionForTriple(const llvm::Triple &triple) {
   if (triple.isMacOSX())
     return llvm::VersionTuple(10, 10, 0);
@@ -99,7 +103,10 @@ swift::minimumAvailableOSVersionForTriple(const llvm::Triple &triple) {
   if (triple.isWatchOS())
     return llvm::VersionTuple(2, 0);
 
-  return None;
+  if (triple.isXROS())
+    return llvm::VersionTuple(1, 0);
+
+  return std::nullopt;
 }
 
 bool swift::tripleRequiresRPathForSwiftLibrariesInOS(
@@ -121,6 +128,10 @@ bool swift::tripleRequiresRPathForSwiftLibrariesInOS(
     // watchOS versions before 5.2 don't have Swift in the OS.
     // watchOS versions before 8.0 don't have _Concurrency in the OS.
     return triple.isOSVersionLT(8, 0);
+  }
+
+  if (triple.isXROS()) {
+    return triple.isOSVersionLT(1, 0);
   }
 
   // Other platforms don't have Swift installed as part of the OS by default.
@@ -150,6 +161,12 @@ DarwinPlatformKind swift::getDarwinPlatformKind(const llvm::Triple &triple) {
   if (triple.isMacOSX())
     return DarwinPlatformKind::MacOS;
 
+  if (triple.isXROS()) {
+    if (tripleIsVisionSimulator(triple))
+      return DarwinPlatformKind::VisionOSSimulator;
+    return DarwinPlatformKind::VisionOS;
+  }
+
   llvm_unreachable("Unsupported Darwin platform");
 }
 
@@ -169,14 +186,16 @@ static StringRef getPlatformNameForDarwin(const DarwinPlatformKind platform) {
     return "watchos";
   case DarwinPlatformKind::WatchOSSimulator:
     return "watchsimulator";
+  case DarwinPlatformKind::VisionOS:
+    return "xros";
+  case DarwinPlatformKind::VisionOSSimulator:
+    return "xrsimulator";
   }
   llvm_unreachable("Unsupported Darwin platform");
 }
 
 StringRef swift::getPlatformNameForTriple(const llvm::Triple &triple) {
   switch (triple.getOS()) {
-  case llvm::Triple::UnknownOS:
-    llvm_unreachable("unknown OS");
   case llvm::Triple::ZOS:
   case llvm::Triple::Ananas:
   case llvm::Triple::CloudABI:
@@ -209,9 +228,20 @@ StringRef swift::getPlatformNameForTriple(const llvm::Triple &triple) {
   case llvm::Triple::IOS:
   case llvm::Triple::TvOS:
   case llvm::Triple::WatchOS:
+  case llvm::Triple::XROS:
     return getPlatformNameForDarwin(getDarwinPlatformKind(triple));
   case llvm::Triple::Linux:
-    return triple.isAndroid() ? "android" : "linux";
+    if (triple.isAndroid())
+      return "android";
+    else if (triple.isMusl()) {
+      // The triple for linux-static is <arch>-swift-linux-musl, to distinguish
+      // it from a "normal" musl set-up (ala Alpine).
+      if (triple.getVendor() == llvm::Triple::Swift)
+        return "linux-static";
+      else
+        return "musl";
+    } else
+      return "linux";
   case llvm::Triple::FreeBSD:
     return "freebsd";
   case llvm::Triple::OpenBSD:
@@ -226,7 +256,7 @@ StringRef swift::getPlatformNameForTriple(const llvm::Triple &triple) {
     case llvm::Triple::Itanium:
       return "windows";
     default:
-      llvm_unreachable("unsupported Windows environment");
+      return "none";
     }
   case llvm::Triple::PS4:
     return "ps4";
@@ -234,6 +264,11 @@ StringRef swift::getPlatformNameForTriple(const llvm::Triple &triple) {
     return "haiku";
   case llvm::Triple::WASI:
     return "wasi";
+  case llvm::Triple::UnknownOS:
+    return "none";
+  case llvm::Triple::UEFI:
+  case llvm::Triple::LiteOS:
+    llvm_unreachable("unsupported OS");
   }
   llvm_unreachable("unsupported OS");
 }
@@ -278,7 +313,7 @@ StringRef swift::getMajorArchitectureName(const llvm::Triple &Triple) {
 //   map to. That is, `.Cases("bar", "baz", "foo")` will return "foo" if it sees
 //   "bar" or "baz".
 //
-// * llvm::Optional is similar to a Swift Optional: it either contains a value
+// * std::optional is similar to a Swift Optional: it either contains a value
 //   or represents the absence of one. `None` is equivalent to `nil`; leading
 //   `*` is equivalent to trailing `!`; conversion to `bool` is a not-`None`
 //   check.
@@ -335,15 +370,16 @@ getOSForAppleTargetSpecificModuleTriple(const llvm::Triple &triple) {
               .Default(tripleOSNameNoVersion);
 }
 
-static Optional<StringRef>
+static std::optional<StringRef>
 getEnvironmentForAppleTargetSpecificModuleTriple(const llvm::Triple &triple) {
   auto tripleEnvironment = triple.getEnvironmentName();
-  return llvm::StringSwitch<Optional<StringRef>>(tripleEnvironment)
-              .Cases("unknown", "", None)
-  // These values are also supported, but are handled by the default case below:
-  //          .Case ("simulator", StringRef("simulator"))
-  //          .Case ("macabi", StringRef("macabi"))
-              .Default(tripleEnvironment);
+  return llvm::StringSwitch<std::optional<StringRef>>(tripleEnvironment)
+      .Cases("unknown", "", std::nullopt)
+      // These values are also supported, but are handled by the default case
+      // below:
+      //          .Case ("simulator", StringRef("simulator"))
+      //          .Case ("macabi", StringRef("macabi"))
+      .Default(tripleEnvironment);
 }
 
 llvm::Triple swift::getTargetSpecificModuleTriple(const llvm::Triple &triple) {
@@ -356,7 +392,7 @@ llvm::Triple swift::getTargetSpecificModuleTriple(const llvm::Triple &triple) {
 
     StringRef newOS = getOSForAppleTargetSpecificModuleTriple(triple);
 
-    Optional<StringRef> newEnvironment =
+    std::optional<StringRef> newEnvironment =
         getEnvironmentForAppleTargetSpecificModuleTriple(triple);
 
     if (!newEnvironment)
@@ -395,10 +431,10 @@ llvm::Triple swift::getUnversionedTriple(const llvm::Triple &triple) {
                       unversionedOSName);
 }
 
-Optional<llvm::VersionTuple>
+std::optional<llvm::VersionTuple>
 swift::getSwiftRuntimeCompatibilityVersionForTarget(
     const llvm::Triple &Triple) {
-  #define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 
   if (Triple.isMacOSX()) {
     llvm::VersionTuple OSVersion;
@@ -508,8 +544,11 @@ swift::getSwiftRuntimeCompatibilityVersionForTarget(
       return floorFor64bits(llvm::VersionTuple(5, 7));
     }
   }
+  else if (Triple.isXROS()) {
+    return std::nullopt;
+  }
 
-  return None;
+  return std::nullopt;
 }
 
 static const llvm::VersionTuple minimumMacCatalystDeploymentTarget() {
@@ -528,7 +567,7 @@ llvm::VersionTuple swift::getTargetSDKVersion(clang::DarwinSDKInfo &SDKInfo,
     if (const auto *MacOStoMacCatalystMapping = SDKInfo.getVersionMapping(
             clang::DarwinSDKInfo::OSEnvPair::macOStoMacCatalystPair())) {
       return MacOStoMacCatalystMapping
-          ->map(SDKVersion, minimumMacCatalystDeploymentTarget(), None)
+          ->map(SDKVersion, minimumMacCatalystDeploymentTarget(), std::nullopt)
           .value_or(llvm::VersionTuple(0, 0, 0));
     }
     return llvm::VersionTuple(0, 0, 0);
@@ -575,7 +614,7 @@ std::string swift::getSDKBuildVersion(StringRef Path) {
 std::string swift::getSDKName(StringRef Path) {
   std::string Name = getPlistEntry(llvm::Twine(Path)+"/SDKSettings.plist",
                                    "CanonicalName");
-  if (Name.empty() && Path.endswith(".sdk")) {
+  if (Name.empty() && Path.ends_with(".sdk")) {
     Name = llvm::sys::path::filename(Path).drop_back(strlen(".sdk")).str();
   }
   return Name;

@@ -21,6 +21,7 @@
 #include "swift/SILOptimizer/Utils/CFGOptUtils.h"
 #include "swift/SILOptimizer/Utils/Devirtualize.h"
 #include "swift/SILOptimizer/Utils/Generics.h"
+#include "swift/SILOptimizer/Utils/OwnershipOptUtils.h"
 #include "swift/SILOptimizer/Utils/PerformanceInlinerUtils.h"
 #include "swift/SILOptimizer/Utils/SILOptFunctionBuilder.h"
 #include "swift/SILOptimizer/Utils/StackNesting.h"
@@ -63,6 +64,12 @@ llvm::cl::opt<bool> SILPrintInliningCallerAfter(
     llvm::cl::desc(
         "Print functions into which another function has been inlined."));
 
+llvm::cl::opt<bool> EnableVerifyAfterEachInlining(
+    "sil-inline-verify-after-each-inline", llvm::cl::init(false),
+    llvm::cl::desc(
+        "Run sil verification after inlining each found callee apply "
+        "site into a caller."));
+
 //===----------------------------------------------------------------------===//
 //                           Printing Helpers
 //===----------------------------------------------------------------------===//
@@ -94,6 +101,7 @@ class SILPerformanceInliner {
   /// global_init attributes.
   InlineSelection WhatToInline;
 
+  SILPassManager *pm;
   DominanceAnalysis *DA;
   SILLoopAnalysis *LA;
   BasicCalleeAnalysis *BCA;
@@ -112,6 +120,9 @@ class SILPerformanceInliner {
     /// The base value for every call: it represents the benefit of removing the
     /// call overhead itself.
     RemovedCallBenefit = 20,
+
+    /// The benefit of inlining a `begin_apply`.
+    RemovedCoroutineCallBenefit = 300,
 
     /// The benefit if the operand of an apply gets constant, e.g. if a closure
     /// is passed to an apply instruction in the callee.
@@ -201,6 +212,10 @@ class SILPerformanceInliner {
           llvm::detail::DenseMapPair<swift::SILBasicBlock *, uint64_t>, true>
           &bbIt);
 
+  bool isAutoDiffLinearMapWithControlFlow(FullApplySite AI);
+
+  bool isTupleWithAllocsOrPartialApplies(SILValue retVal);
+
   bool isProfitableToInline(
       FullApplySite AI, Weight CallerWeight, ConstantTracker &callerTracker,
       int &NumCallerBlocks,
@@ -211,21 +226,22 @@ class SILPerformanceInliner {
       int &NumCallerBlocks,
       const llvm::DenseMap<SILBasicBlock *, uint64_t> &BBToWeightMap);
 
-  bool decideInColdBlock(FullApplySite AI, SILFunction *Callee);
+  bool decideInColdBlock(FullApplySite AI, SILFunction *Callee, int numCallerBlocks);
 
   void visitColdBlocks(SmallVectorImpl<FullApplySite> &AppliesToInline,
-                       SILBasicBlock *root, DominanceInfo *DT);
+                       SILBasicBlock *root, DominanceInfo *DT, int numCallerBlocks);
 
   void collectAppliesToInline(SILFunction *Caller,
                               SmallVectorImpl<FullApplySite> &Applies);
 
 public:
   SILPerformanceInliner(StringRef PassName, SILOptFunctionBuilder &FuncBuilder,
-                        InlineSelection WhatToInline, DominanceAnalysis *DA,
+                        InlineSelection WhatToInline,
+                        SILPassManager *pm, DominanceAnalysis *DA,
                         SILLoopAnalysis *LA, BasicCalleeAnalysis *BCA,
                         OptimizationMode OptMode, OptRemark::Emitter &ORE)
       : PassName(PassName), FuncBuilder(FuncBuilder),
-        WhatToInline(WhatToInline), DA(DA), LA(LA), BCA(BCA), CBI(DA), ORE(ORE),
+        WhatToInline(WhatToInline), pm(pm), DA(DA), LA(LA), BCA(BCA), CBI(DA), ORE(ORE),
         OptMode(OptMode) {}
 
   bool inlineCallsIntoFunction(SILFunction *F);
@@ -291,6 +307,150 @@ bool SILPerformanceInliner::profileBasedDecision(
   return true;
 }
 
+// Checks if `FAI` can be traced back to a specifically named,
+// input enum function argument. If so, the callsite
+// containing function is a linear map in Swift Autodiff.
+bool SILPerformanceInliner::isAutoDiffLinearMapWithControlFlow(
+    FullApplySite FAI) {
+  static const std::string LinearMapBranchTracingEnumPrefix = "_AD__";
+
+  auto val = FAI.getCallee();
+
+  for (;;) {
+    if (auto *inst = dyn_cast<SingleValueInstruction>(val)) {
+      if (auto pi = Projection::isObjectProjection(val)) {
+        // Extract a member from a struct/tuple/enum.
+        val = pi->getOperand(0);
+        continue;
+      } else if (auto base = stripFunctionConversions(inst)) {
+        val = base;
+        continue;
+      }
+      return false;
+    } else if (auto *phiArg = dyn_cast<SILPhiArgument>(val)) {
+      if (auto *predBB = phiArg->getParent()->getSinglePredecessorBlock()) {
+        // The terminator of this predecessor block must either be a
+        // (conditional) branch instruction or a switch_enum.
+        if (auto *bi = dyn_cast<BranchInst>(predBB->getTerminator())) {
+          val = bi->getArg(phiArg->getIndex());
+          continue;
+        } else if (auto *cbi =
+                       dyn_cast<CondBranchInst>(predBB->getTerminator())) {
+          val = cbi->getArgForDestBB(phiArg->getParent(), phiArg->getIndex());
+          continue;
+        } else if (auto *sei =
+                       dyn_cast<SwitchEnumInst>(predBB->getTerminator())) {
+          val = sei->getOperand();
+          continue;
+        }
+        return false;
+      }
+    }
+    break;
+  }
+
+  // If `val` now points to a function argument then we have successfully traced
+  // the callee back to a function argument.
+  //
+  // We now need to check if this argument is an enum and named like an autodiff
+  // branch tracing enum.
+  if (auto *arg = dyn_cast<SILFunctionArgument>(val)) {
+    if (auto *enumDecl = arg->getType().getEnumOrBoundGenericEnum()) {
+      return enumDecl->getName().str().starts_with(
+          LinearMapBranchTracingEnumPrefix);
+    }
+  }
+
+  return false;
+}
+
+// Checks if the given value is a tuple containing allocated objects
+// or partial applies.
+//
+// Returns true if the number of allocated objects or partial applies is
+// greater than 0, and false otherwise. 
+// 
+// Returns false if the value is not a tuple.
+bool SILPerformanceInliner::isTupleWithAllocsOrPartialApplies(SILValue val) {
+  if (auto *ti = dyn_cast<TupleInst>(val)) {
+    for (auto i : range(ti->getNumOperands())) {
+      SILValue val = ti->getOperand(i);
+
+      if (auto base = stripFunctionConversions(val))
+        val = base;
+
+      if (isa<AllocationInst>(val) || isa<PartialApplyInst>(val))
+        return true;
+    }
+  }
+
+  return false;
+}
+
+// Uses a function's mangled name to determine if it is an Autodiff VJP
+// function.
+//
+// TODO: VJPs of differentiable functions with custom silgen names are not
+// recognized as VJPs by this function. However, this is not a hard limitation
+// and can be fixed.
+bool isFunctionAutodiffVJP(SILFunction *callee) {
+  swift::Demangle::Context Ctx;
+  if (auto *Root = Ctx.demangleSymbolAsNode(callee->getName())) {
+    if (auto *node = Root->findByKind(
+            swift::Demangle::Node::Kind::AutoDiffFunctionKind, 3)) {
+      if (node->hasIndex()) {
+        auto index = (char)node->getIndex();
+        auto ADFunctionKind = swift::Demangle::AutoDiffFunctionKind(index);
+        if (ADFunctionKind == swift::Demangle::AutoDiffFunctionKind::VJP) {
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+bool isProfitableToInlineAutodiffVJP(SILFunction *vjp, SILFunction *caller,
+                                     InlineSelection whatToInline,
+                                     StringRef stageName) {
+  bool isLowLevelFunctionPassPipeline = stageName == "LowLevel,Function";
+  auto isHighLevelFunctionPassPipeline =
+      stageName == "HighLevel,Function+EarlyLoopOpt";
+  auto calleeHasControlFlow = vjp->size() > 1;
+  auto isCallerVJP = isFunctionAutodiffVJP(caller);
+  auto callerHasControlFlow = caller->size() > 1;
+
+  // If the pass is being run as part of the low-level function pass pipeline,
+  // the autodiff closure-spec optimization is done doing its work. Therefore,
+  // all VJPs should be considered for inlining.
+  if (isLowLevelFunctionPassPipeline) {
+    return true;
+  }
+
+  // If callee has control-flow it will definitely not be handled by the
+  // Autodiff closure-spec optimization. Therefore, we should consider it for
+  // inlining.
+  if (calleeHasControlFlow) {
+    return true;
+  }
+
+  // If this is the EarlyPerfInline pass we want to have the Autodiff
+  // closure-spec optimization pass optimize VJPs in isolation before they are
+  // inlined into other VJPs.
+  if (isHighLevelFunctionPassPipeline) {
+    return false;
+  }
+
+  // If this is not the EarlyPerfInline pass, VJPs should only be inlined into
+  // other VJPs that do not contain any control-flow.
+  if (!isCallerVJP || (isCallerVJP && callerHasControlFlow)) {
+    return false;
+  }
+
+  return true;
+}
+
 bool SILPerformanceInliner::isProfitableToInline(
     FullApplySite AI, Weight CallerWeight, ConstantTracker &callerTracker,
     int &NumCallerBlocks,
@@ -299,8 +459,15 @@ bool SILPerformanceInliner::isProfitableToInline(
   assert(Callee);
   bool IsGeneric = AI.hasSubstitutions();
 
+  if (isFunctionAutodiffVJP(Callee) &&
+      !isProfitableToInlineAutodiffVJP(Callee, AI.getFunction(), WhatToInline,
+                                       this->pm->getStageName())) {
+    return false;
+  }
+
   // Start with a base benefit.
-  int BaseBenefit = RemovedCallBenefit;
+  int BaseBenefit = isa<BeginApplyInst>(AI) ? RemovedCoroutineCallBenefit
+                                            : RemovedCallBenefit;
 
   // Osize heuristic.
   //
@@ -352,7 +519,7 @@ bool SILPerformanceInliner::isProfitableToInline(
   // Bail out if this is a generic call of a `@_specialize(exported:)` function
   // and we are in the early inliner. We want to give the generic specializer
   // the opportunity to see specialized call sites.
-  if (IsGeneric && WhatToInline == InlineSelection::NoSemanticsAndGlobalInit  &&
+  if (IsGeneric && WhatToInline == InlineSelection::NoSemanticsAndEffects  &&
       Callee->hasPrespecialization()) {
     return false;
   }
@@ -405,6 +572,22 @@ bool SILPerformanceInliner::isProfitableToInline(
         SILInstruction *def = constTracker.getDefInCaller(FAI.getCallee());
         if (def && (isa<FunctionRefInst>(def) || isa<PartialApplyInst>(def)))
           BlockW.updateBenefit(Benefit, RemovedClosureBenefit);
+        else if (isAutoDiffLinearMapWithControlFlow(FAI)) {
+          // TODO: Do we need to tweak inlining benefits given to pullbacks
+          // (with and without control-flow)?
+
+          // For linear maps in Swift Autodiff, callees may be passed as an
+          // argument, however, they may be hidden behind a branch-tracing
+          // enum (tracing execution flow of the original function).
+          //
+          // If we can establish that we are inside of a Swift Autodiff linear
+          // map and that the branch tracing input enum is wrapping pullback
+          // closures, then we can update this function's benefit with
+          // `RemovedClosureBenefit` because inlining will (probably) eliminate
+          // the closure.
+          BlockW.updateBenefit(Benefit, RemovedClosureBenefit);
+        }
+
         // Check if inlining the callee would allow for further
         // optimizations like devirtualization or generic specialization. 
         if (!def)
@@ -489,13 +672,15 @@ bool SILPerformanceInliner::isProfitableToInline(
         }
       } else if (auto ri = dyn_cast<ReturnInst>(&I)) {
         SILValue retVal = ri->getOperand();
+        if (auto *eir = dyn_cast<EndInitLetRefInst>(retVal))
+          retVal = eir->getOperand();
         if (auto *uci = dyn_cast<UpcastInst>(retVal))
           retVal = uci->getOperand();
 
         // Inlining functions which return an allocated object or partial_apply
         // most likely has a benefit in the caller, because e.g. it can enable
         // de-virtualization.
-        if (isa<AllocationInst>(retVal) || isa<PartialApplyInst>(retVal)) {
+        if (isa<AllocationInst>(retVal) || isa<PartialApplyInst>(retVal) || isTupleWithAllocsOrPartialApplies(retVal)) {
           BlockW.updateBenefit(Benefit, RemovedCallBenefit + 10);
           returnsAllocation = true;
         }
@@ -613,12 +798,29 @@ static bool returnsClosure(SILFunction *F) {
   return false;
 }
 
-static bool isInlineAlwaysCallSite(SILFunction *Callee) {
+static bool hasMaxNumberOfBasicBlocks(SILFunction *f, int limit) {
+  for (SILBasicBlock &block : *f) {
+    (void)block;
+    if (limit == 0)
+      return false;
+    limit--;
+  }
+  return true;
+}
+
+static bool isInlineAlwaysCallSite(SILFunction *Callee, int numCallerBlocks) {
   if (Callee->isTransparent())
     return true;
-  if (Callee->getInlineStrategy() == AlwaysInline)
-    if (!Callee->getModule().getOptions().IgnoreAlwaysInline)
-      return true;
+  if (Callee->getInlineStrategy() == AlwaysInline &&
+      !Callee->getModule().getOptions().IgnoreAlwaysInline &&
+
+      // Protect against misuse of @inline(__always).
+      // Inline-always should only be used on relatively small functions.
+      // It must not be used on recursive functions. This check prevents that
+      // the compiler blows up if @inline(__always) is put on a recursive function.
+      (numCallerBlocks < 64 || hasMaxNumberOfBasicBlocks(Callee, 64))) {
+    return true;
+  }
   return false;
 }
 
@@ -628,7 +830,8 @@ static bool isInlineAlwaysCallSite(SILFunction *Callee) {
 /// It returns false if a function should not be inlined.
 /// It returns None if the decision cannot be made without a more complex
 /// analysis.
-static Optional<bool> shouldInlineGeneric(FullApplySite AI) {
+static std::optional<bool> shouldInlineGeneric(FullApplySite AI,
+                                               int numCallerBlocks) {
   assert(AI.hasSubstitutions() &&
          "Expected a generic apply");
 
@@ -648,7 +851,7 @@ static Optional<bool> shouldInlineGeneric(FullApplySite AI) {
 
   // Always inline generic functions which are marked as
   // AlwaysInline or transparent.
-  if (isInlineAlwaysCallSite(Callee))
+  if (isInlineAlwaysCallSite(Callee, numCallerBlocks))
     return true;
 
   // If all substitutions are concrete, then there is no need to perform the
@@ -663,7 +866,7 @@ static Optional<bool> shouldInlineGeneric(FullApplySite AI) {
     // enable inlining them in a generic context. Though the final inlining
     // decision is done by the usual heuristics. Therefore we return None and
     // not true.
-    return None;
+    return std::nullopt;
   }
 
   // The returned partial_apply of a thunk is most likely being optimized away
@@ -679,7 +882,7 @@ static Optional<bool> shouldInlineGeneric(FullApplySite AI) {
     return false;
 
   // It is not clear yet if this function should be decided or not.
-  return None;
+  return std::nullopt;
 }
 
 bool SILPerformanceInliner::decideInWarmBlock(
@@ -688,14 +891,14 @@ bool SILPerformanceInliner::decideInWarmBlock(
     const llvm::DenseMap<SILBasicBlock *, uint64_t> &BBToWeightMap) {
   if (AI.hasSubstitutions()) {
     // Only inline generics if definitively clear that it should be done.
-    auto ShouldInlineGeneric = shouldInlineGeneric(AI);
+    auto ShouldInlineGeneric = shouldInlineGeneric(AI, NumCallerBlocks);
     if (ShouldInlineGeneric.has_value())
       return ShouldInlineGeneric.value();
   }
 
   SILFunction *Callee = AI.getReferencedFunctionOrNull();
 
-  if (isInlineAlwaysCallSite(Callee)) {
+  if (isInlineAlwaysCallSite(Callee, NumCallerBlocks)) {
     LLVM_DEBUG(dumpCaller(AI.getFunction());
                llvm::dbgs() << "    always-inline decision "
                             << Callee->getName() << '\n');
@@ -708,17 +911,17 @@ bool SILPerformanceInliner::decideInWarmBlock(
 
 /// Return true if inlining this call site into a cold block is profitable.
 bool SILPerformanceInliner::decideInColdBlock(FullApplySite AI,
-                                              SILFunction *Callee) {
+                                              SILFunction *Callee, int numCallerBlocks) {
   if (AI.hasSubstitutions()) {
     // Only inline generics if definitively clear that it should be done.
-    auto ShouldInlineGeneric = shouldInlineGeneric(AI);
+    auto ShouldInlineGeneric = shouldInlineGeneric(AI, numCallerBlocks);
     if (ShouldInlineGeneric.has_value())
       return ShouldInlineGeneric.value();
 
     return false;
   }
 
-  if (isInlineAlwaysCallSite(Callee)) {
+  if (isInlineAlwaysCallSite(Callee, numCallerBlocks)) {
     LLVM_DEBUG(dumpCaller(AI.getFunction());
                llvm::dbgs() << "    always-inline decision "
                             << Callee->getName() << '\n');
@@ -911,13 +1114,15 @@ void SILPerformanceInliner::collectAppliesToInline(
       if (!FullApplySite::isa(&*I))
         continue;
 
+      pm->setDependingOnCalleeBodies();
+
       FullApplySite AI = FullApplySite(&*I);
 
       auto *Callee = getEligibleFunction(AI, WhatToInline);
       if (Callee) {
         // Check if we have an always_inline or transparent function. If we do,
         // just add it to our final Applies list and continue.
-        if (isInlineAlwaysCallSite(Callee)) {
+        if (isInlineAlwaysCallSite(Callee, NumCallerBlocks)) {
           NumCallerBlocks += Callee->size();
           Applies.push_back(AI);
           continue;
@@ -947,7 +1152,7 @@ void SILPerformanceInliner::collectAppliesToInline(
     domOrder.pushChildrenIf(block, [&] (SILBasicBlock *child) {
       if (CBI.isSlowPath(block, child)) {
         // Handle cold blocks separately.
-        visitColdBlocks(InitialCandidates, child, DT);
+        visitColdBlocks(InitialCandidates, child, DT, NumCallerBlocks);
         return false;
       }
       return true;
@@ -982,6 +1187,8 @@ bool SILPerformanceInliner::inlineCallsIntoFunction(SILFunction *Caller) {
   if (!Caller->shouldOptimize())
     return false;
 
+  LLVM_DEBUG(llvm::dbgs() << "Inlining calls into " << Caller->getName()
+                          << "\n");
   // First step: collect all the functions we want to inline.  We
   // don't change anything yet so that the dominator information
   // remains valid.
@@ -1009,6 +1216,8 @@ bool SILPerformanceInliner::inlineCallsIntoFunction(SILFunction *Caller) {
     // ownership... do not inline. The two modes are incompatible, so skip this
     // apply site for now.
     if (!Callee->hasOwnership() && Caller->hasOwnership()) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "Not inlining non-ossa " << Caller->getName() << "\n");
       continue;
     }
 
@@ -1034,9 +1243,30 @@ bool SILPerformanceInliner::inlineCallsIntoFunction(SILFunction *Caller) {
     // will assert, so we are safe making this assumption.
     SILInliner::inlineFullApply(AI, SILInliner::InlineKind::PerformanceInline,
                                 FuncBuilder, deleter);
+    // When inlining an OSSA function into a non-OSSA function, ownership of
+    // nonescaping closures is lowered.  At that point, they are recognized as
+    // stack users.  Since they weren't recognized as such before, they may not
+    // satisfy stack discipline.  Fix that up now.
+    invalidatedStackNesting |=
+        Callee->hasOwnership() && !Caller->hasOwnership();
     ++NumFunctionsInlined;
     if (SILPrintInliningCallerAfter) {
       printInliningDetailsCallerAfter(PassName, Caller, Callee);
+    }
+    if (EnableVerifyAfterEachInlining) {
+      deleter.cleanupDeadInstructions();
+
+      // The inliner splits blocks at call sites. Re-merge trivial branches to
+      // reestablish a canonical CFG.
+      mergeBasicBlocks(Caller);
+
+      if (invalidatedStackNesting) {
+        StackNesting::fixNesting(Caller);
+        invalidatedStackNesting = false;
+      }
+
+      Caller->verify();
+      pm->runSwiftFunctionVerification(Caller);
     }
   }
   deleter.cleanupDeadInstructions();
@@ -1048,12 +1278,14 @@ bool SILPerformanceInliner::inlineCallsIntoFunction(SILFunction *Caller) {
   if (invalidatedStackNesting) {
     StackNesting::fixNesting(Caller);
   }
+  updateBorrowedFrom(pm, Caller);
 
   // If we were asked to verify our caller after inlining all callees we could
   // find into it, do so now. This makes it easier to catch verification bugs in
   // the inliner without running the entire inliner.
   if (EnableVerifyAfterInlining) {
     Caller->verify();
+    pm->runSwiftFunctionVerification(Caller);
   }
 
   return true;
@@ -1063,7 +1295,7 @@ bool SILPerformanceInliner::inlineCallsIntoFunction(SILFunction *Caller) {
 // All other functions are not inlined in cold blocks.
 void SILPerformanceInliner::visitColdBlocks(
     SmallVectorImpl<FullApplySite> &AppliesToInline, SILBasicBlock *Root,
-    DominanceInfo *DT) {
+    DominanceInfo *DT, int numCallerBlocks) {
   DominanceOrder domOrder(Root, DT);
   while (SILBasicBlock *block = domOrder.getNext()) {
     for (SILInstruction &I : *block) {
@@ -1072,7 +1304,7 @@ void SILPerformanceInliner::visitColdBlocks(
         continue;
 
       auto *Callee = getEligibleFunction(AI, WhatToInline);
-      if (Callee && decideInColdBlock(AI, Callee)) {
+      if (Callee && decideInColdBlock(AI, Callee, numCallerBlocks)) {
         AppliesToInline.push_back(AI);
       }
     }
@@ -1094,9 +1326,7 @@ class SILPerformanceInlinerPass : public SILFunctionTransform {
 
 public:
   SILPerformanceInlinerPass(InlineSelection WhatToInline, StringRef LevelName):
-    WhatToInline(WhatToInline), PassName(LevelName) {
-    PassName.append(" Performance Inliner");
-  }
+    WhatToInline(WhatToInline), PassName(LevelName) {}
 
   void run() override {
     DominanceAnalysis *DA = PM->getAnalysis<DominanceAnalysis>();
@@ -1112,8 +1342,8 @@ public:
 
     SILOptFunctionBuilder FuncBuilder(*this);
 
-    SILPerformanceInliner Inliner(getID(), FuncBuilder, WhatToInline, DA, LA,
-                                  BCA, OptMode, ORE);
+    SILPerformanceInliner Inliner(getID(), FuncBuilder, WhatToInline,
+                                  getPassManager(), DA, LA, BCA, OptMode, ORE);
 
     assert(getFunction()->isDefinition() &&
            "Expected only functions with bodies!");
@@ -1133,24 +1363,19 @@ public:
 
 SILTransform *swift::createAlwaysInlineInliner() {
   return new SILPerformanceInlinerPass(InlineSelection::OnlyInlineAlways,
-                                       "InlineAlways");
+                                       "InlineAlways Performance Inliner");
 }
 
 /// Create an inliner pass that does not inline functions that are marked with
-/// the @_semantics, @_effects or global_init attributes.
-SILTransform *swift::createEarlyInliner() {
+/// the @_semantics or @_effects attributes.
+SILTransform *swift::createEarlyPerfInliner() {
   return new SILPerformanceInlinerPass(
-    InlineSelection::NoSemanticsAndGlobalInit, "Early");
-}
-
-/// Create an inliner pass that does not inline functions that are marked with
-/// the global_init attribute or have an "availability" semantics attribute.
-SILTransform *swift::createPerfInliner() {
-  return new SILPerformanceInlinerPass(InlineSelection::NoGlobalInit, "Middle");
+    InlineSelection::NoSemanticsAndEffects, "Early Performance Inliner");
 }
 
 /// Create an inliner pass that inlines all functions that are marked with
 /// the @_semantics, @_effects or global_init attributes.
-SILTransform *swift::createLateInliner() {
-  return new SILPerformanceInlinerPass(InlineSelection::Everything, "Late");
+SILTransform *swift::createPerfInliner() {
+  return new SILPerformanceInlinerPass(
+    InlineSelection::Everything, "Performance Inliner");
 }

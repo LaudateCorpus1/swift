@@ -73,7 +73,7 @@ func doit<T>(_ f: () -> T) -> T {
 // CHECK:         [[DUPLICATE_CLOSURE:%[^,]+]] = function_ref @$s19opaque_values_Onone10duplicate15valuex_xtx_tlFx_xtyXEfU_
 // CHECK:         copy_addr [[INSTANCE_ADDR_IN]] to [init] [[INSTANCE_ADDR]]
 // CHECK:         [[DUPLICATE_INSTANCE_CLOSURE:%[^,]+]] = partial_apply [callee_guaranteed] [on_stack] [[DUPLICATE_CLOSURE]]<Value>([[INSTANCE_ADDR]])
-// CHECK:         [[DEPENDENDENCY:%[^,]+]] = mark_dependence [[DUPLICATE_INSTANCE_CLOSURE]] : $@noescape @callee_guaranteed () -> @out (Value, Value) on [[INSTANCE_ADDR]] : $*Value
+// CHECK:         [[DEPENDENDENCY:%[^,]+]] = mark_dependence [nonescaping] [[DUPLICATE_INSTANCE_CLOSURE]] : $@noescape @callee_guaranteed () -> @out (Value, Value) on [[INSTANCE_ADDR]] : $*Value
 // CHECK:         [[CONVERTED:%[^,]+]] = convert_function [[DEPENDENDENCY]]
 // CHECK:         apply {{%[^,]+}}<(Value, Value)>([[OUTPUT_TUPLE_ADDR]], [[CONVERTED]])
 // CHECK-LABEL: } // end sil function 'duplicate1'
@@ -97,7 +97,7 @@ func duplicate1<Value>(value: Value) -> (Value, Value) {
 // CHECK:         [[DUPLICATE_CLOSURE:%[^,]+]] = function_ref @$s19opaque_values_Onone10duplicate25valuex3one_x3twotx_tlFxAD_xAEtyXEfU_
 // CHECK:         copy_addr [[INSTANCE_ADDR_IN]] to [init] [[INSTANCE_ADDR]]
 // CHECK:         [[DUPLICATE_INSTANCE_CLOSURE:%[^,]+]] = partial_apply [callee_guaranteed] [on_stack] [[DUPLICATE_CLOSURE]]<Value>([[INSTANCE_ADDR]])
-// CHECK:         [[DEPENDENDENCY:%[^,]+]] = mark_dependence [[DUPLICATE_INSTANCE_CLOSURE]] : $@noescape @callee_guaranteed () -> @out (one: Value, two: Value) on [[INSTANCE_ADDR]] : $*Value
+// CHECK:         [[DEPENDENDENCY:%[^,]+]] = mark_dependence [nonescaping] [[DUPLICATE_INSTANCE_CLOSURE]] : $@noescape @callee_guaranteed () -> @out (one: Value, two: Value) on [[INSTANCE_ADDR]] : $*Value
 // CHECK:         [[CONVERTED:%[^,]+]] = convert_function [[DEPENDENDENCY]]
 // CHECK:         apply {{%[^,]+}}<(one: Value, two: Value)>([[OUTPUT_TUPLE_ADDR]], [[CONVERTED]])
 // CHECK-LABEL: } // end sil function 'duplicate2'
@@ -133,7 +133,7 @@ func duplicate_with_int2<Value>(value: Value) -> ((Value, Value), Int) {
 // CHECK:         [[CLOSURE:%[^,]+]] = function_ref @$s19opaque_values_Onone19duplicate_with_int35valueSi_x_x_x_SitxttSitx_tlFSi_x_x_x_SitxttSityXEfU_
 // CHECK:         copy_addr [[INSTANCE_ADDR_IN]] to [init] [[INSTANCE_ADDR]]
 // CHECK:         [[INSTANCE_CLOSURE:%[^,]+]] = partial_apply [callee_guaranteed] [on_stack] [[CLOSURE]]<Value>([[INSTANCE_ADDR]])
-// CHECK:         [[DEPENDENCY:%[^,]+]] = mark_dependence [[INSTANCE_CLOSURE]]
+// CHECK:         [[DEPENDENCY:%[^,]+]] = mark_dependence [nonescaping] [[INSTANCE_CLOSURE]]
 // CHECK:         [[CONVERTED:%[^,]+]] = convert_function [[DEPENDENCY]]
 // CHECK:         apply {{%[^,]+}}<(Int, (Value, (Value, (Value, Int), Value)), Int)>({{%[^,]+}}, [[CONVERTED]])
 // CHECK-LABEL: } // end sil function 'duplicate_with_int3'
@@ -152,8 +152,8 @@ func duplicate_with_int2<Value>(value: Value) -> ((Value, Value), Int) {
 // CHECK:         copy_addr [[IN_ADDR]] to [init] [[OUT_1_1_2_ADDR]]
 // CHECK:         [[OUT_1_1_1_1_ADDR:%[^,]+]] = tuple_element_addr [[OUT_1_1_1_ADDR]] : $*(Value, Int), 1
 // CHECK:         store {{%[^,]+}} to [[OUT_1_1_1_1_ADDR]]
-// CHECK:         [[OUT_2_ADDR:%[^,]+]] = tuple_element_addr [[OUT_ADDR]] : $*(Int, (Value, (Value, (Value, Int), Value)), Int), 0
-// CHECK:         store {{%[^,]+}} to [[OUT_2_ADDR]]
+// CHECK:         [[OUT_0_ADDR:%[^,]+]] = tuple_element_addr [[OUT_ADDR]] : $*(Int, (Value, (Value, (Value, Int), Value)), Int), 0
+// CHECK:         store {{%[^,]+}} to [[OUT_0_ADDR]]
 // CHECK:         [[OUT_2_ADDR:%[^,]+]] = tuple_element_addr [[OUT_ADDR]] : $*(Int, (Value, (Value, (Value, Int), Value)), Int), 2
 // CHECK:         store {{%[^,]+}} to [[OUT_2_ADDR]]
 // CHECK-LABEL: } // end sil function '$s19opaque_values_Onone19duplicate_with_int35valueSi_x_x_x_SitxttSitx_tlFSi_x_x_x_SitxttSityXEfU_'
@@ -165,10 +165,10 @@ func duplicate_with_int3<Value>(value: Value) -> (Int, (Value, (Value, (Value, I
 }
 
 // CHECK-LABEL: sil hidden @get_a_generic_tuple : {{.*}} {
-// CHECK:         [[TUPLE_ADDR:%[^,]+]] = alloc_stack [lexical] $(This, This)
 // CHECK:         [[GIVE_A_GENERIC_TUPLE:%[^,]+]] = function_ref @give_a_generic_tuple
-// CHECK:         [[TUPLE_0_ADDR:%[^,]+]] = tuple_element_addr [[TUPLE_ADDR]] : $*(This, This), 0
+// CHECK:         [[TUPLE_ADDR:%[^,]+]] = alloc_stack [lexical] $(This, This)
 // CHECK:         [[TUPLE_1_ADDR:%[^,]+]] = tuple_element_addr [[TUPLE_ADDR]] : $*(This, This), 1
+// CHECK:         [[TUPLE_0_ADDR:%[^,]+]] = tuple_element_addr [[TUPLE_ADDR]] : $*(This, This), 0
 // CHECK:         apply [[GIVE_A_GENERIC_TUPLE]]<This>([[TUPLE_0_ADDR]], [[TUPLE_1_ADDR]], {{%[^,]+}})
 // CHECK:         destroy_addr [[TUPLE_ADDR]]
 // CHECK:         dealloc_stack [[TUPLE_ADDR]]

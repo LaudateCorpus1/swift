@@ -62,7 +62,7 @@ ParseMembersRequest::evaluate(Evaluator &evaluator,
       }
     }
 
-    Optional<Fingerprint> fp = None;
+    std::optional<Fingerprint> fp = std::nullopt;
     if (!idc->getDecl()->isImplicit() && fileUnit) {
       fp = fileUnit->loadFingerprint(idc);
     }
@@ -79,7 +79,7 @@ ParseMembersRequest::evaluate(Evaluator &evaluator,
                                                  declsAndHash.first};
   return FingerprintAndMembers{
       fingerprintAndMembers.fingerprint,
-      ctx.AllocateCopy(llvm::makeArrayRef(fingerprintAndMembers.members))};
+      ctx.AllocateCopy(llvm::ArrayRef(fingerprintAndMembers.members))};
 }
 
 BodyAndFingerprint
@@ -91,7 +91,6 @@ ParseAbstractFunctionBodyRequest::evaluate(Evaluator &evaluator,
   case BodyKind::Deserialized:
   case BodyKind::SILSynthesize:
   case BodyKind::None:
-  case BodyKind::Skipped:
     return {};
 
   case BodyKind::TypeChecked:
@@ -164,10 +163,86 @@ SourceFileParsingResult ParseSourceFileRequest::evaluate(Evaluator &evaluator,
   Parser parser(*bufferID, *SF, /*SIL*/ nullptr, state);
   PrettyStackTraceParser StackTrace(parser);
 
+  // If the buffer is generated source information, we might have more
+  // context that we need to set up for parsing.
   SmallVector<ASTNode, 128> items;
-  parser.parseTopLevelItems(items);
+  if (auto generatedInfo = ctx.SourceMgr.getGeneratedSourceInfo(*bufferID)) {
+    if (generatedInfo->declContext)
+      parser.CurDeclContext = generatedInfo->declContext;
 
-  Optional<ArrayRef<Token>> tokensRef;
+    switch (generatedInfo->kind) {
+    case GeneratedSourceInfo::DeclarationMacroExpansion:
+    case GeneratedSourceInfo::CodeItemMacroExpansion:
+      if (parser.CurDeclContext->isTypeContext()) {
+        parser.parseExpandedMemberList(items);
+      } else {
+        parser.parseTopLevelItems(items);
+      }
+      break;
+
+    case GeneratedSourceInfo::ExpressionMacroExpansion:
+    case GeneratedSourceInfo::PreambleMacroExpansion:
+    case GeneratedSourceInfo::ReplacedFunctionBody:
+    case GeneratedSourceInfo::PrettyPrinted:
+    case GeneratedSourceInfo::DefaultArgument: {
+      parser.parseTopLevelItems(items);
+      break;
+    }
+
+    case GeneratedSourceInfo::BodyMacroExpansion: {
+      // Prime the lexer.
+      if (parser.Tok.is(tok::NUM_TOKENS))
+        parser.consumeTokenWithoutFeedingReceiver();
+
+      if (parser.Tok.is(tok::l_brace)) {
+        if (auto body =
+                parser.parseBraceItemList(diag::invalid_diagnostic)
+                  .getPtrOrNull())
+          items.push_back(body);
+      }
+
+      break;
+    }
+
+    case GeneratedSourceInfo::MemberMacroExpansion: {
+      parser.parseExpandedMemberList(items);
+      break;
+    }
+
+    case GeneratedSourceInfo::AccessorMacroExpansion: {
+      ASTNode astNode = ASTNode::getFromOpaqueValue(generatedInfo->astNode);
+      auto attachedDecl = astNode.get<Decl *>();
+      auto accessorsForStorage = dyn_cast<AbstractStorageDecl>(attachedDecl);
+
+      parser.parseTopLevelAccessors(accessorsForStorage, items);
+      break;
+    }
+
+    case GeneratedSourceInfo::MemberAttributeMacroExpansion: {
+      parser.parseExpandedAttributeList(items);
+      break;
+    }
+
+    case GeneratedSourceInfo::PeerMacroExpansion: {
+      if (parser.CurDeclContext->isTypeContext()) {
+        parser.parseExpandedMemberList(items);
+      } else {
+        parser.parseTopLevelItems(items);
+      }
+      break;
+    }
+
+    case GeneratedSourceInfo::ConformanceMacroExpansion:
+    case GeneratedSourceInfo::ExtensionMacroExpansion: {
+      parser.parseTopLevelItems(items);
+      break;
+    }
+    }
+  } else {
+    parser.parseTopLevelItems(items);
+  }
+
+  std::optional<ArrayRef<Token>> tokensRef;
   if (auto tokens = parser.takeTokenReceiver()->finalize())
     tokensRef = ctx.AllocateCopy(*tokens);
 
@@ -180,12 +255,12 @@ evaluator::DependencySource ParseSourceFileRequest::readDependencySource(
   return std::get<0>(getStorage());
 }
 
-Optional<SourceFileParsingResult>
+std::optional<SourceFileParsingResult>
 ParseSourceFileRequest::getCachedResult() const {
   auto *SF = std::get<0>(getStorage());
   auto items = SF->getCachedTopLevelItems();
   if (!items)
-    return None;
+    return std::nullopt;
 
   return SourceFileParsingResult{*items, SF->AllCollectedTokens,
                                  SF->InterfaceHasher};

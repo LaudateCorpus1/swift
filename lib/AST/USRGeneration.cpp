@@ -176,7 +176,8 @@ swift::USRGenerationRequest::evaluate(Evaluator &evaluator,
 
   if (!D->hasName() && !isa<ParamDecl>(D) && !isa<AccessorDecl>(D))
     return std::string(); // Ignore.
-  if (D->getModuleContext()->isBuiltinModule())
+  if (D->getModuleContext()->isBuiltinModule() &&
+      !isa<BuiltinTupleDecl>(D))
     return std::string(); // Ignore.
   if (isa<ModuleDecl>(D))
     return std::string(); // Ignore.
@@ -257,7 +258,7 @@ swift::USRGenerationRequest::evaluate(Evaluator &evaluator,
 }
 
 std::string ide::demangleUSR(StringRef mangled) {
-  if (mangled.startswith(getUSRSpacePrefix())) {
+  if (mangled.starts_with(getUSRSpacePrefix())) {
     mangled = mangled.substr(getUSRSpacePrefix().size());
   }
   SmallString<128> buffer;
@@ -342,7 +343,7 @@ bool ide::printExtensionUSR(const ExtensionDecl *ED, raw_ostream &OS) {
   }
   OS << getUSRSpacePrefix() << "e:";
   printValueDeclUSR(nominal, OS);
-  for (auto Inherit : ED->getInherited()) {
+  for (auto Inherit : ED->getInherited().getEntries()) {
     if (auto T = Inherit.getType()) {
       if (T->getAnyNominal())
         return printValueDeclUSR(T->getAnyNominal(), OS);

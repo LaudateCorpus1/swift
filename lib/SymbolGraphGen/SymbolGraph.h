@@ -41,13 +41,13 @@ struct SymbolGraph {
   /**
    The module whose types were extended in `M`.
    */
-  Optional<ModuleDecl *> ExtendedModule;
-  
+  std::optional<ModuleDecl *> ExtendedModule;
+
   /**
    The module declaring `M`, if `M` is a cross-import overlay.
    */
-  Optional<ModuleDecl *> DeclaringModule;
-  
+  std::optional<ModuleDecl *> DeclaringModule;
+
   /**
    The modules that must be imported alongside `DeclaringModule` for `M` to be imported, if `M` is a cross-import overlay.
    */
@@ -62,7 +62,7 @@ struct SymbolGraph {
    The semantic version of the module that this symbol graph describes,
    if known.
    */
-  Optional<llvm::VersionTuple> ModuleVersion;
+  std::optional<llvm::VersionTuple> ModuleVersion;
 
   /**
    The symbols in a module: the nodes in the graph.
@@ -80,8 +80,9 @@ struct SymbolGraph {
   bool IsForSingleNode;
 
   SymbolGraph(SymbolGraphASTWalker &Walker, ModuleDecl &M,
-              Optional<ModuleDecl *> ExtendedModule, markup::MarkupContext &Ctx,
-              Optional<llvm::VersionTuple> ModuleVersion = None,
+              std::optional<ModuleDecl *> ExtendedModule,
+              markup::MarkupContext &Ctx,
+              std::optional<llvm::VersionTuple> ModuleVersion = std::nullopt,
               bool IsForSingleNode = false);
 
   // MARK: - Utilities

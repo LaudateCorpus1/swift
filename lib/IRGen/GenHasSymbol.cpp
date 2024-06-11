@@ -21,6 +21,8 @@
 #include "swift/SIL/SILFunctionBuilder.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/SILSymbolVisitor.h"
+#include "clang/AST/DeclObjC.h"
+#include "clang/AST/GlobalDecl.h"
 
 #include "GenDecl.h"
 #include "IRGenFunction.h"
@@ -39,6 +41,20 @@ static llvm::Constant *getAddrOfLLVMVariable(IRGenModule &IGM,
   if (entity.isDispatchThunk())
     return IGM.getAddrOfDispatchThunk(entity.getSILDeclRef(), NotForDefinition);
 
+  if (entity.isOpaqueTypeDescriptorAccessor()) {
+    OpaqueTypeDecl *decl =
+        const_cast<OpaqueTypeDecl *>(cast<OpaqueTypeDecl>(entity.getDecl()));
+    bool isImplementation = entity.isOpaqueTypeDescriptorAccessorImpl();
+    return IGM
+        .getAddrOfOpaqueTypeDescriptorAccessFunction(decl, NotForDefinition,
+                                                     isImplementation)
+        .getDirectPointer();
+  }
+
+  // FIXME: Look up addr of the replaceable function (has "TI" mangling suffix)
+  if (entity.isDynamicallyReplaceableFunctionImpl())
+    return nullptr;
+
   return IGM.getAddrOfLLVMVariable(entity, ConstantInit(), DebugTypeInfo());
 }
 
@@ -46,13 +62,16 @@ class HasSymbolIRGenVisitor : public IRSymbolVisitor {
   IRGenModule &IGM;
   llvm::SmallVector<llvm::Constant *, 4> &Addrs;
 
+  void addFunction(SILFunction *fn) {
+    Addrs.emplace_back(IGM.getAddrOfSILFunction(fn, NotForDefinition));
+  }
+
   void addFunction(StringRef name) {
     SILFunction *silFn = IGM.getSILModule().lookUpFunction(name);
     // Definitions for each SIL function should have been emitted by SILGen.
     assert(silFn && "missing SIL function?");
-    if (silFn) {
-      Addrs.emplace_back(IGM.getAddrOfSILFunction(silFn, NotForDefinition));
-    }
+    if (silFn)
+      addFunction(silFn);
   }
 
 public:
@@ -74,9 +93,16 @@ public:
   }
 
   void addLinkEntity(LinkEntity entity) override {
+    if (entity.hasSILFunction()) {
+      addFunction(entity.getSILFunction());
+      return;
+    }
+
     auto constant = getAddrOfLLVMVariable(IGM, entity);
-    auto global = cast<llvm::GlobalValue>(constant);
-    Addrs.emplace_back(global);
+    if (constant) {
+      auto global = cast<llvm::GlobalValue>(constant);
+      Addrs.emplace_back(global);
+    }
   }
 
   void addProtocolWitnessThunk(RootProtocolConformance *C,
@@ -86,6 +112,39 @@ public:
   }
 };
 
+static llvm::Constant *
+getAddrOfLLVMVariableForClangDecl(IRGenModule &IGM, ValueDecl *decl,
+                                  const clang::Decl *clangDecl) {
+  if (isa<clang::FunctionDecl>(clangDecl)) {
+    SILFunction *silFn =
+        IGM.getSILModule().lookUpFunction(SILDeclRef(decl).asForeign());
+    assert(silFn && "missing SIL function?");
+    return silFn ? IGM.getAddrOfSILFunction(silFn, NotForDefinition) : nullptr;
+  }
+
+  if (auto var = dyn_cast<clang::ObjCInterfaceDecl>(clangDecl))
+    return IGM.getAddrOfObjCClass(cast<ClassDecl>(decl), NotForDefinition);
+
+  llvm::report_fatal_error("Unexpected clang decl kind");
+}
+
+static void
+getSymbolAddrsForDecl(IRGenModule &IGM, ValueDecl *decl,
+                      llvm::SmallVector<llvm::Constant *, 4> &addrs) {
+  if (auto *clangDecl = decl->getClangDecl()) {
+    if (auto *addr = getAddrOfLLVMVariableForClangDecl(IGM, decl, clangDecl))
+      addrs.push_back(addr);
+    return;
+  }
+
+  SILSymbolVisitorOptions opts;
+  opts.VisitMembers = false;
+  auto silCtx = SILSymbolVisitorContext(IGM.getSwiftModule(), opts);
+  auto linkInfo = UniversalLinkageInfo(IGM);
+  auto symbolVisitorCtx = IRSymbolVisitorContext(linkInfo, silCtx);
+  HasSymbolIRGenVisitor(IGM, addrs).visit(decl, symbolVisitorCtx);
+}
+
 llvm::Function *IRGenModule::emitHasSymbolFunction(ValueDecl *decl) {
 
   PrettyStackTraceDecl trace("emitting #_hasSymbol query for", decl);
@@ -94,14 +153,9 @@ llvm::Function *IRGenModule::emitHasSymbolFunction(ValueDecl *decl) {
   auto func = cast<llvm::Function>(getOrCreateHelperFunction(
       mangler.mangleHasSymbolQuery(decl), Int1Ty, {},
       [decl, this](IRGenFunction &IGF) {
-        SILSymbolVisitorOptions opts;
-        opts.VisitMembers = false;
-        auto silCtx = SILSymbolVisitorContext(getSwiftModule(), opts);
-        auto linkInfo = UniversalLinkageInfo(*this);
-        auto symbolVisitorCtx = IRSymbolVisitorContext(linkInfo, silCtx);
         auto &Builder = IGF.Builder;
         llvm::SmallVector<llvm::Constant *, 4> addrs;
-        HasSymbolIRGenVisitor(*this, addrs).visit(decl, symbolVisitorCtx);
+        getSymbolAddrsForDecl(*this, decl, addrs);
 
         llvm::Value *ret = nullptr;
         for (llvm::Constant *addr : addrs) {
@@ -122,7 +176,7 @@ llvm::Function *IRGenModule::emitHasSymbolFunction(ValueDecl *decl) {
 
   func->setDoesNotThrow();
   func->setCallingConv(DefaultCC);
-  func->addFnAttr(llvm::Attribute::ReadOnly);
+  func->setOnlyReadsMemory();
 
   return func;
 }

@@ -63,6 +63,11 @@ static bool seemsUseful(SILInstruction *I) {
   if (I->mayHaveSideEffects())
     return true;
 
+  if (llvm::any_of(I->getResults(),
+                   [](auto result) { return result->isLexical(); })) {
+    return true;
+  }
+
   if (auto *BI = dyn_cast<BuiltinInst>(I)) {
     // Although the onFastPath builtin has no side-effects we don't want to
     // remove it.
@@ -77,8 +82,16 @@ static bool seemsUseful(SILInstruction *I) {
   }
 
   // Is useful if it's associating with a function argument
+  // If undef, it is useful and it doesn't cost anything.
   if (isa<DebugValueInst>(I))
-    return isa<SILFunctionArgument>(I->getOperand(0));
+    return isa<SILFunctionArgument>(I->getOperand(0))
+      || isa<SILUndef>(I->getOperand(0));
+  
+
+  // Don't delete allocation instructions in DCE.
+  if (isa<AllocRefInst>(I) || isa<AllocRefDynamicInst>(I)) {
+    return true;
+  }
 
   return false;
 }
@@ -215,7 +228,6 @@ void DCE::markInstructionLive(SILInstruction *Inst) {
 
   LLVM_DEBUG(llvm::dbgs() << "Marking as live: " << *Inst);
 
-  markControllingTerminatorsLive(Inst->getParent());
   Worklist.push_back(Inst);
 }
 
@@ -275,45 +287,58 @@ void DCE::markLive() {
         addReverseDependency(beginAccess, &I);
         break;
       }
-      case SILInstructionKind::DestroyValueInst:
-      case SILInstructionKind::EndBorrowInst:
+      case SILInstructionKind::DestroyValueInst: {
+        auto phi = PhiValue(I.getOperand(0));
+        // Disable DCE of phis which are lexical or may have a pointer escape.
+        if (phi && (phi->isLexical() || findPointerEscape(phi))) {
+          markInstructionLive(&I);
+        }
+        // The instruction is live only if it's operand value is also live
+        addReverseDependency(I.getOperand(0), &I);
+        break;
+      }
+      case SILInstructionKind::EndBorrowInst: {
+        auto phi = PhiValue(lookThroughBorrowedFromDef(I.getOperand(0)));
+        // If there is a pointer escape or phi is lexical, disable DCE.
+        if (phi && (findPointerEscape(phi) || phi->isLexical())) {
+          markInstructionLive(&I);
+        }
+        // The instruction is live only if it's operand value is also live
+        addReverseDependency(I.getOperand(0), &I);
+        break;
+      }
+      case SILInstructionKind::BorrowedFromInst: {
+        addReverseDependency(I.getOperand(0), &I);
+        break;
+      }
       case SILInstructionKind::EndLifetimeInst: {
         // The instruction is live only if it's operand value is also live
         addReverseDependency(I.getOperand(0), &I);
         break;
       }
       case SILInstructionKind::BeginBorrowInst: {
-        // Currently we only support borrows of owned values.
-        // Nested borrow handling can be complex in the presence of reborrows.
-        // So it is not handled currently.
         auto *borrowInst = cast<BeginBorrowInst>(&I);
+        // Populate guaranteedPhiDependencies for this borrowInst
+        findGuaranteedPhiDependencies(BorrowedValue(borrowInst));
+        auto disableBorrowDCE = [&](SILValue borrow) {
+          visitTransitiveEndBorrows(borrow, [&](EndBorrowInst *endBorrow) {
+            markInstructionLive(endBorrow);
+          });
+        };
+        // If we have a begin_borrow of a @guaranteed operand, disable DCE'ing
+        // of parent borrow scopes. Dead reborrows needs complex handling, which
+        // is why it is disabled for now.
         if (borrowInst->getOperand()->getOwnershipKind() ==
             OwnershipKind::Guaranteed) {
-          // Visit the end_borrows of all the borrow scopes that this
-          // begin_borrow could be borrowing.
           SmallVector<SILValue, 4> roots;
           findGuaranteedReferenceRoots(borrowInst->getOperand(),
                                        /*lookThroughNestedBorrows=*/false,
                                        roots);
+          // Visit the end_borrows of all the borrow scopes that this
+          // begin_borrow could be borrowing, and mark them live.
           for (auto root : roots) {
-            visitTransitiveEndBorrows(root,
-                                      [&](EndBorrowInst *endBorrow) {
-                                        markInstructionLive(endBorrow);
-                                      });
+            disableBorrowDCE(root);
           }
-          continue;
-        }
-        // Populate guaranteedPhiDependencies for this borrow
-        findGuaranteedPhiDependencies(BorrowedValue(borrowInst));
-        // Don't optimize a borrow scope if it is lexical or has a pointer
-        // escape.
-        if (borrowInst->isLexical() ||
-            hasPointerEscape(BorrowedValue(borrowInst))) {
-          // Visit all end_borrows and mark them live
-          visitTransitiveEndBorrows(borrowInst, [&](EndBorrowInst *endBorrow) {
-            markInstructionLive(endBorrow);
-          });
-          continue;
         }
         break;
       }
@@ -339,7 +364,7 @@ void DCE::markLive() {
 // Records a reverse dependency if needed. See DCE::ReverseDependencies.
 void DCE::addReverseDependency(SILValue from, SILInstruction *to) {
   LLVM_DEBUG(llvm::dbgs() << "Adding reverse dependency from " << from << " to "
-                          << to);
+                          << *to);
   ReverseDependencies[from].insert(to);
 }
 
@@ -376,9 +401,9 @@ void DCE::markTerminatorArgsLive(SILBasicBlock *Pred,
   switch (Term->getTermKind()) {
   case TermKind::ReturnInst:
   case TermKind::ThrowInst:
+  case TermKind::ThrowAddrInst:
   case TermKind::UnwindInst:
   case TermKind::YieldInst:
-
   case TermKind::UnreachableInst:
   case TermKind::SwitchValueInst:
   case TermKind::SwitchEnumAddrInst:
@@ -454,6 +479,8 @@ void DCE::propagateLiveBlockArgument(SILArgument *Arg) {
 // Given an instruction which is considered live, propagate that liveness
 // back to the instructions that produce values it consumes.
 void DCE::propagateLiveness(SILInstruction *I) {
+  markControllingTerminatorsLive(I->getParent());
+
   if (!isa<TermInst>(I)) {
     for (auto &O : I->getAllOperands())
       markValueLive(O.get());
@@ -480,6 +507,7 @@ void DCE::propagateLiveness(SILInstruction *I) {
   case TermKind::BranchInst:
   case TermKind::UnreachableInst:
   case TermKind::UnwindInst:
+  case TermKind::ThrowAddrInst:
     return;
 
   case TermKind::ReturnInst:
@@ -540,7 +568,7 @@ void DCE::replaceBranchWithJump(SILInstruction *Inst, SILBasicBlock *Block) {
     auto E = Block->args_end();
     for (auto A = Block->args_begin(); A != E; ++A) {
       assert(!LiveArguments.contains(*A) && "Unexpected live block argument!");
-      Args.push_back(SILUndef::get((*A)->getType(), *(*A)->getFunction()));
+      Args.push_back(SILUndef::get(*A));
     }
     Branch =
         SILBuilderWithScope(Inst).createBranch(Inst->getLoc(), Block, Args);
@@ -565,7 +593,7 @@ void DCE::endLifetimeOfLiveValue(SILValue value, SILInstruction *insertPt) {
     builder.emitDestroyOperation(RegularLocation::getAutoGeneratedLocation(),
                                  value);
   }
-  BorrowedValue borrow(value);
+  BorrowedValue borrow(lookThroughBorrowedFromDef(value));
   if (borrow && borrow.isLocalScope()) {
     builder.emitEndBorrowOperation(RegularLocation::getAutoGeneratedLocation(),
                                    value);
@@ -647,7 +675,9 @@ bool DCE::removeDead() {
 
         endLifetimeOfLiveValue(phiArg->getIncomingPhiValue(pred), insertPt);
       }
-      erasePhiArgument(&BB, i);
+      erasePhiArgument(&BB, i, /*cleanupDeadPhiOps=*/true,
+                       InstModCallbacks().onCreateNewInst(
+                           [&](auto *inst) { markInstructionLive(inst); }));
       Changed = true;
       BranchesChanged = true;
     }
@@ -672,7 +702,8 @@ bool DCE::removeDead() {
         }
         LLVM_DEBUG(llvm::dbgs() << "Replacing branch: ");
         LLVM_DEBUG(Inst->dump());
-        LLVM_DEBUG(llvm::dbgs() << "with jump to: BB" << postDom->getDebugID());
+        LLVM_DEBUG(llvm::dbgs()
+                   << "with jump to: BB" << postDom->getDebugID() << "\n");
 
         replaceBranchWithJump(Inst, postDom);
         Inst->eraseFromParent();

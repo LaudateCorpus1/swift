@@ -11,7 +11,7 @@
 //===----------------------------------------------------------------------===//
 //
 // This file implements diagnostics for fragile functions, like those with
-// @inlinable, @_alwaysEmitIntoClient, or @_backDeploy.
+// @inlinable, @_alwaysEmitIntoClient, or @backDeployed.
 //
 //===----------------------------------------------------------------------===//
 
@@ -28,6 +28,27 @@
 
 using namespace swift;
 
+static bool addMissingImport(SourceLoc loc, const Decl *D,
+                             const ExportContext &where) {
+  ASTContext &ctx = where.getDeclContext()->getASTContext();
+  ModuleDecl *M = D->getModuleContext();
+  auto *SF = where.getDeclContext()->getParentSourceFile();
+
+  // Only add imports of API level modules if this is an API level module.
+  if (M->getLibraryLevel() != LibraryLevel::API &&
+      SF->getParentModule()->getLibraryLevel() == LibraryLevel::API)
+    return false;
+
+  // Hack to fix swiftinterfaces in case of missing imports. We can get rid of
+  // this logic when we don't leak the use of non-locally imported things in
+  // API.
+  auto missingImport = ImportedModule(ImportPath::Access(),
+                                      const_cast<ModuleDecl *>(M));
+  SF->addMissingImportedModule(missingImport);
+  ctx.Diags.diagnose(loc, diag::missing_import_inserted, M->getName());
+  return true;
+}
+
 bool TypeChecker::diagnoseInlinableDeclRefAccess(SourceLoc loc,
                                                  const ValueDecl *D,
                                                  const ExportContext &where) {
@@ -40,15 +61,40 @@ bool TypeChecker::diagnoseInlinableDeclRefAccess(SourceLoc loc,
     return false;
 
   auto *DC = where.getDeclContext();
+  auto &Context = DC->getASTContext();
+
+  ImportAccessLevel problematicImport = D->getImportAccessFrom(DC);
+  if (problematicImport.has_value()) {
+    auto SF = DC->getParentSourceFile();
+    if (SF) {
+      // The max used access level previously registered might be Package,
+      // in which case, don't reset it to Public here; this ensures proper
+      // diags between public and package.
+      if (SF->isMaxAccessLevelUsingImportInternal(problematicImport.value()))
+        SF->registerAccessLevelUsingImport(problematicImport.value(),
+                                           AccessLevel::Public);
+
+      if (Context.LangOpts.EnableModuleApiImportRemarks) {
+        ModuleDecl *importedVia = problematicImport->module.importedModule,
+        *sourceModule = D->getModuleContext();
+        Context.Diags.diagnose(loc, diag::module_api_import,
+                               D, importedVia, sourceModule,
+                               importedVia == sourceModule,
+                               /*isImplicit*/false);
+      }
+    }
+  }
+
+  // General check on access-level of the decl.
+  auto declAccessScope =
+      D->getFormalAccessScope(/*useDC=*/DC,
+                              /*allowUsableFromInline=*/true);
 
   // Public declarations are OK, even if they're SPI or came from an
   // implementation-only import. We'll diagnose exportability violations
   // from diagnoseDeclRefExportability().
-  if (D->getFormalAccessScope(/*useDC=*/nullptr,
-                              fragileKind.allowUsableFromInline).isPublic())
+  if (declAccessScope.isPublic())
     return false;
-
-  auto &Context = DC->getASTContext();
 
   // Dynamic declarations were mistakenly not checked in Swift 4.2.
   // Do enforce the restriction even in pre-Swift-5 modes if the module we're
@@ -59,6 +105,16 @@ bool TypeChecker::diagnoseInlinableDeclRefAccess(SourceLoc loc,
   }
 
   DowngradeToWarning downgradeToWarning = DowngradeToWarning::No;
+  // Don't change the order of the getDisallowedOriginKind call;
+  // it can reset downgradeToWarning to NO so needs to be called here.
+  auto originKind = getDisallowedOriginKind(D, where, downgradeToWarning);
+  // For a default argument or property initializer, package type is
+  // allowed at the use site with package access scope.
+  auto allowedForPkgCtx = false;
+  if (originKind == DisallowedOriginKind::None ||
+      originKind == DisallowedOriginKind::PackageImport) {
+    allowedForPkgCtx = where.isPackage() && declAccessScope.isPackage();
+  }
 
   // Swift 4.2 did not perform any checks for type aliases.
   if (isa<TypeAliasDecl>(D)) {
@@ -68,39 +124,34 @@ bool TypeChecker::diagnoseInlinableDeclRefAccess(SourceLoc loc,
       downgradeToWarning = DowngradeToWarning::Yes;
   }
 
-  auto diagName = D->getName();
-  bool isAccessor = false;
-
   // Swift 4.2 did not check accessor accessibility.
   if (auto accessor = dyn_cast<AccessorDecl>(D)) {
-    isAccessor = true;
-
     if (!Context.isSwiftVersionAtLeast(5))
       downgradeToWarning = DowngradeToWarning::Yes;
-
-    // For accessors, diagnose with the name of the storage instead of the
-    // implicit '_'.
-    diagName = accessor->getStorage()->getName();
   }
 
   // Swift 5.0 did not check the underlying types of local typealiases.
   if (isa<TypeAliasDecl>(DC) && !Context.isSwiftVersionAtLeast(6))
     downgradeToWarning = DowngradeToWarning::Yes;
 
-  auto diagID = diag::resilience_decl_unavailable;
-  if (downgradeToWarning == DowngradeToWarning::Yes)
-    diagID = diag::resilience_decl_unavailable_warn;
+  if (!allowedForPkgCtx) {
+    auto diagID = diag::resilience_decl_unavailable;
+    if (downgradeToWarning == DowngradeToWarning::Yes)
+      diagID = diag::resilience_decl_unavailable_warn;
 
-  Context.Diags.diagnose(loc, diagID, D->getDescriptiveKind(), diagName,
-                         D->getFormalAccessScope().accessLevelForDiagnostics(),
-                         fragileKind.getSelector(), isAccessor);
+    AccessLevel diagAccessLevel = declAccessScope.accessLevelForDiagnostics();
+    Context.Diags.diagnose(loc, diagID, D, diagAccessLevel,
+                           fragileKind.getSelector());
 
-  if (fragileKind.allowUsableFromInline) {
-    Context.Diags.diagnose(D, diag::resilience_decl_declared_here,
-                           D->getDescriptiveKind(), diagName, isAccessor);
-  } else {
-    Context.Diags.diagnose(D, diag::resilience_decl_declared_here_public,
-                           D->getDescriptiveKind(), diagName, isAccessor);
+    Context.Diags.diagnose(D, diag::resilience_decl_declared_here, D, allowedForPkgCtx);
+  }
+
+  if (problematicImport.has_value() &&
+      problematicImport->accessLevel < D->getFormalAccess()) {
+    Context.Diags.diagnose(problematicImport->importLoc,
+                           diag::decl_import_via_here, D,
+                           problematicImport->accessLevel,
+                           problematicImport->module.importedModule);
   }
 
   return (downgradeToWarning == DowngradeToWarning::No);
@@ -115,41 +166,85 @@ static bool diagnoseTypeAliasDeclRefExportability(SourceLoc loc,
   if (!D)
     return false;
 
+  auto exportingModule = where.getDeclContext()->getParentModule();
+  ASTContext &ctx = exportingModule->getASTContext();
+
+  ImportAccessLevel problematicImport = D->getImportAccessFrom(
+                                                       where.getDeclContext());
+  if (problematicImport.has_value()) {
+    auto SF = where.getDeclContext()->getParentSourceFile();
+    if (SF) {
+      // The max used access level previously registered might be Package,
+      // in which case, don't reset it to Public here; this ensures proper
+      // diags between public and package.
+      if (SF->isMaxAccessLevelUsingImportInternal(problematicImport.value()))
+        SF->registerAccessLevelUsingImport(problematicImport.value(),
+                                           AccessLevel::Public);
+    }
+    if (ctx.LangOpts.EnableModuleApiImportRemarks) {
+      ModuleDecl *importedVia = problematicImport->module.importedModule,
+                 *sourceModule = D->getModuleContext();
+      ctx.Diags.diagnose(loc, diag::module_api_import_aliases,
+                             D, importedVia, sourceModule,
+                             importedVia == sourceModule);
+    }
+  }
+
   auto ignoredDowngradeToWarning = DowngradeToWarning::No;
   auto originKind =
       getDisallowedOriginKind(D, where, ignoredDowngradeToWarning);
   if (originKind == DisallowedOriginKind::None)
     return false;
 
-  auto definingModule = D->getModuleContext();
-  ASTContext &ctx = definingModule->getASTContext();
-  auto fragileKind = where.getFragileFunctionKind();
+  // As an exception, if the import of the module that defines the desugared
+  // decl is just missing (as opposed to imported explicitly with reduced
+  // visibility) then we should only diagnose if we're building a resilient
+  // module.
+  if (originKind == DisallowedOriginKind::MissingImport &&
+      !exportingModule->isResilient())
+    return false;
 
+  auto definingModule = D->getModuleContext();
+  auto fragileKind = where.getFragileFunctionKind();
+  bool warnPreSwift6 = originKind != DisallowedOriginKind::SPIOnly &&
+                       originKind != DisallowedOriginKind::PackageImport &&
+                       originKind != DisallowedOriginKind::InternalOrLessImport;
   if (fragileKind.kind == FragileFunctionKind::None) {
     auto reason = where.getExportabilityReason();
     ctx.Diags
         .diagnose(loc, diag::typealias_desugars_to_type_from_hidden_module,
-                  TAD->getName(), definingModule->getNameStr(), D->getNameStr(),
+                  TAD, definingModule->getNameStr(), D->getNameStr(),
                   static_cast<unsigned>(*reason), definingModule->getName(),
                   static_cast<unsigned>(originKind))
-        .warnUntilSwiftVersionIf(originKind != DisallowedOriginKind::SPIOnly,
-                                 6);
+        .warnUntilSwiftVersionIf(warnPreSwift6, 6);
   } else {
     ctx.Diags
         .diagnose(loc,
                   diag::inlinable_typealias_desugars_to_type_from_hidden_module,
-                  TAD->getName(), definingModule->getNameStr(), D->getNameStr(),
+                  TAD, definingModule->getNameStr(), D->getNameStr(),
                   fragileKind.getSelector(), definingModule->getName(),
                   static_cast<unsigned>(originKind))
-        .warnUntilSwiftVersionIf(originKind != DisallowedOriginKind::SPIOnly,
-                                 6);
+        .warnUntilSwiftVersionIf(warnPreSwift6, 6);
   }
   D->diagnose(diag::kind_declared_here, DescriptiveDeclKind::Type);
 
   if (originKind == DisallowedOriginKind::MissingImport &&
       !ctx.LangOpts.isSwiftVersionAtLeast(6))
-    ctx.Diags.diagnose(loc, diag::missing_import_inserted,
-                       definingModule->getName());
+    addMissingImport(loc, D, where);
+
+  // If limited by an import, note which one.
+  if (originKind == DisallowedOriginKind::InternalOrLessImport ||
+      originKind == DisallowedOriginKind::PackageImport) {
+    const DeclContext *DC = where.getDeclContext();
+    ImportAccessLevel limitImport = D->getImportAccessFrom(DC);
+    assert(limitImport.has_value() &&
+           limitImport->accessLevel < AccessLevel::Public &&
+           "The import should still be non-public");
+    ctx.Diags.diagnose(limitImport->importLoc,
+                       diag::decl_import_via_here, D,
+                       limitImport->accessLevel,
+                       limitImport->module.importedModule);
+  }
 
   return true;
 }
@@ -161,26 +256,82 @@ static bool diagnoseValueDeclRefExportability(SourceLoc loc, const ValueDecl *D,
   auto definingModule = D->getModuleContext();
   auto downgradeToWarning = DowngradeToWarning::No;
 
-  auto originKind = getDisallowedOriginKind(
-      D, where, downgradeToWarning);
+  auto reason = where.getExportabilityReason();
+  auto DC = where.getDeclContext();
+  ASTContext &ctx = DC->getASTContext();
+  auto originKind = getDisallowedOriginKind(D, where, downgradeToWarning);
+
+  // If we got here it was used in API, we can record the use of the import.
+  ImportAccessLevel import = D->getImportAccessFrom(DC);
+  if (import.has_value() && reason.has_value()) {
+    auto SF = DC->getParentSourceFile();
+    if (SF) {
+      // The max used access level previously registered might be Package,
+      // in which case, don't reset it to Public here; this ensures proper
+      // diags between public and package.
+      if (SF->isMaxAccessLevelUsingImportInternal(import.value()))
+        SF->registerAccessLevelUsingImport(import.value(),
+                                           AccessLevel::Public);
+    }
+  }
+
+  // Access levels from imports are reported with the others access levels.
+  // Except for extensions, we report them here.
+  if (originKind == DisallowedOriginKind::InternalOrLessImport ||
+      originKind == DisallowedOriginKind::PackageImport) {
+    if (reason != ExportabilityReason::ExtensionWithPublicMembers &&
+        reason != ExportabilityReason::ExtensionWithPackageMembers &&
+        reason != ExportabilityReason::ExtensionWithConditionalConformances &&
+        reason != ExportabilityReason::ExtensionWithPackageConditionalConformances)
+      return false;
+  }
+
+  if (ctx.LangOpts.EnableModuleApiImportRemarks &&
+      import.has_value() && where.isExported() &&
+      reason != ExportabilityReason::General &&
+      originKind != DisallowedOriginKind::InternalOrLessImport) {
+    // These may be reported twice, for the Type and for the TypeRepr.
+    ModuleDecl *importedVia = import->module.importedModule,
+               *sourceModule = D->getModuleContext();
+    ctx.Diags.diagnose(loc, diag::module_api_import,
+                       D, importedVia, sourceModule,
+                       importedVia == sourceModule,
+                       /*isImplicit*/false);
+  }
+
   if (originKind == DisallowedOriginKind::None)
     return false;
 
-  ASTContext &ctx = definingModule->getASTContext();
+  // No diags needed for extensions with package members or
+  // conformance to types with package access scope.
+  if (originKind == DisallowedOriginKind::PackageImport) {
+    if (reason == ExportabilityReason::ExtensionWithPackageMembers ||
+       reason == ExportabilityReason::ExtensionWithPackageConditionalConformances)
+    return false;
+  }
+
+  auto diagName = D->getName();
+  if (auto accessor = dyn_cast<AccessorDecl>(D)) {
+    // Only diagnose accessors if their disallowed origin kind differs from
+    // that of their storage.
+    if (getDisallowedOriginKind(accessor->getStorage(), where) == originKind)
+      return false;
+
+    // For accessors, diagnose with the name of the storage instead of the
+    // implicit '_'.
+    diagName = accessor->getStorage()->getName();
+  }
 
   auto fragileKind = where.getFragileFunctionKind();
-  auto reason = where.getExportabilityReason();
-
   if (fragileKind.kind == FragileFunctionKind::None) {
-    auto errorOrWarning = downgradeToWarning == DowngradeToWarning::Yes?
-                              diag::decl_from_hidden_module_warn:
-                              diag::decl_from_hidden_module;
-    ctx.Diags.diagnose(loc, errorOrWarning,
-                       D->getDescriptiveKind(),
-                       D->getName(),
+    DiagnosticBehavior limit = downgradeToWarning == DowngradeToWarning::Yes
+                             ? DiagnosticBehavior::Warning
+                             : DiagnosticBehavior::Unspecified;
+    ctx.Diags.diagnose(loc, diag::decl_from_hidden_module, D,
                        static_cast<unsigned>(*reason),
                        definingModule->getName(),
-                       static_cast<unsigned>(originKind));
+                       static_cast<unsigned>(originKind))
+        .limitBehavior(limit);
 
     D->diagnose(diag::kind_declared_here, DescriptiveDeclKind::Type);
   } else {
@@ -189,19 +340,28 @@ static bool diagnoseValueDeclRefExportability(SourceLoc loc, const ValueDecl *D,
     assert(downgradeToWarning == DowngradeToWarning::No ||
            originKind == DisallowedOriginKind::MissingImport &&
            "Only implicitly imported decls should be reported as a warning.");
-    auto errorOrWarning = downgradeToWarning == DowngradeToWarning::Yes?
-                              diag::inlinable_decl_ref_from_hidden_module_warn:
-                              diag::inlinable_decl_ref_from_hidden_module;
 
-    ctx.Diags.diagnose(loc, errorOrWarning,
-                       D->getDescriptiveKind(), D->getName(),
+    ctx.Diags.diagnose(loc, diag::inlinable_decl_ref_from_hidden_module, D,
                        fragileKind.getSelector(), definingModule->getName(),
-                       static_cast<unsigned>(originKind));
+                       static_cast<unsigned>(originKind))
+        .warnUntilSwiftVersionIf(downgradeToWarning == DowngradeToWarning::Yes,
+                                 6);
 
     if (originKind == DisallowedOriginKind::MissingImport &&
         downgradeToWarning == DowngradeToWarning::Yes)
-      ctx.Diags.diagnose(loc, diag::missing_import_inserted,
-                         definingModule->getName());
+      addMissingImport(loc, D, where);
+  }
+
+  // If limited by an import, note which one.
+  if (originKind == DisallowedOriginKind::InternalOrLessImport ||
+      originKind == DisallowedOriginKind::PackageImport) {
+    assert(import.has_value() &&
+           import->accessLevel < AccessLevel::Public &&
+           "The import should still be non-public");
+    ctx.Diags.diagnose(import->importLoc,
+                       diag::decl_import_via_here, D,
+                       import->accessLevel,
+                       import->module.importedModule);
   }
 
   return true;
@@ -210,11 +370,6 @@ static bool diagnoseValueDeclRefExportability(SourceLoc loc, const ValueDecl *D,
 bool TypeChecker::diagnoseDeclRefExportability(SourceLoc loc,
                                                const ValueDecl *D,
                                                const ExportContext &where) {
-  // Accessors cannot have exportability that's different than the storage,
-  // so skip them for now.
-  if (isa<AccessorDecl>(D))
-    return false;
-
   if (!where.mustOnlyReferenceExportedDecls())
     return false;
 
@@ -233,16 +388,42 @@ TypeChecker::diagnoseConformanceExportability(SourceLoc loc,
                                               const RootProtocolConformance *rootConf,
                                               const ExtensionDecl *ext,
                                               const ExportContext &where,
-                                              bool useConformanceAvailabilityErrorsOption) {
+                                              bool warnIfConformanceUnavailablePreSwift6) {
   if (!where.mustOnlyReferenceExportedDecls())
     return false;
 
-  auto originKind = getDisallowedOriginKind(ext, where);
-  if (originKind == DisallowedOriginKind::None)
+  // Skip the special Sendable and Copyable conformances we synthesized in
+  // ASTContext::getBuiltinTupleDecl().
+  if (ext->getParentModule()->isBuiltinModule())
     return false;
 
   ModuleDecl *M = ext->getParentModule();
   ASTContext &ctx = M->getASTContext();
+
+  ImportAccessLevel problematicImport = ext->getImportAccessFrom(where.getDeclContext());
+  if (problematicImport.has_value()) {
+    auto SF = where.getDeclContext()->getParentSourceFile();
+    if (SF) {
+      // The max used access level previously registered might be Package,
+      // in which case, don't reset it to Public here; this ensures proper
+      // diags between public and package.
+      if (SF->isMaxAccessLevelUsingImportInternal(problematicImport.value()))
+        SF->registerAccessLevelUsingImport(problematicImport.value(),
+                                           AccessLevel::Public);
+    }
+    if (ctx.LangOpts.EnableModuleApiImportRemarks) {
+      ModuleDecl *importedVia = problematicImport->module.importedModule,
+                 *sourceModule = ext->getModuleContext();
+      ctx.Diags.diagnose(loc, diag::module_api_import_conformance,
+                         rootConf->getType(), rootConf->getProtocol(),
+                         importedVia, sourceModule,
+                         importedVia == sourceModule);
+    }
+  }
+
+  auto originKind = getDisallowedOriginKind(ext, where);
+  if (originKind == DisallowedOriginKind::None)
+    return false;
 
   auto reason = where.getExportabilityReason();
   if (!reason.has_value())
@@ -254,15 +435,30 @@ TypeChecker::diagnoseConformanceExportability(SourceLoc loc,
                      static_cast<unsigned>(*reason),
                      M->getName(),
                      static_cast<unsigned>(originKind))
-      .warnUntilSwiftVersionIf((useConformanceAvailabilityErrorsOption &&
-                                !ctx.LangOpts.EnableConformanceAvailabilityErrors &&
-                                originKind != DisallowedOriginKind::SPIOnly) ||
+      .warnUntilSwiftVersionIf((warnIfConformanceUnavailablePreSwift6 &&
+                                originKind != DisallowedOriginKind::SPIOnly &&
+                                originKind != DisallowedOriginKind::PackageImport &&
+                                originKind != DisallowedOriginKind::InternalOrLessImport) ||
                                originKind == DisallowedOriginKind::MissingImport,
                                6);
 
-    if (originKind == DisallowedOriginKind::MissingImport &&
-        !ctx.LangOpts.isSwiftVersionAtLeast(6))
-      ctx.Diags.diagnose(loc, diag::missing_import_inserted,
-                         M->getName());
+  if (originKind == DisallowedOriginKind::MissingImport &&
+      !ctx.LangOpts.isSwiftVersionAtLeast(6))
+    addMissingImport(loc, ext, where);
+
+  // If limited by an import, note which one.
+  if (originKind == DisallowedOriginKind::InternalOrLessImport ||
+      originKind == DisallowedOriginKind::PackageImport) {
+    const DeclContext *DC = where.getDeclContext();
+    ImportAccessLevel limitImport = ext->getImportAccessFrom(DC);
+    assert(limitImport.has_value() &&
+           limitImport->accessLevel < AccessLevel::Public &&
+           "The import should still be non-public");
+    ctx.Diags.diagnose(limitImport->importLoc,
+                       diag::decl_import_via_here, ext,
+                       limitImport->accessLevel,
+                       limitImport->module.importedModule);
+  }
+
   return true;
 }

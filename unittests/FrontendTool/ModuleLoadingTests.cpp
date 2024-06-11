@@ -103,8 +103,10 @@ protected:
     ClangImporterOptions clangImpOpts;
     symbolgraphgen::SymbolGraphOptions symbolGraphOpts;
     SILOptions silOpts;
+    CASOptions casOpts;
     auto ctx = ASTContext::get(langOpts, typecheckOpts, silOpts, searchPathOpts,
-                               clangImpOpts, symbolGraphOpts, sourceMgr, diags);
+                               clangImpOpts, symbolGraphOpts, casOpts,
+                               sourceMgr, diags);
 
     ctx->addModuleInterfaceChecker(
       std::make_unique<ModuleInterfaceCheckerImpl>(*ctx, cacheDir,
@@ -126,7 +128,7 @@ protected:
     auto error =
       loader->findModuleFilesInDirectory({moduleName, SourceLoc()},
         SerializedModuleBaseName(tempDir, SerializedModuleBaseName("Library")),
-        /*ModuleInterfacePath*/nullptr,
+        /*ModuleInterfacePath=*/nullptr, /*ModuleInterfaceSourcePath=*/nullptr,
         &moduleBuffer, &moduleDocBuffer, &moduleSourceInfoBuffer,
         /*skipBuildingInterface*/ false, /*IsFramework*/false);
     ASSERT_FALSE(error);
@@ -149,7 +151,8 @@ protected:
 
     auto bufData = (*bufOrErr)->getBuffer();
     auto validationInfo = serialization::validateSerializedAST(
-        bufData, silOpts.EnableOSSAModules, /*requiredSDK*/StringRef());
+        bufData, silOpts.EnableOSSAModules,
+        /*requiredSDK*/StringRef());
     ASSERT_EQ(serialization::Status::Valid, validationInfo.status);
     ASSERT_EQ(bufData, moduleBuffer->getBuffer());
   }

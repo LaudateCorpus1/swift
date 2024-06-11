@@ -31,7 +31,7 @@ protocol Invalid5<Element, Element> {
 
 protocol Sequence<Element> {
   associatedtype Element
-  // expected-note@-1 2{{protocol requires nested type 'Element'; do you want to add it?}}
+  // expected-note@-1 2{{protocol requires nested type 'Element'; add nested type 'Element' for conformance}}
 }
 
 extension Sequence {
@@ -158,7 +158,7 @@ struct OpaqueTypes<E> {
   func returnSequenceOfIntBad() -> some Sequence<Int> {
     // expected-note@-1 {{opaque return type declared here}}
     return ConcreteSequence<E>()
-    // expected-error@-1 {{return type of instance method 'returnSequenceOfIntBad()' requires that 'E' conform to 'Int'}}
+    // expected-error@-1 {{return type of instance method 'returnSequenceOfIntBad()' requires the types 'E' and 'Int' be equivalent}}
   }
 
   // Invalid

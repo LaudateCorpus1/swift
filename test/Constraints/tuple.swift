@@ -74,7 +74,7 @@ var values = getIntFloat()
 func wantFloat(_: Float) {}
 wantFloat(values.float)
 
-var e : (x: Int..., y: Int) // expected-error{{variadic expansion 'Int' must contain at least one variadic generic parameter}}
+var e : (x: Int..., y: Int) // expected-error{{variadic parameter cannot appear outside of a function parameter list}}
 
 typealias Interval = (a:Int, b:Int)
 func takeInterval(_ x: Interval) {}
@@ -363,7 +363,7 @@ func testTupleLabelMismatchFuncConversion(fn1: @escaping ((x: Int, y: Int)) -> V
 }
 
 func testTupleLabelMismatchKeyPath() {
-  // Very Cursed.
+  // FIXME: The warning should be upgraded to an error for key paths.
   let _: KeyPath<(x: Int, y: Int), Int> = \(a: Int, b: Int).x
   // expected-warning@-1 {{tuple conversion from '(a: Int, b: Int)' to '(x: Int, y: Int)' mismatches labels}}
 }

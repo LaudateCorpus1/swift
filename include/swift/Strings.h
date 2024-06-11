@@ -24,14 +24,23 @@ constexpr static const StringLiteral STDLIB_NAME = "Swift";
 constexpr static const StringLiteral SWIFT_ONONE_SUPPORT = "SwiftOnoneSupport";
 /// The name of the Concurrency module, which supports that extension.
 constexpr static const StringLiteral SWIFT_CONCURRENCY_NAME = "_Concurrency";
+/// The name of the Concurrency Shims Clang module
+constexpr static const StringLiteral SWIFT_CONCURRENCY_SHIMS_NAME = "_SwiftConcurrencyShims";
+/// The unique ABI prefix that swift-syntax uses when it's built as part of the
+/// compiler.
+constexpr static const StringLiteral SWIFT_MODULE_ABI_NAME_PREFIX = "Compiler";
 /// The name of the Distributed module, which supports that extension.
 constexpr static const StringLiteral SWIFT_DISTRIBUTED_NAME = "Distributed";
 /// The name of the StringProcessing module, which supports that extension.
 constexpr static const StringLiteral SWIFT_STRING_PROCESSING_NAME = "_StringProcessing";
+/// The name of the Backtracing module, which supports that extension.
+constexpr static const StringLiteral SWIFT_BACKTRACING_NAME = "_Backtracing";
 /// The name of the SwiftShims module, which contains private stdlib decls.
 constexpr static const StringLiteral SWIFT_SHIMS_NAME = "SwiftShims";
 /// The name of the CxxShim module, which contains a cxx casting utility.
 constexpr static const StringLiteral CXX_SHIM_NAME = "CxxShim";
+/// The name of the Cxx module, which contains C++ interop helper protocols.
+constexpr static const StringLiteral CXX_MODULE_NAME = "Cxx";
 /// The name of the Builtin module, which contains Builtin functions.
 constexpr static const StringLiteral BUILTIN_NAME = "Builtin";
 /// The name of the clang imported header module.
@@ -56,8 +65,14 @@ constexpr static const StringLiteral SEMANTICS_PROGRAMTERMINATION_POINT =
 constexpr static const StringLiteral SEMANTICS_DEFAULT_ACTOR =
     "defaultActor";
 
+constexpr static const StringLiteral SEMANTICS_UNAVAILABLE_CODE_REACHED =
+    "unavailable_code_reached";
+
 constexpr static const StringLiteral DEFAULT_ACTOR_STORAGE_FIELD_NAME =
     "$defaultActor";
+
+constexpr static const StringLiteral NON_DEFAULT_DISTRIBUTED_ACTOR_STORAGE_FIELD_NAME =
+    "$nonDefaultDistributedActor";
 
 /// The name of the Builtin type prefix
 constexpr static const StringLiteral BUILTIN_TYPE_NAME_PREFIX = "Builtin.";
@@ -139,12 +154,15 @@ constexpr static BuiltinNameStringLiteral BUILTIN_TYPE_NAME_UNSAFEVALUEBUFFER =
 /// The name of the Builtin type for Job
 constexpr static BuiltinNameStringLiteral BUILTIN_TYPE_NAME_JOB = {
     "Builtin.Job"};
-/// The name of the Builtin type for ExecutorRef
+/// The name of the Builtin type for SerialExecutorRef
 constexpr static BuiltinNameStringLiteral BUILTIN_TYPE_NAME_EXECUTOR = {
     "Builtin.Executor"};
 /// The name of the Builtin type for DefaultActorStorage
 constexpr static BuiltinNameStringLiteral BUILTIN_TYPE_NAME_DEFAULTACTORSTORAGE = {
     "Builtin.DefaultActorStorage"};
+/// The name of the Builtin type for NonDefaultDistributedActorStorage
+constexpr static BuiltinNameStringLiteral BUILTIN_TYPE_NAME_NONDEFAULTDISTRIBUTEDACTORSTORAGE = {
+    "Builtin.NonDefaultDistributedActorStorage"};
 /// The name of the Builtin type for UnknownObject
 ///
 /// This no longer exists as an AST-accessible type, but it's still used for
@@ -160,6 +178,9 @@ constexpr static BuiltinNameStringLiteral BUILTIN_TYPE_NAME_SILTOKEN = {
 /// The name of the Builtin type for Word
 constexpr static BuiltinNameStringLiteral BUILTIN_TYPE_NAME_WORD = {
     "Builtin.Word"};
+/// The name of the Builtin type for PackIndex
+constexpr static BuiltinNameStringLiteral BUILTIN_TYPE_NAME_PACKINDEX = {
+    "Builtin.PackIndex"};
 
 } // end namespace swift
 

@@ -96,27 +96,19 @@ func testExistentialDispatch(p: P) {
 
 // CHECK:   [[PCOPY_ADDR:%[0-9]+]] = open_existential_addr immutable_access [[P]] : $*any P to $*@opened([[N:".*"]], any P) Self
 // CHECK:   [[P_RESULT:%[0-9]+]] = alloc_stack $any P
-// CHECK:   [[PCOPY_ADDR_1:%[0-9]+]] = alloc_stack $@opened([[N]], any P) Self
-// CHECK:   copy_addr [[PCOPY_ADDR]] to [init] [[PCOPY_ADDR_1]] : $*@opened([[N]], any P) Self
 // CHECK:   [[P_P_GETTER:%[0-9]+]] = witness_method $@opened([[N]], any P) Self, #P.p!getter : {{.*}}, [[PCOPY_ADDR]]{{.*}} : $@convention(witness_method: P) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> @out τ_0_0
 // CHECK:   [[P_RESULT_ADDR2:%[0-9]+]] = init_existential_addr [[P_RESULT]] : $*any P, $@opened([[N]], any P) Self
-// CHECK:   apply [[P_P_GETTER]]<@opened([[N]], any P) Self>([[P_RESULT_ADDR2]], [[PCOPY_ADDR_1]]) : $@convention(witness_method: P) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> @out τ_0_0
-// CHECK:   destroy_addr [[PCOPY_ADDR_1]] : $*@opened([[N]], any P) Self
+// CHECK:   apply [[P_P_GETTER]]<@opened([[N]], any P) Self>([[P_RESULT_ADDR2]], [[PCOPY_ADDR]]) : $@convention(witness_method: P) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> @out τ_0_0
 // CHECK:   destroy_addr [[P_RESULT]] : $*any P
-// CHECK:   dealloc_stack [[PCOPY_ADDR_1]] : $*@opened([[N]], any P) Self
 // CHECK:   dealloc_stack [[P_RESULT]] : $*any P
   _ = p.p
 
 // CHECK:   [[PCOPY_ADDR:%[0-9]+]] = open_existential_addr immutable_access [[P]] : $*any P to $*@opened([[N:".*"]], any P) Self
 // CHECK:   [[P_RESULT:%[0-9]+]] = alloc_stack $any P
-// CHECK:   [[PCOPY_ADDR_1:%[0-9]+]] = alloc_stack $@opened([[N]], any P) Self
-// CHECK:   copy_addr [[PCOPY_ADDR]] to [init] [[PCOPY_ADDR_1]] : $*@opened([[N]], any P) Self
 // CHECK:   [[P_SUBSCRIPT_GETTER:%[0-9]+]] = witness_method $@opened([[N]], any P) Self, #P.subscript!getter : {{.*}}, [[PCOPY_ADDR]]{{.*}} : $@convention(witness_method: P) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> @out τ_0_0
 // CHECK:   [[P_RESULT_ADDR:%[0-9]+]] = init_existential_addr [[P_RESULT]] : $*any P, $@opened([[N]], any P) Self
-// CHECK:   apply [[P_SUBSCRIPT_GETTER]]<@opened([[N]], any P) Self>([[P_RESULT_ADDR]], [[PCOPY_ADDR_1]]) : $@convention(witness_method: P) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> @out τ_0_0
-// CHECK:   destroy_addr [[PCOPY_ADDR_1]] : $*@opened([[N]], any P) Self
+// CHECK:   apply [[P_SUBSCRIPT_GETTER]]<@opened([[N]], any P) Self>([[P_RESULT_ADDR]], [[PCOPY_ADDR]]) : $@convention(witness_method: P) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> @out τ_0_0
 // CHECK:   destroy_addr [[P_RESULT]] : $*any P
-// CHECK:   dealloc_stack [[PCOPY_ADDR_1]] : $*@opened([[N]], any P) Self
 // CHECK:   dealloc_stack [[P_RESULT]] : $*any P
   _ = p[]
 }
@@ -246,7 +238,7 @@ class Z {
     // so that IRGen can recover metadata.
 
     // CHECK:      [[WEAK_SELF:%.*]] = alloc_box ${ var @sil_weak Optional<Z> }
-    // CHECK:      [[WEAK_SELF_LIFETIME:%.*]] = begin_borrow [lexical] [[WEAK_SELF]]
+    // CHECK:      [[WEAK_SELF_LIFETIME:%.*]] = begin_borrow [lexical] [var_decl] [[WEAK_SELF]]
     // CHECK:      [[FN:%.*]] = function_ref @$s12dynamic_self1ZC23testDynamicSelfCaptures1xACXDSi_tFyycfU1_ : $@convention(thin) (@guaranteed { var @sil_weak Optional<Z> }, @thick @dynamic_self Z.Type) -> ()
     // CHECK:      [[WEAK_SELF_COPY:%.*]] = copy_value [[WEAK_SELF_LIFETIME]] : ${ var @sil_weak Optional<Z> }
     // CHECK-NEXT: [[DYNAMIC_SELF:%.*]] = metatype $@thick @dynamic_self Z.Type
@@ -479,10 +471,10 @@ public extension EmptyProtocol {
 func doEscaping<T>(_: @escaping (T) -> ()) {}
 
 public class FunctionConversionTest : EmptyProtocol {
-  // CHECK-LABEL: sil hidden [ossa] @$s12dynamic_self22FunctionConversionTestC07convertC0yACXDyypXEF : $@convention(method) (@noescape @callee_guaranteed (@in_guaranteed Any) -> (), @guaranteed FunctionConversionTest) -> @owned FunctionConversionTest {
+  // CHECK-LABEL: sil hidden [ossa] @$s12dynamic_self22FunctionConversionTestC07convertC0yACXDyypXEF :
   func convertFunction(_ fn: (Any) -> ()) -> Self {
     // The reabstraction thunk captures a self metatype here:
-    // CHECK: function_ref @$s12dynamic_self22FunctionConversionTestCIgg_ACIegn_ACXMTTy : $@convention(thin) (@in_guaranteed FunctionConversionTest, @noescape @callee_guaranteed (@guaranteed FunctionConversionTest) -> (), @thick FunctionConversionTest.Type) -> ()
+    // CHECK: function_ref @$s12dynamic_self22FunctionConversionTestCIgg_ACIegn_ACXMTTy : $@convention(thin) ({{.*}}, @thick FunctionConversionTest.Type) -> ()
     run(fn)
     return self
   }
@@ -524,9 +516,9 @@ final class Final {
   static func useSelf(_ body: (Self) -> ()) {}
 }
 
-// CHECK-LABEL: sil hidden [ossa] @$s12dynamic_self13testNoErasureyyyAA5FinalCXEF : $@convention(thin) (@noescape @callee_guaranteed (@guaranteed Final) -> ()) -> () {
+// CHECK-LABEL: sil hidden [ossa] @$s12dynamic_self13testNoErasureyyyAA5FinalCXEF :
 func testNoErasure(_ body: (Final) -> ()) {
-  // CHECK: function_ref @$s12dynamic_self5FinalC7useSelfyyyACXDXEFZ : $@convention(method) (@noescape @callee_guaranteed (@guaranteed Final) -> (), @thick Final.Type) -> ()
+  // CHECK: function_ref @$s12dynamic_self5FinalC7useSelfyyyACXDXEFZ :
   return Final.useSelf(body)
 }
 

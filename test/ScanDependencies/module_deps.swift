@@ -3,10 +3,10 @@
 
 // RUN: %target-swift-frontend -scan-dependencies -module-cache-path %t/clang-module-cache %s -o %t/deps.json -I %S/Inputs/CHeaders -I %S/Inputs/Swift -emit-dependencies -emit-dependencies-path %t/deps.d -import-objc-header %S/Inputs/CHeaders/Bridging.h -swift-version 4
 // Check the contents of the JSON output
-// RUN: %FileCheck -check-prefix CHECK_NO_CLANG_TARGET %s < %t/deps.json
+// RUN: %validate-json %t/deps.json | %FileCheck -check-prefix CHECK_NO_CLANG_TARGET %s
 
 // Check the contents of the JSON output
-// RUN: %FileCheck %s -check-prefix CHECK-NO-SEARCH-PATHS < %t/deps.json
+// RUN: %validate-json %t/deps.json | %FileCheck %s -check-prefix CHECK-NO-SEARCH-PATHS
 
 // Check the make-style dependencies file
 // RUN: %FileCheck %s -check-prefix CHECK-MAKE-DEPS < %t/deps.d
@@ -22,12 +22,12 @@
 
 // Ensure that round-trip serialization does not affect result
 // RUN: %target-swift-frontend -scan-dependencies -test-dependency-scan-cache-serialization -module-cache-path %t/clang-module-cache %s -o %t/deps.json -I %S/Inputs/CHeaders -I %S/Inputs/Swift -import-objc-header %S/Inputs/CHeaders/Bridging.h -swift-version 4
-// RUN: %FileCheck -check-prefix CHECK_NO_CLANG_TARGET %s < %t/deps.json
+// RUN: %validate-json %t/deps.json | %FileCheck -check-prefix CHECK_NO_CLANG_TARGET %s
 
 // Ensure that scanning with `-clang-target` makes sure that Swift modules' respective PCM-dependency-build-argument sets do not contain target triples.
 // RUN: %target-swift-frontend -scan-dependencies -module-cache-path %t/clang-module-cache %s -o %t/deps_clang_target.json -I %S/Inputs/CHeaders -I %S/Inputs/Swift -import-objc-header %S/Inputs/CHeaders/Bridging.h -swift-version 4 -clang-target %target-cpu-apple-macosx10.14
 // Check the contents of the JSON output
-// RUN: %FileCheck -check-prefix CHECK_CLANG_TARGET %s < %t/deps_clang_target.json
+// RUN: %validate-json %t/deps_clang_target.json | %FileCheck -check-prefix CHECK_CLANG_TARGET %s
 
 // REQUIRES: executable_test
 // REQUIRES: objc_interop
@@ -45,38 +45,19 @@ import SubE
 // CHECK-NEXT: module_deps.swift
 // CHECK-NEXT: ],
 // CHECK-NEXT: "directDependencies": [
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "A"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "clang": "C"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "E"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "F"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "G"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "SubE"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "Swift"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "SwiftOnoneSupport"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "_Concurrency"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "_cross_import_E"
-// CHECK-NEXT:   }
-// CHECK-NEXT: ],
+// CHECK-DAG:     "swift": "A"
+// CHECK-DAG:     "clang": "C"
+// CHECK-DAG:     "swift": "E"
+// CHECK-DAG:     "swift": "F"
+// CHECK-DAG:     "swift": "G"
+// CHECK-DAG:     "swift": "SubE"
+// CHECK-DAG:     "swift": "Swift"
+// CHECK-DAG:     "swift": "SwiftOnoneSupport"
+// CHECK-DAG:     "swift": "_Concurrency"
+// CHECK-DAG:     "swift": "_cross_import_E"
+// CHECK: ],
 
+// CHECK:      "contextHash":
 // CHECK:      "extraPcmArgs": [
 // CHECK-NEXT:    "-Xcc",
 // CHECK-NEXT:    "-target",
@@ -100,10 +81,8 @@ import SubE
 
 // CHECK: directDependencies
 // CHECK-NEXT: {
-// CHECK-NEXT:   "clang": "A"
-// CHECK-NEXT: }
-// CHECK-NEXT: {
-// CHECK-NEXT:   "swift": "Swift"
+// CHECK-DAG:   "clang": "A"
+// CHECK-DAG:   "swift": "Swift"
 // CHECK-NEXT: },
 
 /// --------Clang module C
@@ -125,7 +104,7 @@ import SubE
 
 // CHECK: "commandLine": [
 // CHECK-NEXT: "-frontend"
-// CHECK-NEXT: "-only-use-extra-clang-opts"
+// CHECK: "-direct-clang-cc1-module-build"
 // CHECK-NOT:  "BUILD_DIR/bin/clang"
 // CHECK:      "-Xcc"
 // CHECK-NEXT: "-resource-dir"
@@ -159,13 +138,9 @@ import SubE
 // CHECK-NEXT: ],
 // CHECK-NEXT: "directDependencies": [
 // CHECK-NEXT:   {
-// CHECK-NEXT:     "clang": "F"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "Swift"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "SwiftOnoneSupport"
+// CHECK-DAG:     "clang": "F"
+// CHECK-DAG:     "swift": "Swift"
+// CHECK-DAG:     "swift": "SwiftOnoneSupport"
 // CHECK-NEXT:   }
 // CHECK-NEXT: ],
 
@@ -173,15 +148,10 @@ import SubE
 // CHECK-LABEL: "modulePath": "{{.*}}{{/|\\}}G-{{.*}}.swiftmodule"
 // CHECK: "directDependencies"
 // CHECK-NEXT: {
-// CHECK-NEXT:   "clang": "G"
-// CHECK-NEXT: },
-// CHECK-NEXT: {
-// CHECK-NEXT:   "swift": "Swift"
-// CHECK-NEXT: },
-// CHECK-NEXT: {
-// CHECK-NEXT:   "swift": "SwiftOnoneSupport"
-// CHECK-NEXT: }
-// CHECK-NEXT: ],
+// CHECK-DAG:   "clang": "G"
+// CHECK-DAG:   "swift": "Swift"
+// CHECK-DAG:   "swift": "SwiftOnoneSupport"
+// CHECK: ],
 // CHECK-NEXT: "details": {
 
 // CHECK: "contextHash": "{{.*}}",

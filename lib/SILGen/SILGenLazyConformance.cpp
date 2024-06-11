@@ -9,11 +9,19 @@
 // See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
+//
+//  This file forces emission of lazily-generated ClangImporter-synthesized
+//  conformances.
+//
+//===----------------------------------------------------------------------===//
 
 #include "SILGen.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/PackConformance.h"
 #include "swift/AST/ProtocolConformance.h"
+#include "swift/AST/ProtocolConformanceRef.h"
 #include "swift/ClangImporter/ClangModule.h"
+#include "swift/SIL/FormalLinkage.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILVisitor.h"
 
@@ -30,6 +38,16 @@ void SILGenModule::useConformance(ProtocolConformanceRef conformanceRef) {
   // We don't need to emit dependent conformances.
   if (conformanceRef.isAbstract())
     return;
+
+  // Recursively visit pack conformances.
+  if (conformanceRef.isPack()) {
+    auto *packConformance = conformanceRef.getPack();
+
+    for (auto patternConformanceRef : packConformance->getPatternConformances())
+      useConformance(patternConformanceRef);
+
+    return;
+  }
 
   auto conformance = conformanceRef.getConcrete();
 
@@ -49,10 +67,9 @@ void SILGenModule::useConformance(ProtocolConformanceRef conformanceRef) {
   if (normal == nullptr)
     return;
 
-  // If this conformance was not synthesized by the ClangImporter, we're not
-  // going to be emitting it lazily either, so we can avoid doing anything
-  // below.
-  if (!isa<ClangModuleUnit>(normal->getDeclContext()->getModuleScopeContext()))
+  // If this conformance was not synthesized, we're not going to be emitting
+  // it lazily either, so we can avoid doing anything below.
+  if (!normal->isSynthesized())
     return;
 
   // If we already emitted this witness table, we don't need to track the fact

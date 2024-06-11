@@ -32,7 +32,7 @@ ambiguousWithVar(true)   // no-warning
 
 var localVar : Bool
 localVar = false
-localVar = 42 // expected-error {{type 'Int' cannot be used as a boolean; test for '!= 0' instead}}
+localVar = 42 // expected-error {{cannot assign value of type 'Int' to type 'Bool'}}
 localVar(42)  // expected-error {{cannot call value of non-function type 'Bool'}}
 var _ : localVar // should still work
 
@@ -60,7 +60,7 @@ extension HasFooSub {
 func testHasFooSub(_ hfs: HasFooSub) -> Int {
   // CHECK: return_stmt
   // CHECK-NOT: func_decl
-  // CHECK: member_ref_expr{{.*}}decl=overload_vars.(file).HasFoo.foo
+  // CHECK: member_ref_expr{{.*}}decl="overload_vars.(file).HasFoo.foo
   return hfs.foo
 }
 
@@ -72,7 +72,7 @@ extension HasBar {
 func testHasBar(_ hb: HasBar) -> Int {
   // CHECK: return_stmt
   // CHECK-NOT: func_decl
-  // CHECK: member_ref_expr{{.*}}decl=overload_vars.(file).HasBar.bar
+  // CHECK: member_ref_expr{{.*}}decl="overload_vars.(file).HasBar.bar
   return hb.bar
 }
 

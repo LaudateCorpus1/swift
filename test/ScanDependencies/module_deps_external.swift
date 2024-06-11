@@ -10,10 +10,10 @@
 // RUN: echo "\"isFramework\": false" >> %/t/inputs/map.json
 // RUN: echo "}]" >> %/t/inputs/map.json
 
-// RUN: %target-swift-frontend -scan-dependencies -module-cache-path %t/clang-module-cache %s -placeholder-dependency-module-map-file %t/inputs/map.json -o %t/deps.json -I %S/Inputs/CHeaders -I %S/Inputs/Swift -emit-dependencies -emit-dependencies-path %t/deps.d -import-objc-header %S/Inputs/CHeaders/Bridging.h -swift-version 4
+// RUN: %target-swift-frontend -scan-dependencies -module-load-mode prefer-interface -module-cache-path %t/clang-module-cache %s -placeholder-dependency-module-map-file %t/inputs/map.json -o %t/deps.json -I %S/Inputs/CHeaders -I %S/Inputs/Swift -emit-dependencies -emit-dependencies-path %t/deps.d -import-objc-header %S/Inputs/CHeaders/Bridging.h -swift-version 4
 
 // Check the contents of the JSON output
-// RUN: %FileCheck %s < %t/deps.json
+// RUN: %validate-json %t/deps.json | %FileCheck %s
 
 // Check the make-style dependencies file
 // RUN: %FileCheck %s -check-prefix CHECK-MAKE-DEPS < %t/deps.d
@@ -28,8 +28,8 @@
 // RUN: %target-run %t/main %t/deps.json
 
 // Ensure that round-trip serialization does not affect result
-// RUN: %target-swift-frontend -scan-dependencies -test-dependency-scan-cache-serialization -module-cache-path %t/clang-module-cache %s -placeholder-dependency-module-map-file %t/inputs/map.json -o %t/deps.json -I %S/Inputs/CHeaders -I %S/Inputs/Swift -import-objc-header %S/Inputs/CHeaders/Bridging.h -swift-version 4
-// RUN: %FileCheck %s < %t/deps.json
+// RUN: %target-swift-frontend -scan-dependencies -module-load-mode prefer-interface -test-dependency-scan-cache-serialization -module-cache-path %t/clang-module-cache %s -placeholder-dependency-module-map-file %t/inputs/map.json -o %t/deps.json -I %S/Inputs/CHeaders -I %S/Inputs/Swift -import-objc-header %S/Inputs/CHeaders/Bridging.h -swift-version 4
+// RUN: %validate-json %t/deps.json | %FileCheck %s
 
 // REQUIRES: executable_test
 // REQUIRES: objc_interop
@@ -44,30 +44,14 @@ import SomeExternalModule
 
 // CHECK: directDependencies
 // CHECK-NEXT: {
-// CHECK-NEXT: "swift": "F"
-// CHECK-NEXT: }
-// CHECK-NEXT: {
-// CHECK-NEXT: "swiftPlaceholder": "SomeExternalModule"
-// CHECK-NEXT: }
-// CHECK-NEXT: {
-// CHECK-NEXT: "swift": "Swift"
-// CHECK-NEXT: }
-// CHECK-NEXT: {
-// CHECK-NEXT: "swift": "SwiftOnoneSupport"
-// CHECK-NEXT: },
-// CHECK-NEXT: {
-// CHECK-NEXT: "swift": "_Concurrency"
-// CHECK-NEXT: },
-// CHECK-NEXT: {
-// CHECK-NEXT: "swift": "_StringProcessing"
-// CHECK-NEXT: }
-// CHECK-NEXT: ],
-
-// CHECK:      "extraPcmArgs": [
-// CHECK-NEXT:    "-Xcc",
-// CHECK-NEXT:    "-target",
-// CHECK-NEXT:    "-Xcc",
-// CHECK:         "-fapinotes-swift-version=4"
+// CHECK-DAG: "clang": "F"
+// CHECK-DAG: "swiftPlaceholder": "SomeExternalModule"
+// CHECK-DAG: "swift": "Swift"
+// CHECK-DAG: "swift": "SwiftOnoneSupport"
+// CHECK-DAG: "swift": "_Concurrency"
+// CHECK-DAG: "swift": "_StringProcessing"
+// CHECK-DAG: "clang": "_SwiftConcurrencyShims"
+// CHECK: ],
 
 // CHECK: "bridgingHeader":
 // CHECK-NEXT: "path":
@@ -77,9 +61,21 @@ import SomeExternalModule
 // CHECK-NEXT: Bridging.h
 // CHECK-NEXT: BridgingOther.h
 
-// CHECK: "moduleDependencies": [
-// CHECK-NEXT: "F"
-// CHECK-NEXT: ]
+// CHECK:       "moduleDependencies": [
+// CHECK-NEXT:     "F"
+// CHECK-NEXT:  ],
+
+// CHECK:       "swiftOverlayDependencies": [
+// CHECK-NEXT:    {
+// CHECK-NEXT:      "swift": "F"
+// CHECK-NEXT:    }
+// CHECK-NEXT:  ]
+
+// CHECK:      "extraPcmArgs": [
+// CHECK-NEXT:    "-Xcc",
+// CHECK-NEXT:    "-target",
+// CHECK-NEXT:    "-Xcc",
+// CHECK:         "-fapinotes-swift-version=4"
 
 /// --------Swift external module SomeExternalModule
 // CHECK-LABEL: "modulePath": "{{.*}}{{/|\\}}SomeExternalModule.swiftmodule",
@@ -103,3 +99,4 @@ import SomeExternalModule
 // CHECK-MAKE-DEPS-SAME: Bridging.h
 // CHECK-MAKE-DEPS-SAME: BridgingOther.h
 // CHECK-MAKE-DEPS-SAME: module.modulemap
+

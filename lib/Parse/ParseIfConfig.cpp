@@ -32,13 +32,13 @@ using namespace swift;
 namespace {
 
 /// Get PlatformConditionKind from platform condition name.
-static
-Optional<PlatformConditionKind> getPlatformConditionKind(StringRef Name) {
-  return llvm::StringSwitch<Optional<PlatformConditionKind>>(Name)
+static std::optional<PlatformConditionKind>
+getPlatformConditionKind(StringRef Name) {
+  return llvm::StringSwitch<std::optional<PlatformConditionKind>>(Name)
 #define PLATFORM_CONDITION(LABEL, IDENTIFIER) \
     .Case(IDENTIFIER, PlatformConditionKind::LABEL)
 #include "swift/AST/PlatformConditionKinds.def"
-    .Default(None);
+      .Default(std::nullopt);
 }
 
 /// Get platform condition name from PlatformConditionKind.
@@ -58,8 +58,8 @@ static StringRef extractExprSource(SourceManager &SM, Expr *E) {
   return SM.extractText(Range);
 }
 
-static bool isValidPrefixUnaryOperator(Optional<StringRef> UnaryOperator) {
-  return UnaryOperator != None &&
+static bool isValidPrefixUnaryOperator(std::optional<StringRef> UnaryOperator) {
+  return UnaryOperator != std::nullopt &&
          (UnaryOperator.value() == ">=" || UnaryOperator.value() == "<");
 }
 
@@ -164,13 +164,13 @@ class ValidateIfConfigCondition :
   bool HasError;
 
   /// Get the identifier string of the UnresolvedDeclRefExpr.
-  Optional<StringRef> getDeclRefStr(Expr *E, DeclRefKind Kind) {
+  std::optional<StringRef> getDeclRefStr(Expr *E, DeclRefKind Kind) {
     auto UDRE = dyn_cast<UnresolvedDeclRefExpr>(E);
     if (!UDRE ||
         !UDRE->hasName() ||
         UDRE->getRefKind() != Kind ||
         UDRE->getName().isCompoundName())
-      return None;
+      return std::nullopt;
 
     return UDRE->getName().getBaseIdentifier().str();
   }
@@ -197,7 +197,7 @@ class ValidateIfConfigCondition :
   Expr *foldSequence(Expr *LHS, ArrayRef<Expr*> &S, bool isRecurse = false) {
     assert(!S.empty() && ((S.size() & 1) == 0));
 
-    auto getNextOperator = [&]() -> Optional<StringRef> {
+    auto getNextOperator = [&]() -> std::optional<StringRef> {
       assert((S.size() & 1) == 0);
       while (!S.empty()) {
         auto Name = getDeclRefStr(S[0], DeclRefKind::BinaryOperator);
@@ -212,7 +212,7 @@ class ValidateIfConfigCondition :
         // Consume invalid operator and the immediate RHS.
         S = S.slice(2);
       }
-      return None;
+      return std::nullopt;
     };
 
     // Extract out the first operator name.
@@ -299,10 +299,13 @@ public:
       if (E->getArgs()->empty()) {
         D.diagnose(E->getLoc(), diag::platform_condition_expected_argument);
       } else {
-        D.diagnose(E->getLoc(), diag::platform_condition_expected_one_argument);
+        SourceLoc DiagLoc = E->getArgs()->front().getStartLoc();
+        assert(DiagLoc.isValid() && "parsed Argument should have a location");
+        D.diagnose(DiagLoc, diag::platform_condition_expected_one_argument);
       }
       return nullptr;
     }
+    SourceLoc ArgLoc = Arg->getStartLoc();
     // '_compiler_version' '(' string-literal ')'
     if (*KindName == "_compiler_version") {
       if (auto SLE = dyn_cast<StringLiteralExpr>(Arg)) {
@@ -326,11 +329,12 @@ public:
     if (*KindName == "swift" || *KindName == "compiler" ||
         *KindName == "_compiler_version") {
       auto PUE = dyn_cast<PrefixUnaryExpr>(Arg);
-      Optional<StringRef> PrefixName =
-          PUE ? getDeclRefStr(PUE->getFn(), DeclRefKind::PrefixOperator) : None;
+      std::optional<StringRef> PrefixName =
+          PUE ? getDeclRefStr(PUE->getFn(), DeclRefKind::PrefixOperator)
+              : std::nullopt;
       if (!isValidPrefixUnaryOperator(PrefixName)) {
         D.diagnose(
-            Arg->getLoc(), diag::unsupported_platform_condition_argument,
+            ArgLoc, diag::unsupported_platform_condition_argument,
             "a unary comparison '>=' or '<'; for example, '>=2.2' or '<2.2'");
         return nullptr;
       }
@@ -351,7 +355,7 @@ public:
       }
 
       if (!isModulePath(Arg)) {
-        D.diagnose(E->getLoc(), diag::unsupported_platform_condition_argument,
+        D.diagnose(ArgLoc, diag::unsupported_platform_condition_argument,
                    "module name");
         return nullptr;
       }
@@ -360,7 +364,7 @@ public:
 
     if (*KindName == "hasFeature") {
       if (!getDeclRefStr(Arg, DeclRefKind::Ordinary)) {
-        D.diagnose(E->getLoc(), diag::unsupported_platform_condition_argument,
+        D.diagnose(ArgLoc, diag::unsupported_platform_condition_argument,
                    "feature name");
         return nullptr;
       }
@@ -370,7 +374,7 @@ public:
 
     if (*KindName == "hasAttribute") {
       if (!getDeclRefStr(Arg, DeclRefKind::Ordinary)) {
-        D.diagnose(E->getLoc(), diag::unsupported_platform_condition_argument,
+        D.diagnose(ArgLoc, diag::unsupported_platform_condition_argument,
                    "attribute name");
         return nullptr;
       }
@@ -378,7 +382,7 @@ public:
       return E;
     }
 
-    // ( 'os' | 'arch' | '_endian' | '_runtime' ) '(' identifier ')''
+    // ( 'os' | 'arch' | '_endian' | '_pointerBitWidth' | '_runtime' | '_hasAtomicBitWidth' ) '(' identifier ')''
     auto Kind = getPlatformConditionKind(*KindName);
     if (!Kind.has_value()) {
       D.diagnose(E->getLoc(), diag::unsupported_platform_condition_expression);
@@ -387,7 +391,7 @@ public:
 
     auto ArgStr = getDeclRefStr(Arg, DeclRefKind::Ordinary);
     if (!ArgStr.has_value()) {
-      D.diagnose(E->getLoc(), diag::unsupported_platform_condition_argument,
+      D.diagnose(ArgLoc, diag::unsupported_platform_condition_argument,
                  "identifier");
       return nullptr;
     }
@@ -398,7 +402,7 @@ public:
                                                       suggestedKind, suggestedValues)) {
       if (Kind == PlatformConditionKind::Runtime) {
         // Error for _runtime()
-        D.diagnose(Arg->getLoc(),
+        D.diagnose(ArgLoc,
                    diag::unsupported_platform_runtime_condition_argument);
         return nullptr;
       }
@@ -412,36 +416,38 @@ public:
         DiagName = "architecture"; break;
       case PlatformConditionKind::Endianness:
         DiagName = "endianness"; break;
+      case PlatformConditionKind::PointerBitWidth:
+        DiagName = "pointer bit width"; break;
       case PlatformConditionKind::CanImport:
         DiagName = "import conditional"; break;
       case PlatformConditionKind::TargetEnvironment:
         DiagName = "target environment"; break;
       case PlatformConditionKind::PtrAuth:
         DiagName = "pointer authentication scheme"; break;
+      case PlatformConditionKind::HasAtomicBitWidth:
+        DiagName = "has atomic bit width"; break;
       case PlatformConditionKind::Runtime:
         llvm_unreachable("handled above");
       }
-      auto Loc = Arg->getLoc();
-      D.diagnose(Loc, diag::unknown_platform_condition_argument,
-                 DiagName, *KindName);
+      D.diagnose(ArgLoc, diag::unknown_platform_condition_argument, DiagName,
+                 *KindName);
       if (suggestedKind != *Kind) {
         auto suggestedKindName = getPlatformConditionName(suggestedKind);
-        D.diagnose(Loc, diag::note_typo_candidate, suggestedKindName)
-          .fixItReplace(E->getFn()->getSourceRange(), suggestedKindName);
+        D.diagnose(ArgLoc, diag::note_typo_candidate, suggestedKindName)
+            .fixItReplace(E->getFn()->getSourceRange(), suggestedKindName);
       }
       for (auto suggestion : suggestedValues)
-        D.diagnose(Loc, diag::note_typo_candidate, suggestion)
-          .fixItReplace(Arg->getSourceRange(), suggestion);
+        D.diagnose(ArgLoc, diag::note_typo_candidate, suggestion)
+            .fixItReplace(Arg->getSourceRange(), suggestion);
     }
     else if (!suggestedValues.empty()) {
       // The value the user gave has been replaced by something newer.
       assert(suggestedValues.size() == 1 && "only support one replacement");
       auto replacement = suggestedValues.front();
 
-      auto Loc = Arg->getLoc();
-      D.diagnose(Loc, diag::renamed_platform_condition_argument,
-                 *ArgStr, replacement)
-        .fixItReplace(Arg->getSourceRange(), replacement);
+      D.diagnose(ArgLoc, diag::renamed_platform_condition_argument, *ArgStr,
+                 replacement)
+          .fixItReplace(Arg->getSourceRange(), replacement);
     }
 
     return E;
@@ -550,20 +556,13 @@ public:
 
   bool visitUnresolvedDeclRefExpr(UnresolvedDeclRefExpr *E) {
     auto Name = getDeclRefStr(E);
+    if (Name.empty())
+      return false;
 
-    // Check whether this is any one of the known compiler features.
-    const auto &langOpts = Ctx.LangOpts;
-    bool isKnownFeature = llvm::StringSwitch<bool>(Name)
-#define LANGUAGE_FEATURE(FeatureName, SENumber, Description, Option) \
-        .Case("$" #FeatureName, Option)
-#define UPCOMING_FEATURE(FeatureName, SENumber, Version)
-#include "swift/Basic/Features.def"
-        .Default(false);
-
-    if (isKnownFeature)
+    if (Name.starts_with("$") && Ctx.LangOpts.hasFeature(Name.drop_front()))
       return true;
-    
-    return langOpts.isCustomConditionalCompilationFlagSet(Name);
+
+    return Ctx.LangOpts.isCustomConditionalCompilationFlagSet(Name);
   }
 
   bool visitCallExpr(CallExpr *E) {
@@ -785,7 +784,8 @@ Result Parser::parseIfConfigRaw(
       SourceMgr.getIDEInspectionTargetBufferID() == L->getBufferID() &&
       SourceMgr.isBeforeInBuffer(Tok.getLoc(),
                                  SourceMgr.getIDEInspectionTargetLoc())) {
-    llvm::SaveAndRestore<Optional<StableHasher>> H(CurrentTokenHash, None);
+    llvm::SaveAndRestore<std::optional<StableHasher>> H(CurrentTokenHash,
+                                                        std::nullopt);
     BacktrackingScope backtrack(*this);
     do {
       auto startLoc = Tok.getLoc();
@@ -812,6 +812,7 @@ Result Parser::parseIfConfigRaw(
 
   bool foundActive = false;
   bool isVersionCondition = false;
+  CharSourceRange activeBodyRange;
   while (1) {
     bool isElse = Tok.is(tok::pound_else);
     SourceLoc ClauseLoc = consumeToken();
@@ -869,12 +870,13 @@ Result Parser::parseIfConfigRaw(
     }
 
     // Parse elements
+    auto bodyStart = Lexer::getLocForEndOfToken(SourceMgr, PreviousLoc);
     llvm::SaveAndRestore<bool> S(InInactiveClauseEnvironment,
                                  InInactiveClauseEnvironment || !isActive);
     // Disable updating the interface hash inside inactive blocks.
-    Optional<llvm::SaveAndRestore<Optional<StableHasher>>> T;
+    std::optional<llvm::SaveAndRestore<std::optional<StableHasher>>> T;
     if (!isActive)
-      T.emplace(CurrentTokenHash, None);
+      T.emplace(CurrentTokenHash, std::nullopt);
 
     if (isActive || !isVersionCondition) {
       parseElements(
@@ -887,6 +889,14 @@ Result Parser::parseIfConfigRaw(
           ClauseLoc, Condition, isActive, IfConfigElementsRole::Skipped);
     }
 
+    // Record the clause range info in SourceFile.
+    if (shouldEvaluate) {
+      auto kind = isActive ? IfConfigClauseRangeInfo::ActiveClause
+                           : IfConfigClauseRangeInfo::InactiveClause;
+      SF.recordIfConfigClauseRangeInfo(
+          {ClauseLoc, bodyStart, Tok.getLoc(), kind});
+    }
+
     if (Tok.isNot(tok::pound_elseif, tok::pound_else))
       break;
 
@@ -897,6 +907,12 @@ Result Parser::parseIfConfigRaw(
   SourceLoc EndLoc;
   bool HadMissingEnd = parseEndIfDirective(EndLoc);
 
+  // Record the '#end' ranges in SourceFile.
+  if (!HadMissingEnd && shouldEvaluate) {
+    SourceLoc EndOfEndLoc = getEndOfPreviousLoc();
+    SF.recordIfConfigClauseRangeInfo({EndLoc, EndOfEndLoc, EndOfEndLoc,
+                                      IfConfigClauseRangeInfo::EndDirective});
+  }
   return finish(EndLoc, HadMissingEnd);
 }
 

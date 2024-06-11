@@ -35,32 +35,22 @@ extension DAP where ActorSystem.ActorID == String {
 }
 
 distributed actor D2 {
-  // expected-error@-1{{actor 'D2' has no initializers}}
   let actorSystem: String
   // expected-error@-1{{property 'actorSystem' cannot be defined explicitly, as it conflicts with distributed actor synthesized stored property}}
-  // expected-error@-2{{invalid redeclaration of synthesized implementation for protocol requirement 'actorSystem'}}
-  // expected-note@-3{{stored property 'actorSystem' without initial value prevents synthesized initializers}}
 }
 
 distributed actor D3 {
   var id: Int { 0 }
   // expected-error@-1{{property 'id' cannot be defined explicitly, as it conflicts with distributed actor synthesized stored property}}
-  // expected-error@-2{{invalid redeclaration of synthesized implementation for protocol requirement 'id'}}
 }
 
 struct OtherActorIdentity: Sendable, Hashable, Codable {}
 
 distributed actor D4 {
-  // expected-error@-1{{actor 'D4' has no initializers}}
-
   let actorSystem: String
   // expected-error@-1{{property 'actorSystem' cannot be defined explicitly, as it conflicts with distributed actor synthesized stored property}}
-  // expected-error@-2{{invalid redeclaration of synthesized implementation for protocol requirement 'actorSystem'}}
-  // expected-note@-3{{stored property 'actorSystem' without initial value prevents synthesized initializers}}
   let id: OtherActorIdentity
   // expected-error@-1{{property 'id' cannot be defined explicitly, as it conflicts with distributed actor synthesized stored property}}
-  // expected-error@-2{{invalid redeclaration of synthesized implementation for protocol requirement 'id'}}
-  // expected-note@-3{{stored property 'id' without initial value prevents synthesized initializers}}
 }
 
 protocol P1: DistributedActor {
@@ -78,9 +68,22 @@ distributed actor D5: P1 {
 
 // Make sure the conformances have been added implicitly.
 func acceptDistributedActor<Act: DistributedActor>(_: Act.Type) { }
-func acceptAnyActor<Act: AnyActor>(_: Act.Type) { }
+func acceptAnyActor<Act: AnyActor>(_: Act.Type) { } // expected-warning {{'AnyActor' is deprecated: Use 'any Actor' with 'DistributedActor.asLocalActor' instead}}
 
 func testConformance() {
   acceptDistributedActor(D1.self)
   acceptAnyActor(D1.self)
 }
+
+// https://github.com/apple/swift/issues/69244
+protocol P {
+  func foo() -> Void
+  // expected-note@-1{{mark the protocol requirement 'foo()' 'async throws' to allow actor-isolated conformances}}{{13-13= async throws}}
+}
+
+distributed actor A: P {
+  typealias ActorSystem = LocalTestingDistributedActorSystem
+  distributed func foo() { }
+  // expected-error@-1{{actor-isolated distributed instance method 'foo()' cannot be used to satisfy nonisolated protocol requirement}}
+}
+// ---

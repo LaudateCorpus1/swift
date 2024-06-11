@@ -16,6 +16,10 @@ import Swift
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
+#elseif canImport(Android)
+import Android
 #elseif os(Windows)
 import WinSDK
 #endif
@@ -43,7 +47,7 @@ public final class LocalTestingDistributedActorSystem: DistributedActorSystem, @
   public init() {}
 
   public func resolve<Act>(id: ActorID, as actorType: Act.Type)
-    throws -> Act? where Act: DistributedActor, Act.ID == ActorID {
+    throws -> Act? where Act: DistributedActor {
     guard let anyActor = self.activeActorsLock.withLock({ self.activeActors[id] }) else {
       throw LocalTestingDistributedActorSystemError(message: "Unable to locate id '\(id)' locally")
     }

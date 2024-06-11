@@ -1,5 +1,4 @@
-// RUN: %empty-directory(%t)
-// RUN: %target-swift-ide-test -batch-code-completion -source-filename %s %S/Inputs/EnumFromOtherFile.swift -filecheck %raw-FileCheck -completion-output-dir %t
+// RUN: %batch-code-completion %S/Inputs/EnumFromOtherFile.swift
 
 // NOCRASH: Token
 
@@ -95,7 +94,6 @@ class C2 {
   func f2() {
     OptionSetTaker1([.Option1, .#^UNRESOLVED_5?check=UNRESOLVED_1^#])
   }
-// UNRESOLVED_1:  Begin completions
 // UNRESOLVED_1-NOT:  SomeEnum1
 // UNRESOLVED_1-NOT:  SomeEnum2
 // UNRESOLVED_1-DAG:  Decl[StaticVar]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: Option1[#SomeOptions1#]; name=Option1
@@ -112,7 +110,6 @@ class C3 {
   func f2() {
     OptionSetTaker2([.Option4, .#^UNRESOLVED_7?check=UNRESOLVED_2^#])
   }
-// UNRESOLVED_2:  Begin completions
 // UNRESOLVED_2-NOT:  SomeEnum1
 // UNRESOLVED_2-NOT:  SomeEnum2
 // UNRESOLVED_2-DAG:  Decl[StaticVar]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: Option4[#SomeOptions2#]; name=Option4
@@ -148,7 +145,6 @@ class C4 {
 // UNRESOLVED_3-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: North[#SomeEnum1#]; name=North
 // UNRESOLVED_3-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: South[#SomeEnum1#]; name=South
 // UNRESOLVED_3-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: hash({#(self): SomeEnum1#})[#(into: inout Hasher) -> Void#]; name=hash(:)
-// UNRESOLVED_3: End completions
 
 // Exhaustive to make sure we don't include `init({#(some):` or `init({#nilLiteral:` entries
 // UNRESOLVED_3_OPT: Begin completions, 9 items
@@ -158,10 +154,9 @@ class C4 {
 // UNRESOLVED_3_OPT-DAG: Keyword[nil]/None/Erase[1]/TypeRelation[Convertible]: nil[#SomeEnum1?#]; name=nil
 // UNRESOLVED_3_OPT-DAG: Decl[EnumElement]/CurrNominal/IsSystem/TypeRelation[Convertible]: none[#Optional<SomeEnum1>#]; name=none
 // UNRESOLVED_3_OPT-DAG: Decl[EnumElement]/CurrNominal/IsSystem/TypeRelation[Convertible]: some({#SomeEnum1#})[#Optional<SomeEnum1>#];
-// UNRESOLVED_3_OPT-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem: map({#(self): Optional<SomeEnum1>#})[#((SomeEnum1) throws -> U) -> U?#];
-// UNRESOLVED_3_OPT-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem: flatMap({#(self): Optional<SomeEnum1>#})[#((SomeEnum1) throws -> U?) -> U?#];
+// UNRESOLVED_3_OPT-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem: map({#(self): Optional<SomeEnum1>#})[#((SomeEnum1) throws(Error) -> ~Copyable) -> ~Copyable?#]; name=map(:)
+// UNRESOLVED_3_OPT-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem: flatMap({#(self): Optional<SomeEnum1>#})[#((SomeEnum1) throws(Error) -> ~Copyable?) -> ~Copyable?#];
 // UNRESOLVED_3_OPT-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem/TypeRelation[Invalid]: hash({#(self): Optional<SomeEnum1>#})[#(into: inout Hasher) -> Void#];
-// UNRESOLVED_3_OPT: End completions
 
 // Exhaustive to make sure we don't include `init({#(some):` or `init({#nilLiteral:` entries
 // UNRESOLVED_3_OPTOPTOPT: Begin completions, 9 items
@@ -171,10 +166,9 @@ class C4 {
 // UNRESOLVED_3_OPTOPTOPT-DAG: Keyword[nil]/None/Erase[1]/TypeRelation[Convertible]: nil[#SomeEnum1???#]; name=nil
 // UNRESOLVED_3_OPTOPTOPT-DAG: Decl[EnumElement]/CurrNominal/IsSystem/TypeRelation[Convertible]: none[#Optional<SomeEnum1??>#]; name=none
 // UNRESOLVED_3_OPTOPTOPT-DAG: Decl[EnumElement]/CurrNominal/IsSystem/TypeRelation[Convertible]: some({#SomeEnum1??#})[#Optional<SomeEnum1??>#];
-// UNRESOLVED_3_OPTOPTOPT-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem: map({#(self): Optional<SomeEnum1??>#})[#((SomeEnum1??) throws -> U) -> U?#];
-// UNRESOLVED_3_OPTOPTOPT-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem: flatMap({#(self): Optional<SomeEnum1??>#})[#((SomeEnum1??) throws -> U?) -> U?#];
+// UNRESOLVED_3_OPTOPTOPT-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem: map({#(self): Optional<SomeEnum1??>#})[#((SomeEnum1??) throws(Error) -> ~Copyable) -> ~Copyable?#];
+// UNRESOLVED_3_OPTOPTOPT-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem: flatMap({#(self): Optional<SomeEnum1??>#})[#((SomeEnum1??) throws(Error) -> ~Copyable?) -> ~Copyable?#];
 // UNRESOLVED_3_OPTOPTOPT-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem/TypeRelation[Invalid]: hash({#(self): Optional<SomeEnum1??>#})[#(into: inout Hasher) -> Void#];
-// UNRESOLVED_3_OPTOPTOPT: End completions
 
 enum Somewhere {
   case earth, mars
@@ -194,12 +188,11 @@ func testOptionalWithCustomExtension() {
 // UNRESOLVED_OPT_4-DAG: Decl[EnumElement]/CurrNominal/IsSystem/TypeRelation[Convertible]: some({#Somewhere#})[#Optional<Somewhere>#];
 // UNRESOLVED_OPT_4-DAG: Decl[Constructor]/CurrNominal/TypeRelation[Convertible]: init({#str: String#})[#Optional<Somewhere>#]; name=init(str:)
 // UNRESOLVED_OPT_4-DAG: Decl[StaticVar]/CurrNominal/TypeRelation[Convertible]: nowhere[#Optional<Somewhere>#]; name=nowhere
-// UNRESOLVED_OPT_4-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem: map({#(self): Optional<Somewhere>#})[#((Somewhere) throws -> U) -> U?#];
-// UNRESOLVED_OPT_4-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem: flatMap({#(self): Optional<Somewhere>#})[#((Somewhere) throws -> U?) -> U?#];
+// UNRESOLVED_OPT_4-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem: map({#(self): Optional<Somewhere>#})[#((Somewhere) throws(Error) -> ~Copyable) -> ~Copyable?#];
+// UNRESOLVED_OPT_4-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem: flatMap({#(self): Optional<Somewhere>#})[#((Somewhere) throws(Error) -> ~Copyable?) -> ~Copyable?#];
 // UNRESOLVED_OPT_4-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem/TypeRelation[Invalid]: hash({#(self): Optional<Somewhere>#})[#(into: inout Hasher) -> Void#];
 // UNRESOLVED_OPT_4-NOT: init({#(some):
 // UNRESOLVED_OPT_4-NOT: init({#nilLiteral:
-// UNRESOLVED_OPT_4: End completions
 }
 
 
@@ -217,7 +210,6 @@ OptionSetTaker5(.#^UNRESOLVED_14?check=UNRESOLVED_1^#, .Option4, .South, .West)
 OptionSetTaker5([.#^UNRESOLVED_15?check=UNRESOLVED_1^#], .Option4, .South, .West)
 
 OptionSetTaker6(.#^UNRESOLVED_16^#, .Option4)
-// UNRESOLVED_16:  Begin completions
 // UNRESOLVED_16-DAG:  Decl[StaticVar]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: Option1[#SomeOptions1#];
 // UNRESOLVED_16-DAG:  Decl[StaticVar]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: Option2[#SomeOptions1#];
 // UNRESOLVED_16-DAG:  Decl[StaticVar]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: Option3[#SomeOptions1#];
@@ -239,7 +231,6 @@ Container.EnumTaker1(.#^UNRESOLVED_20?check=UNRESOLVED_3^#
 
 func parserSync() {}
 
-// UNRESOLVED_4: Begin completions
 // UNRESOLVED_4-DAG: Decl[StaticVar]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: Option1[#SomeOptions1#]; name=Option1
 // UNRESOLVED_4-DAG: Decl[StaticVar]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: Option2[#SomeOptions1#]; name=Option2
 // UNRESOLVED_4-DAG: Decl[StaticVar]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: Option3[#SomeOptions1#]; name=Option3
@@ -270,7 +261,7 @@ class C6 {
 
 class C6 {
   func f1(e: SomeEnum1) {
-    if let x = Optional(e) where x == .#^UNRESOLVED_25?check=UNRESOLVED_3^#
+    if let x = Optional(e) where x == .#^UNRESOLVED_25?check=UNRESOLVED_3_OPT^#
   }
 }
 class C7 {}
@@ -322,18 +313,15 @@ func testAvail1(_ x: EnumAvail1) {
 // ENUM_AVAIL_1-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/NotRecommended/TypeRelation[Convertible]: BBB[#EnumAvail1#];
 // ENUM_AVAIL_1-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: hash({#(self): EnumAvail1#})[#(into: inout Hasher) -> Void#];
 // ENUM_AVAIL_1-NOT: AAA
-// ENUM_AVAIL_1: End completions
 
 func testAvail2(_ x: OptionsAvail1) {
   testAvail2(.#^OPTIONS_AVAIL_1^#)
 }
-// OPTIONS_AVAIL_1: Begin completions
 // OPTIONS_AVAIL_1-NOT: AAA
 // OPTIONS_AVAIL_1-DAG: Decl[StaticVar]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: aaa[#OptionsAvail1#];
 // OPTIONS_AVAIL_1-DAG: Decl[StaticVar]/CurrNominal/Flair[ExprSpecific]/NotRecommended/TypeRelation[Convertible]: BBB[#OptionsAvail1#];
 // OPTIONS_AVAIL_1-DAG: Decl[Constructor]/CurrNominal/TypeRelation[Convertible]: init({#rawValue: Int#})[#OptionsAvail1#]
 // OPTIONS_AVAIL_1-NOT: AAA
-// OPTIONS_AVAIL_1: End completions
 
 func testWithLiteral1() {
   struct S {
@@ -347,7 +335,6 @@ func testWithLiteral1() {
 // WITH_LITERAL_1: Begin completions, 2 items
 // WITH_LITERAL_1-NEXT: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: myCase[#S.MyEnum#];
 // WITH_LITERAL_1-NEXT: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: hash({#(self): S.MyEnum#})[#(into: inout Hasher) -> Void#];
-// WITH_LITERAL_1-NEXT: End completions
 }
 func testWithLiteral2() {
   struct S {
@@ -372,7 +359,6 @@ func testWithLiteral3() {
 // WITH_LITERAL_3: Begin completions, 2 items
 // WITH_LITERAL_3-NEXT: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: myCase[#MyEnum#];
 // WITH_LITERAL_3-NEXT: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: hash({#(self): MyEnum#})[#(into: inout Hasher) -> Void#];
-// WITH_LITERAL_3-NEXT: End completions
     }
   }
 }
@@ -386,11 +372,9 @@ func testInvalid1() {
 func enumFromOtherFile() -> EnumFromOtherFile {
   return .#^OTHER_FILE_1^# // Don't crash.
 }
-// OTHER_FILE_1: Begin completions
 // OTHER_FILE_1-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: b({#String#})[#EnumFromOtherFile#];
 // OTHER_FILE_1-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: a({#Int#})[#EnumFromOtherFile#];
 // OTHER_FILE_1-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: c[#EnumFromOtherFile#];
-// OTHER_FILE_1: End completions
 
 struct NonOptSet {
   static let a = NonOptSet()
@@ -414,7 +398,6 @@ func testNonOptSet() {
 // NON_OPT_SET_1-DAG: Decl[Constructor]/CurrNominal/TypeRelation[Convertible]:  init()[#NonOptSet#]
 // NON_OPT_SET_1-DAG: Decl[StaticMethod]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: b()[#NonOptSet#]
 // NON_OPT_SET_1-DAG: Decl[InstanceMethod]/CurrNominal: notStatic({#(self): NonOptSet#})[#() -> NonOptSet#];
-// NON_OPT_SET_1: End completions
 
 func testNonOptSet() {
   let x: NonOptSet = .#^NON_OPT_SET_2?check=NON_OPT_SET_1^#
@@ -430,10 +413,8 @@ func testInStringInterpolation() {
   let x = "enum: \(takeEnum(.#^STRING_INTERPOLATION_1^#))"
   let y = "enum: \(.#^STRING_INTERPOLATION_INVALID?check=NOCRASH^#)" // Dont'crash.
 }
-// STRING_INTERPOLATION_1: Begin completions
 // STRING_INTERPOLATION_1-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: foo[#MyEnum#];
 // STRING_INTERPOLATION_1-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: bar[#MyEnum#];
-// STRING_INTERPOLATION_1: End completions
 
 class BaseClass {
   class SubClass : BaseClass { init() {} }
@@ -457,7 +438,6 @@ func testSubType() {
 // SUBTYPE_1-DAG: Decl[Constructor]/CurrNominal:      init({#failable: Void#})[#BaseClass?#];
 // SUBTYPE_1-DAG: Decl[TypeAlias]/Super/TypeRelation[Convertible]: Concrete1[#BaseClass#];
 // SUBTYPE_1-DAG: Decl[TypeAlias]/Super:              Concrete2[#AnotherTy#];
-// SUBTYPE_1: End completions
 
 func testMemberTypealias() {
   var _: MyProtocol = .#^SUBTYPE_2^#
@@ -465,7 +445,6 @@ func testMemberTypealias() {
 // SUBTYPE_2: Begin completions, 2 items
 // SUBTYPE_2-DAG: Decl[TypeAlias]/CurrNominal/TypeRelation[Convertible]: Concrete1[#BaseClass#];
 // SUBTYPE_2-DAG: Decl[TypeAlias]/CurrNominal/TypeRelation[Convertible]: Concrete2[#AnotherTy#];
-// SUBTYPE_2: End completions
 
 enum Generic<T> {
   case contains(content: T)
@@ -485,16 +464,12 @@ func testGeneric() {
 switch Generic<Int>.empty {
 case let .#^GENERIC_4?check=GENERIC_1_INT^#
 }
-// GENERIC_1_INT: Begin completions
 // GENERIC_1_INT-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: contains({#content: Int#})[#Generic<Int>#];
 // GENERIC_1_INT-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: empty[#Generic<Int>#];
-// GENERIC_1_INT: End completions
 
-// GENERIC_1_U: Begin completions
 // GENERIC_1_U-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: contains({#content: U#})[#Generic<U>#];
 // GENERIC_1_U-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: empty[#Generic<U>#];
 // GENERIC_1_U-DAG: Decl[StaticMethod]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: create({#U#})[#Generic<U>#];
-// GENERIC_1_U: End completions
 
 struct HasCreator {
   static var create: () -> HasCreator = { fatalError() }
@@ -508,7 +483,6 @@ func testHasStaticClosure() {
 // FIXME: Suggest 'create()[#HasCreateor#]', not 'create'.
 // STATIC_CLOSURE_1-DAG: Decl[StaticVar]/CurrNominal:        create[#() -> HasCreator#];
 // STATIC_CLOSURE_1-DAG: Decl[StaticVar]/CurrNominal:        create_curried[#() -> () -> HasCreator#];
-// STATIC_CLOSURE_1: End completions
 
 struct HasOverloaded {
   init(e: SomeEnum1) {}
@@ -525,7 +499,6 @@ func testOverload(val: HasOverloaded) {
 // OVERLOADED_METHOD_1-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: East[#SomeEnum2#]; name=East
 // OVERLOADED_METHOD_1-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: West[#SomeEnum2#]; name=West
 // OVERLOADED_METHOD_1-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: hash({#(self): SomeEnum2#})[#(into: inout Hasher) -> Void#];
-// OVERLOADED_METHOD_1: End completions
 
   let _ = HasOverloaded.init(e: .#^OVERLOADED_INIT_1?check=OVERLOADED_METHOD_1^#)
 // Same as OVERLOADED_METHOD_1.
@@ -542,7 +515,6 @@ func testingGenericParam1<T: HasStatic>(x: inout T, fn: (T) -> Void) -> T {
   x = .#^GENERICPARAM_1^#
 // GENERICPARAM_1: Begin completions, 1 items
 // GENERICPARAM_1: Decl[StaticVar]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: instance[#HasStatic#]; name=instance
-// GENERICPARAM_1: End completions
 
   /* Parser sync. */;
 
@@ -652,7 +624,6 @@ func testTypeParamInContextType() {
 // TYPEPARAM_IN_CONTEXTTYPE_1-DAG: Decl[Constructor]/CurrNominal/TypeRelation[Convertible]:      init()[#MyStruct<MyProtocol>#];
 // TYPEPARAM_IN_CONTEXTTYPE_1-DAG: Decl[StaticVar]/CurrNominal/TypeRelation[Convertible]: myProtocolOption[#MyStruct<ConcreteMyProtocol>#];
 // TYPEPARAM_IN_CONTEXTTYPE_1-DAG: Decl[StaticVar]/CurrNominal:        otherProtocolOption[#MyStruct<ConcreteOtherProtocol>#];
-// TYPEPARAM_IN_CONTEXTTYPE_1: End completions
 }
 
 func testTernaryOperator(cond: Bool) {
@@ -671,9 +642,7 @@ func testTernaryOperator2(cond: Bool) {
   let _: SomeEnum1 = cond ? .bogus : .#^TERNARY_6?check=UNRESOLVED_3^#
   func sync(){}
   let _: SomeEnum1 = .#^TERNARY_CONDITION^# ? .bogus : .bogus
-// TERNARY_CONDITION: Begin completions
 // TERNARY_CONDITION-DAG: Decl[Constructor]/CurrNominal/IsSystem/TypeRelation[Convertible]: init()[#Bool#]; name=init()
-// TERNARY_CONDITION: End completions
 }
 
 func overloadedClosureRcv(_: () -> SomeEnum1) {}
@@ -689,7 +658,6 @@ func testClosureReturnTypeForOverloaded() {
 // OVERLOADED_CLOSURE_RETURN-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: East[#SomeEnum2#];
 // OVERLOADED_CLOSURE_RETURN-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: West[#SomeEnum2#];
 // OVERLOADED_CLOSURE_RETURN-DAG: Decl[InstanceMethod]/CurrNominal:   hash({#(self): SomeEnum2#})[#(into: inout Hasher) -> Void#];
-// OVERLOADED_CLOSURE_RETURN: End completions
 }
 
 func receiveAutoclosure(_: @autoclosure () -> SomeEnum1) {}
@@ -726,9 +694,53 @@ func testSameType() {
 // SUGAR_TYPE-DAG: Keyword[nil]/None/Erase[1]/TypeRelation[Convertible]: nil[#SomeEnum1?#];
 // SUGAR_TYPE-DAG: Decl[EnumElement]/CurrNominal/IsSystem/TypeRelation[Convertible]: none[#Optional<SomeEnum1>#];
 // SUGAR_TYPE-DAG: Decl[EnumElement]/CurrNominal/IsSystem/TypeRelation[Convertible]: some({#SomeEnum1#})[#Optional<SomeEnum1>#];
-// SUGAR_TYPE-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem: map({#(self): Optional<SomeEnum1>#})[#((SomeEnum1) throws -> U) -> U?#];
-// SUGAR_TYPE-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem: flatMap({#(self): Optional<SomeEnum1>#})[#((SomeEnum1) throws -> U?) -> U?#];
+// SUGAR_TYPE-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem: map({#(self): Optional<SomeEnum1>#})[#((SomeEnum1) throws(Error) -> ~Copyable) -> ~Copyable?#];
+// SUGAR_TYPE-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem: flatMap({#(self): Optional<SomeEnum1>#})[#((SomeEnum1) throws(Error) -> ~Copyable?) -> ~Copyable?#];
 // SUGAR_TYPE-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem/TypeRelation[Invalid]: hash({#(self): Optional<SomeEnum1>#})[#(into: inout Hasher) -> Void#];
-// SUGAR_TYPE: End completions
 }
 
+struct DispatchTime {
+  static func now() -> DispatchTime { .init() }
+}
+func +(_ x: DispatchTime, _ y: Double) -> DispatchTime { return x }
+
+let _: DispatchTime = .#^UNRESOLVED_FUNCTION_CALL^#now() + 0.2
+
+// UNRESOLVED_FUNCTION_CALL: Begin completions, 2 items
+// UNRESOLVED_FUNCTION_CALL-DAG: Decl[StaticMethod]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: now()[#DispatchTime#];
+// UNRESOLVED_FUNCTION_CALL-DAG: Decl[Constructor]/CurrNominal/TypeRelation[Convertible]: init()[#DispatchTime#];
+
+func id<T>(_ x: T) -> T { x }
+
+func testNestedExprPatternCompletion(_ x: SomeEnum1) {
+  // Multi-statement closures have different type-checking code paths,
+  // so we need to test both.
+  let fn = {
+    switch x {
+    case id(.#^UNRESOLVED_NESTED1^#):
+      // UNRESOLVED_NESTED1: Begin completions, 3 items
+      // UNRESOLVED_NESTED1: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: South[#SomeEnum1#]; name=South
+      // UNRESOLVED_NESTED1: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: North[#SomeEnum1#]; name=North
+      // UNRESOLVED_NESTED1: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: hash({#(self): SomeEnum1#})[#(into: inout Hasher) -> Void#]; name=hash(:)
+      break
+    }
+    if case id(.#^UNRESOLVED_NESTED2^#) = x {}
+    // UNRESOLVED_NESTED2: Begin completions, 3 items
+    // UNRESOLVED_NESTED2: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: South[#SomeEnum1#]; name=South
+    // UNRESOLVED_NESTED2: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: North[#SomeEnum1#]; name=North
+    // UNRESOLVED_NESTED2: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: hash({#(self): SomeEnum1#})[#(into: inout Hasher) -> Void#]; name=hash(:)
+  }
+  switch x {
+  case id(.#^UNRESOLVED_NESTED3^#):
+    // UNRESOLVED_NESTED3: Begin completions, 3 items
+    // UNRESOLVED_NESTED3: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: South[#SomeEnum1#]; name=South
+    // UNRESOLVED_NESTED3: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: North[#SomeEnum1#]; name=North
+    // UNRESOLVED_NESTED3: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: hash({#(self): SomeEnum1#})[#(into: inout Hasher) -> Void#]; name=hash(:)
+    break
+  }
+  if case id(.#^UNRESOLVED_NESTED4^#) = x {}
+  // UNRESOLVED_NESTED4: Begin completions, 3 items
+  // UNRESOLVED_NESTED4: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: South[#SomeEnum1#]; name=South
+  // UNRESOLVED_NESTED4: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: North[#SomeEnum1#]; name=North
+  // UNRESOLVED_NESTED4: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: hash({#(self): SomeEnum1#})[#(into: inout Hasher) -> Void#]; name=hash(:)
+}

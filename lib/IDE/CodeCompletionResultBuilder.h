@@ -43,9 +43,8 @@ class CodeCompletionResultBuilder {
   CodeCompletionFlair Flair;
   unsigned NumBytesToErase = 0;
   const Decl *AssociatedDecl = nullptr;
-  bool IsAsync = false;
   bool HasAsyncAlternative = false;
-  Optional<CodeCompletionLiteralKind> LiteralKind;
+  std::optional<CodeCompletionLiteralKind> LiteralKind;
   CodeCompletionKeywordKind KeywordKind = CodeCompletionKeywordKind::None;
   unsigned CurrentNestingLevel = 0;
   SmallVector<CodeCompletionString::Chunk, 4> Chunks;
@@ -116,7 +115,6 @@ public:
 
   void setAssociatedDecl(const Decl *D);
 
-  void setIsAsync(bool IsAsync) { this->IsAsync = IsAsync; }
   void setHasAsyncAlternative(bool HasAsyncAlternative) {
     this->HasAsyncAlternative = HasAsyncAlternative;
   }
@@ -178,6 +176,11 @@ public:
       break;
     case AccessLevel::Internal:
       // 'internal' is the default, don't add it.
+      break;
+    case AccessLevel::Package:
+      addChunkWithTextNoCopy(
+          CodeCompletionString::Chunk::ChunkKind::AccessControlKeyword,
+          "package ");
       break;
     case AccessLevel::Public:
       addChunkWithTextNoCopy(
@@ -340,10 +343,17 @@ public:
     addChunkWithTextNoCopy(CodeCompletionString::Chunk::ChunkKind::Equal, "=");
   }
 
-  void addDeclAttrParamKeyword(StringRef Name, StringRef Annotation,
-                               bool NeedSpecify) {
+  void addDeclAttrParamKeyword(StringRef Name, ArrayRef<StringRef> Parameters,
+                               StringRef Annotation, bool NeedSpecify) {
     addChunkWithText(CodeCompletionString::Chunk::ChunkKind::
                      DeclAttrParamKeyword, Name);
+    if (!Parameters.empty()) {
+      addLeftParen();
+      for (auto Parameter : Parameters) {
+        addSimpleNamedParameter(Parameter);
+      }
+      addRightParen();
+    }
     if (NeedSpecify)
       addChunkWithText(CodeCompletionString::Chunk::ChunkKind::
                        DeclAttrParamColon, ": ");
@@ -413,14 +423,16 @@ public:
 
   void addCallArgument(Identifier Name, Identifier LocalName, Type Ty,
                        Type ContextTy, bool IsVarArg, bool IsInOut, bool IsIUO,
-                       bool IsAutoClosure, bool UseUnderscoreLabel,
-                       bool IsLabeledTrailingClosure, bool HasDefault);
+                       bool IsAutoClosure, bool IsLabeledTrailingClosure,
+                       bool IsForOperator, bool HasDefault);
 
-  void addCallArgument(Identifier Name, Type Ty, Type ContextTy = Type()) {
+  void addCallArgument(Identifier Name, Type Ty, Type ContextTy = Type(),
+                       bool IsForOperator = false) {
     addCallArgument(Name, Identifier(), Ty, ContextTy,
                     /*IsVarArg=*/false, /*IsInOut=*/false, /*IsIUO=*/false,
-                    /*IsAutoClosure=*/false, /*UseUnderscoreLabel=*/false,
-                    /*IsLabeledTrailingClosure=*/false, /*HasDefault=*/false);
+                    /*IsAutoClosure=*/false,
+                    /*IsLabeledTrailingClosure=*/false, IsForOperator,
+                    /*HasDefault=*/false);
   }
 
   void addGenericParameter(StringRef Name) {

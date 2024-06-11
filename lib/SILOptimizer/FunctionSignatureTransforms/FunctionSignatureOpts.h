@@ -40,7 +40,7 @@ struct ArgumentDescriptor {
   SILFunctionArgument *Arg;
 
   /// Parameter Info.
-  Optional<SILParameterInfo> PInfo;
+  std::optional<SILParameterInfo> PInfo;
 
   /// The original index of this argument.
   unsigned Index;
@@ -127,14 +127,13 @@ struct ArgumentDescriptor {
     return false;
   }
 
-  llvm::Optional<ValueOwnershipKind>
-  getTransformedOwnershipKind(SILType SubTy) {
+  std::optional<ValueOwnershipKind> getTransformedOwnershipKind(SILType SubTy) {
     if (IsEntirelyDead)
-      return None;
+      return std::nullopt;
     if (SubTy.isTrivial(*Arg->getFunction()))
-      return Optional<ValueOwnershipKind>(OwnershipKind::None);
+      return std::optional<ValueOwnershipKind>(OwnershipKind::None);
     if (OwnedToGuaranteed)
-      return Optional<ValueOwnershipKind>(OwnershipKind::Guaranteed);
+      return std::optional<ValueOwnershipKind>(OwnershipKind::Guaranteed);
     return Arg->getOwnershipKind();
   }
 };

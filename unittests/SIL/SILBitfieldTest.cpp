@@ -21,15 +21,16 @@ class BasicBlockBitfield;
 
 struct SILFunction {
   BasicBlockBitfield *newestAliveBlockBitfield = nullptr;
-  int64_t currentBitfieldID = 1;
+  uint64_t currentBitfieldID = 1;
 };
 
 struct SILBasicBlock {
   SILFunction *function;
   uint32_t customBits = 0;
-  int64_t lastInitializedBitfieldID = 0;
+  uint64_t lastInitializedBitfieldID = 0;
 
   enum { numCustomBits = 32 };
+  enum { maxBitfieldID = std::numeric_limits<uint64_t>::max() };
 
   SILBasicBlock(SILFunction *function): function(function) {}
 

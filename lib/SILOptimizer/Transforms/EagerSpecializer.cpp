@@ -35,6 +35,7 @@
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/Type.h"
 #include "swift/SIL/SILFunction.h"
+#include "swift/SILOptimizer/Analysis/BasicCalleeAnalysis.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/CFGOptUtils.h"
 #include "swift/SILOptimizer/Utils/Generics.h"
@@ -71,6 +72,9 @@ static bool isTrivialReturnBlock(SILBasicBlock *RetBB) {
   //   % = tuple ()
   //   return % : $()
   if (RetOperand->getType().isVoid()) {
+    if (!RetBB->args_empty())
+      return false;
+
     auto *TupleI = dyn_cast<TupleInst>(RetBB->begin());
     if (!TupleI || !TupleI->getType().isVoid())
       return false;
@@ -745,10 +749,8 @@ SILValue EagerDispatch::emitArgumentConversion(
 }
 
 namespace {
-// FIXME: This should be a function transform that pushes cloned functions on
-// the pass manager worklist.
 class EagerSpecializerTransform : public SILFunctionTransform {
-  bool onlyCreatePrespecializations;
+  const bool onlyCreatePrespecializations;
 public:
   EagerSpecializerTransform(bool onlyPrespecialize)
       : onlyCreatePrespecializations(onlyPrespecialize) {}
@@ -836,6 +838,8 @@ void EagerSpecializerTransform::run() {
   // performed.
   SmallVector<SILSpecializeAttr *, 8> attrsToRemove;
 
+  bool onlyCreatePrespecializations = this->onlyCreatePrespecializations;
+
   for (auto *SA : F.getSpecializeAttrs()) {
     if (onlyCreatePrespecializations && !SA->isExported()) {
       attrsToRemove.push_back(SA);
@@ -859,7 +863,7 @@ void EagerSpecializerTransform::run() {
       // That means we are loading it from another module. In this case, we
       // don't want to create a pre-specialization.
       SpecializedFuncs.push_back(nullptr);
-      ReInfoVec.emplace_back(ReabstractionInfo());
+      ReInfoVec.emplace_back(ReabstractionInfo(F.getModule()));
       continue;
     }
     ReInfoVec.emplace_back(FuncBuilder.getModule().getSwiftModule(),
@@ -879,12 +883,13 @@ void EagerSpecializerTransform::run() {
   // TODO: Optimize the dispatch code to minimize the amount
   // of checks. Use decision trees for this purpose.
   bool Changed = false;
+  CalleeCache *calleeCache = getAnalysis<BasicCalleeAnalysis>()->getCalleeCache();
   if (!onlyCreatePrespecializations)
     for_each3(F.getSpecializeAttrs(), SpecializedFuncs, ReInfoVec,
               [&](const SILSpecializeAttr *SA, SILFunction *NewFunc,
                   const ReabstractionInfo &ReInfo) {
                 if (NewFunc) {
-                  NewFunc->verify();
+                  NewFunc->verify(calleeCache);
                   Changed = true;
                   EagerDispatch(&F, ReInfo).emitDispatchTo(NewFunc);
                 }
@@ -904,7 +909,7 @@ void EagerSpecializerTransform::run() {
   // If any specializations were created, reverify the original body now that it
   // has checks.
   if (!newFunctions.empty())
-    F.verify();
+    F.verify(calleeCache);
 
   for (SILFunction *newF : newFunctions) {
     addFunctionToPassManagerWorklist(newF, nullptr);

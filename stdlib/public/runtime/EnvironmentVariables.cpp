@@ -15,13 +15,21 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/Runtime/Debug.h"
+#include "swift/Runtime/Paths.h"
 #include "swift/Runtime/EnvironmentVariables.h"
 
 #include <string.h>
+#include <inttypes.h>
 
 using namespace swift;
 
 namespace {
+
+// This is required to make the macro machinery work correctly; we can't
+// declare a VARIABLE(..., const char *, ...) because then the token-pasted
+// names won't work properly.  It *does* mean that if you want to use std::string
+// somewhere in this file, you'll have to fully qualify the name.
+typedef const char *string;
 
 // Require all environment variable names to start with SWIFT_
 static constexpr bool hasSwiftPrefix(const char *str) {
@@ -115,12 +123,20 @@ static uint32_t parse_uint32_t(const char *name,
   }
   if (n > UINT32_MAX) {
     swift::warning(RuntimeErrorFlagNone,
-                   "Warning: %s=%s out of bounds, clamping to %d.\n",
+                   "Warning: %s=%s out of bounds, clamping to %" PRIu32 ".\n",
                    name, value, UINT32_MAX);
     return UINT32_MAX;
   }
 
   return n;
+}
+
+static string parse_string(const char *name,
+                           const char *value,
+                           string defaultValue) {
+  if (!value || value[0] == 0)
+    return strdup(defaultValue);
+  return strdup(value);
 }
 
 // Print a list of all the environment variables. Lazy initialization makes
@@ -247,12 +263,10 @@ SWIFT_RUNTIME_STDLIB_SPI bool concurrencyEnableCooperativeQueues() {
       SWIFT_DEBUG_CONCURRENCY_ENABLE_COOPERATIVE_QUEUES();
 }
 
-
-SWIFT_RUNTIME_STDLIB_SPI bool concurrencyEnableJobDispatchIntegration() {
-  return runtime::environment::
-      SWIFT_ENABLE_ASYNC_JOB_DISPATCH_INTEGRATION();
-}
-
 SWIFT_RUNTIME_STDLIB_SPI bool concurrencyValidateUncheckedContinuations() {
   return runtime::environment::SWIFT_DEBUG_VALIDATE_UNCHECKED_CONTINUATIONS();
+}
+
+SWIFT_RUNTIME_STDLIB_SPI const char *concurrencyIsCurrentExecutorLegacyModeOverride() {
+  return runtime::environment::SWIFT_IS_CURRENT_EXECUTOR_LEGACY_MODE_OVERRIDE();
 }

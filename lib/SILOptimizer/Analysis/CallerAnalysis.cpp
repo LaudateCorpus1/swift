@@ -51,7 +51,7 @@ struct CallerAnalysis::ApplySiteFinderVisitor
 
 #ifndef NDEBUG
   SmallPtrSet<SILInstruction *, 8> visitedCallSites;
-  SmallSetVector<SILInstruction *, 8> callSitesThatMustBeVisited;
+  llvm::SmallSetVector<SILInstruction *, 8> callSitesThatMustBeVisited;
 #endif
 
   ApplySiteFinderVisitor(CallerAnalysis *analysis, SILFunction *callerFn)
@@ -147,7 +147,7 @@ bool CallerAnalysis::ApplySiteFinderVisitor::visitFunctionRefBaseInst(
 
   if (result.fullApplySites.size()) {
     iter.first->second.hasFullApply = true;
-    processApplySites(llvm::makeArrayRef(result.fullApplySites));
+    processApplySites(llvm::ArrayRef(result.fullApplySites));
   }
 
   if (result.partialApplySites.size()) {

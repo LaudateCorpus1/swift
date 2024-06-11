@@ -2,12 +2,13 @@
 // RUN: mkdir -p %t/clang-module-cache
 
 // Run the scanner once, emitting the serialized scanner cache
-// RUN: %target-swift-frontend -scan-dependencies -Rdependency-scan-cache -serialize-dependency-scan-cache -dependency-scan-cache-path %t/cache.moddepcache -module-cache-path %t/clang-module-cache %s -o %t/deps_initial.json -I %S/Inputs/CHeaders -I %S/Inputs/Swift -import-objc-header %S/Inputs/CHeaders/Bridging.h -swift-version 4 2>&1 | %FileCheck %s -check-prefix CHECK-REMARK-SAVE
+// RUN: %target-swift-frontend -scan-dependencies -module-load-mode prefer-interface -Rdependency-scan-cache -serialize-dependency-scan-cache -dependency-scan-cache-path %t/cache.moddepcache -module-cache-path %t/clang-module-cache %s -o %t/deps_initial.json -I %S/Inputs/CHeaders -I %S/Inputs/Swift -import-objc-header %S/Inputs/CHeaders/Bridging.h -swift-version 4 2>&1 | %FileCheck %s -check-prefix CHECK-REMARK-SAVE
 
 // Run the scanner again, but now re-using previously-serialized cache
-// RUN: %target-swift-frontend -scan-dependencies -Rdependency-scan-cache -load-dependency-scan-cache -dependency-scan-cache-path %t/cache.moddepcache -module-cache-path %t/clang-module-cache %s -o %t/deps.json -I %S/Inputs/CHeaders -I %S/Inputs/Swift -import-objc-header %S/Inputs/CHeaders/Bridging.h -swift-version 4 2>&1 | %FileCheck %s -check-prefix CHECK-REMARK-LOAD
+// RUN: %target-swift-frontend -scan-dependencies -module-load-mode prefer-interface -Rdependency-scan-cache -load-dependency-scan-cache -dependency-scan-cache-path %t/cache.moddepcache -module-cache-path %t/clang-module-cache %s -o %t/deps.json -I %S/Inputs/CHeaders -I %S/Inputs/Swift -import-objc-header %S/Inputs/CHeaders/Bridging.h -swift-version 4 2>&1 | %FileCheck %s -check-prefix CHECK-REMARK-LOAD
 
 // Check the contents of the JSON output
+// RUN: %validate-json %t/deps.json &>/dev/null
 // RUN: %FileCheck %s < %t/deps.json
 
 // REQUIRES: executable_test
@@ -30,40 +31,20 @@ import SubE
 // CHECK-NEXT: ],
 // CHECK-NEXT: "directDependencies": [
 // CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "A"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "clang": "C"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "E"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "F"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "G"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "SubE"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "Swift"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "SwiftOnoneSupport"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "_Concurrency"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "_StringProcessing"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "_cross_import_E"
-// CHECK-NEXT:   }
-// CHECK-NEXT: ],
+// CHECK-DAG:     "clang": "C"
+// CHECK-DAG:     "swift": "E"
+// CHECK-DAG:     "clang": "F"
+// CHECK-DAG:     "swift": "G"
+// CHECK-DAG:     "swift": "SubE"
+// CHECK-DAG:     "swift": "Swift"
+// CHECK-DAG:     "swift": "SwiftOnoneSupport"
+// CHECK-DAG:     "swift": "_Concurrency"
+// CHECK-DAG:     "swift": "_StringProcessing"
+// CHECK-DAG:     "swift": "_cross_import_E"
+// CHECK-DAG:     "clang": "_SwiftConcurrencyShims"
+// CHECK: ],
 
+// CHECK:      "contextHash":
 // CHECK:      "extraPcmArgs": [
 // CHECK-NEXT:    "-Xcc",
 // CHECK-NEXT:    "-target",
@@ -82,16 +63,64 @@ import SubE
 // CHECK-NEXT: "F"
 // CHECK-NEXT: ]
 
+// CHECK: "swiftOverlayDependencies": [
+// CHECK-DAG: "swift": "F"
+// CHECK-DAG: "swift": "A"
+
 /// --------Swift module A
 // CHECK-LABEL: "modulePath": "{{.*}}{{/|\\}}A-{{.*}}.swiftmodule",
 
 // CHECK: directDependencies
 // CHECK-NEXT: {
-// CHECK-NEXT:   "clang": "A"
-// CHECK-NEXT: }
+// CHECK-DAG:   "clang": "A"
+// CHECK-DAG:   "swift": "Swift"
+
+/// --------Swift module F
+// CHECK-LABEL: "modulePath": "{{.*}}{{/|\\}}F-{{.*}}.swiftmodule",
+// CHECK-NEXT: "sourceFiles": [
+// CHECK-NEXT: ],
+// CHECK-NEXT: "directDependencies": [
+// CHECK-NEXT:   {
+// CHECK-DAG:     "clang": "F"
+// CHECK-DAG:     "swift": "Swift"
+// CHECK-DAG:     "swift": "SwiftOnoneSupport"
+// CHECK: ],
+
+/// --------Swift module G
+// CHECK-LABEL: "modulePath": "{{.*}}{{/|\\}}G-{{.*}}.swiftmodule"
+// CHECK: "directDependencies"
 // CHECK-NEXT: {
-// CHECK-NEXT:   "swift": "Swift"
-// CHECK-NEXT: },
+// CHECK-DAG:   "clang": "G"
+// CHECK-DAG:   "swift": "Swift"
+// CHECK-DAG:   "swift": "SwiftOnoneSupport"
+// CHECK: ],
+// CHECK-NEXT: "linkLibraries": [
+// CHECK-NEXT: ],
+// CHECK-NEXT: "details": {
+
+// CHECK: "commandLine": [
+// CHECK: "-compile-module-from-interface"
+// CHECK: "-target"
+// CHECK: "-module-name"
+// CHECK: "G"
+// CHECK: "-swift-version"
+// CHECK: "5"
+// CHECK: ],
+// CHECK: "contextHash": "{{.*}}",
+// CHECK" "extraPcmArgs": [
+// CHECK"   "-target",
+// CHECK"   "-fapinotes-swift-version=5"
+// CHECK" ]
+
+/// --------Swift module E
+// CHECK: "swift": "E"
+// CHECK-LABEL: modulePath": "{{.*}}{{/|\\}}E-{{.*}}.swiftmodule"
+// CHECK: "directDependencies"
+// CHECK-NEXT: {
+// CHECK: "swift": "Swift"
+
+// CHECK: "moduleInterfacePath"
+// CHECK-SAME: E.swiftinterface
 
 /// --------Clang module C
 // CHECK-LABEL: "modulePath": "{{.*}}/C-{{.*}}.pcm",
@@ -102,7 +131,7 @@ import SubE
 
 // CHECK: directDependencies
 // CHECK-NEXT: {
-// CHECK-NEXT: "clang": "B"
+// CHECK: "clang": "B"
 
 // CHECK: "moduleMapPath"
 // CHECK-SAME: module.modulemap
@@ -112,73 +141,11 @@ import SubE
 
 // CHECK: "commandLine": [
 // CHECK-NEXT: "-frontend"
-// CHECK-NEXT: "-only-use-extra-clang-opts
 // CHECK-NOT: "BUILD_DIR/bin/clang"
 // CHECK: "-emit-pcm",
 // CHECK: "-module-name",
 // CHECK-NEXT: "C"
-
-/// --------Swift module E
-// CHECK: "swift": "E"
-// CHECK-LABEL: modulePath": "{{.*}}{{/|\\}}E-{{.*}}.swiftmodule"
-// CHECK: "directDependencies"
-// CHECK-NEXT: {
-// CHECK-NEXT: "swift": "Swift"
-
-// CHECK: "moduleInterfacePath"
-// CHECK-SAME: E.swiftinterface
-
-/// --------Swift module F
-// CHECK-LABEL: "modulePath": "{{.*}}{{/|\\}}F-{{.*}}.swiftmodule",
-// CHECK-NEXT: "sourceFiles": [
-// CHECK-NEXT: ],
-// CHECK-NEXT: "directDependencies": [
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "clang": "F"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "Swift"
-// CHECK-NEXT:   },
-// CHECK-NEXT:   {
-// CHECK-NEXT:     "swift": "SwiftOnoneSupport"
-// CHECK-NEXT:   }
-// CHECK-NEXT: ],
-
-/// --------Swift module G
-// CHECK-LABEL: "modulePath": "{{.*}}{{/|\\}}G-{{.*}}.swiftmodule"
-// CHECK: "directDependencies"
-// CHECK-NEXT: {
-// CHECK-NEXT:   "clang": "G"
-// CHECK-NEXT: },
-// CHECK-NEXT: {
-// CHECK-NEXT:   "swift": "Swift"
-// CHECK-NEXT: },
-// CHECK-NEXT: {
-// CHECK-NEXT:   "swift": "SwiftOnoneSupport"
-// CHECK-NEXT: }
-// CHECK-NEXT: ],
-// CHECK-NEXT: "details": {
-
-// CHECK: "contextHash": "{{.*}}",
-// CHECK: "commandLine": [
-// CHECK: "-compile-module-from-interface"
-// CHECK: "-target"
-// CHECK: "-module-name"
-// CHECK: "G"
-// CHECK: "-swift-version"
-// CHECK: "5"
-// CHECK: ],
-// CHECK" "extraPcmArgs": [
-// CHECK"   "-target",
-// CHECK"   "-fapinotes-swift-version=5"
-// CHECK" ]
-
-/// --------Swift module Swift
-// CHECK-LABEL: "modulePath": "{{.*}}{{/|\\}}Swift-{{.*}}.swiftmodule",
-
-// CHECK: directDependencies
-// CHECK-NEXT: {
-// CHECK-NEXT: "clang": "SwiftShims"
+// CHECK: "-direct-clang-cc1-module-build"
 
 /// --------Clang module B
 // CHECK-LABEL: "modulePath": "{{.*}}/B-{{.*}}.pcm",
@@ -189,8 +156,16 @@ import SubE
 
 // CHECK: directDependencies
 // CHECK-NEXT: {
-// CHECK-NEXT: "clang": "A"
+// CHECK: "clang": "A"
 // CHECK-NEXT: }
+
+/// --------Swift module Swift
+// CHECK-LABEL: "modulePath": "{{.*}}{{/|\\}}Swift-{{.*}}.swiftmodule",
+
+// CHECK: directDependencies
+// CHECK-NEXT: {
+// CHECK: "clang": "SwiftShims"
 
 /// --------Clang module SwiftShims
 // CHECK-LABEL: "modulePath": "{{.*}}/SwiftShims-{{.*}}.pcm",
+

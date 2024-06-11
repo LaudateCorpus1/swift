@@ -30,8 +30,8 @@ public class C {
 // CHECK-NEXT:  [[PA:%.*]] = partial_apply [callee_guaranteed] [on_stack] [[F]]([[ARG]]) : $@convention(thin) (@guaranteed C) -> ()
 // CHECK-NEXT:  [[CL:%.*]] = mark_dependence [[PA]] : $@noescape @callee_guaranteed () -> () on [[ARG]] : $C
 // CHECK-NEXT:  // function_ref use_closure(_:)
-// CHECK-NEXT:  [[F2:%.*]] = function_ref @$s22closure_lifetime_fixup04use_A0yyyyXEF : $@convention(thin) (@noescape @callee_guaranteed () -> ()) -> ()
-// CHECK-NEXT:  apply [[F2]]([[CL]]) : $@convention(thin) (@noescape @callee_guaranteed () -> ()) -> ()
+// CHECK-NEXT:  [[F2:%.*]] = function_ref @$s22closure_lifetime_fixup04use_A0yyyyXEF :
+// CHECK-NEXT:  apply [[F2]]([[CL]]) :
 // CHECK-NEXT:  dealloc_stack [[PA]] : $@noescape @callee_guaranteed () -> ()
 // CHECK-NEXT:  strong_release [[ARG]] : $C
 // CHECK-NEXT:  tuple ()
@@ -97,8 +97,8 @@ public func dontCrash<In, Out>(test: Bool, body: @escaping ((In) -> Out, In) -> 
 // CHECK-LABEL: sil @$s22closure_lifetime_fixup28to_stack_of_convert_function1pySvSg_tF
 // CHECK:  [[FN:%.*]] = function_ref @$s22closure_lifetime_fixup28to_stack_of_convert_function1pySvSg_tFSSSvcfu_ :
 // CHECK:  [[PA:%.*]] = thin_to_thick_function [[FN]]
-// CHECK:  [[MAP:%.*]] = function_ref @$sSq3mapyqd__Sgqd__xKXEKlF
-// CHECK:  try_apply [[MAP]]<UnsafeMutableRawPointer, String>({{.*}}, [[PA]], {{.*}})
+// CHECK:  [[MAP:%.*]] = function_ref @$sSq3mapyqd_0_Sgqd_0_xqd__YKXEqd__YKs5ErrorRd__Ri_d_0_r0_lF
+// CHECK:  try_apply [[MAP]]<UnsafeMutableRawPointer, Never, String>({{.*}}, [[PA]], {{.*}})
 public func to_stack_of_convert_function(p: UnsafeMutableRawPointer?) {
   _ = p.map(String.init(describing:))
 }
@@ -131,7 +131,7 @@ func useGenericClosureThrowing<T, V>(_ c: (T) throws -> V) throws {
 // CHECK: function_ref @$s22closure_lifetime_fixup17useGenericClosureyyq_xXEr0_lF
 
 // CHECK: partial_apply [callee_guaranteed] [on_stack]
-// CHECK: function_ref @$ss5Error_pIgzo_ytytsAA_pIegnrzo_TR
+// CHECK: function_ref @$sIg_ytyts5Error_pIegnrzo_TR
 // CHECK: partial_apply [callee_guaranteed] [on_stack]
 // CHECK: function_ref @$s22closure_lifetime_fixup25useGenericClosureThrowingyyq_xKXEKr0_l
 public func captureClass(c: C, d: C) throws {
@@ -172,7 +172,7 @@ public protocol DoIt {
 // CHECK: function_ref @$s22closure_lifetime_fixup17useGenericClosureyyq_xXEr0_lF
 
 // CHECK: partial_apply [callee_guaranteed] [on_stack]
-// CHECK: function_ref @$ss5Error_pIgzo_ytytsAA_pIegnrzo_TR
+// CHECK: function_ref @$sIg_ytyts5Error_pIegnrzo_TR
 // CHECK: partial_apply [callee_guaranteed] [on_stack]
 // CHECK: function_ref @$s22closure_lifetime_fixup25useGenericClosureThrowingyyq_xKXEKr0_lF
 public func captureGeneric<C :DoIt,D: DoIt>(c: C, d: D) throws {
@@ -211,7 +211,7 @@ public func captureGeneric<C :DoIt,D: DoIt>(c: C, d: D) throws {
 // CHECK: function_ref @$s22closure_lifetime_fixup17useGenericClosureyyq_xXEr0_lF
 
 // CHECK:  partial_apply [callee_guaranteed] [on_stack]
-// CHECK:  function_ref @$ss5Error_pIgzo_ytytsAA_pIegnrzo_TR
+// CHECK:  function_ref @$sIg_ytyts5Error_pIegnrzo_TR
 // CHECK:  partial_apply [callee_guaranteed] [on_stack]
 // CHECK:  function_ref @$s22closure_lifetime_fixup25useGenericClosureThrowingyyq_xKXEKr0_lF
 public func captureClosure<T, V>(c : (T) ->V, d: (T) -> V, t: T) throws {

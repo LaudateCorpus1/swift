@@ -43,22 +43,7 @@ using namespace swift;
 namespace {
 
 static Type getNamedSwiftType(ModuleDecl *stdlib, StringRef name) {
-  auto &ctx = stdlib->getASTContext();
-  SmallVector<ValueDecl*, 1> results;
-  stdlib->lookupValue(ctx.getIdentifier(name), NLKind::QualifiedLookup,
-                      results);
-
-  // If we have one single type decl, and that decl has been
-  // type-checked, return its declared type.
-  //
-  // ...non-type-checked types should only ever show up here because
-  // of test cases using -enable-source-import, but unfortunately
-  // that's a real thing.
-  if (results.size() == 1) {
-    if (auto typeDecl = dyn_cast<TypeDecl>(results[0]))
-      return typeDecl->getDeclaredInterfaceType();
-  }
-  return Type();
+  return stdlib->getASTContext().getNamedSwiftType(stdlib, name);
 }
 
 static clang::QualType
@@ -89,6 +74,10 @@ getClangBuiltinTypeFromKind(const clang::ASTContext &context,
   case clang::BuiltinType::Id:                                                 \
     return context.Id##Ty;
 #include "clang/Basic/RISCVVTypes.def"
+#define WASM_REF_TYPE(Name, MangedNameBase, Id, SingletonId, AS)               \
+  case clang::BuiltinType::Id:                                                 \
+    return context.SingletonId;
+#include "clang/Basic/WebAssemblyReferenceTypes.def"
   }
 
   // Not a valid BuiltinType.
@@ -167,9 +156,10 @@ const clang::Type *ClangTypeConverter::getFunctionType(
   llvm_unreachable("invalid representation");
 }
 
-const clang::Type *ClangTypeConverter::getFunctionType(
-    ArrayRef<SILParameterInfo> params, Optional<SILResultInfo> result,
-    SILFunctionType::Representation repr) {
+const clang::Type *
+ClangTypeConverter::getFunctionType(ArrayRef<SILParameterInfo> params,
+                                    std::optional<SILResultInfo> result,
+                                    SILFunctionType::Representation repr) {
 
   // Using the interface type is sufficient as type parameters get mapped to
   // `id`, since ObjC lightweight generics use type erasure. (See also: SE-0057)
@@ -215,6 +205,10 @@ const clang::Type *ClangTypeConverter::getFunctionType(
   case SILFunctionType::Representation::ObjCMethod:
   case SILFunctionType::Representation::WitnessMethod:
   case SILFunctionType::Representation::Closure:
+  case SILFunctionType::Representation::KeyPathAccessorGetter:
+  case SILFunctionType::Representation::KeyPathAccessorSetter:
+  case SILFunctionType::Representation::KeyPathAccessorEquals:
+  case SILFunctionType::Representation::KeyPathAccessorHash:
     llvm_unreachable("Expected a C-compatible representation.");
   }
   llvm_unreachable("unhandled representation!");
@@ -263,7 +257,7 @@ clang::QualType ClangTypeConverter::visitStructType(StructType *type) {
   CHECK_NAMED_TYPE("OpaquePointer", ctx.VoidPtrTy);
   CHECK_NAMED_TYPE("CVaListPointer", getClangDecayedVaListType(ctx));
   CHECK_NAMED_TYPE("DarwinBoolean", ctx.UnsignedCharTy);
-  CHECK_NAMED_TYPE(swiftDecl->getASTContext().getSwiftName(
+  CHECK_NAMED_TYPE(swift::getSwiftName(
                      KnownFoundationEntity::NSZone),
                    ctx.VoidPtrTy);
   CHECK_NAMED_TYPE("WindowsBool", ctx.IntTy);
@@ -275,7 +269,7 @@ clang::QualType ClangTypeConverter::visitStructType(StructType *type) {
 
   // Map vector types to the corresponding C vectors.
 #define MAP_SIMD_TYPE(TYPE_NAME, _, BUILTIN_KIND)                      \
-  if (name.startswith(#TYPE_NAME)) {                                   \
+  if (name.starts_with(#TYPE_NAME)) {                                   \
     return getClangVectorType(ctx, clang::BuiltinType::BUILTIN_KIND,   \
                               clang::VectorType::GenericVector,        \
                               name.drop_front(sizeof(#TYPE_NAME)-1));  \
@@ -679,8 +673,9 @@ clang::QualType ClangTypeConverter::visitSILFunctionType(SILFunctionType *type) 
                         ? SILFunctionTypeRepresentation::Block
                         : repr);
     auto results = type->getResults();
-    auto optionalResult =
-        results.empty() ? None : llvm::Optional<SILResultInfo>(results[0]);
+    auto optionalResult = results.empty()
+                              ? std::nullopt
+                              : std::optional<SILResultInfo>(results[0]);
     clangTy = getFunctionType(type->getParameters(), optionalResult, newRepr);
   }
   return clang::QualType(clangTy, 0);
@@ -911,7 +906,7 @@ ClangTypeConverter::getClangTemplateArguments(
   }
   if (failedTypes.empty())
     return nullptr;
-  // Clear "templateArgs" to prevent the clients from accidently reading a
+  // Clear "templateArgs" to prevent the clients from accidentally reading a
   // partially converted set of template arguments.
   templateArgs.clear();
   auto errorInfo = std::make_unique<TemplateInstantiationError>();

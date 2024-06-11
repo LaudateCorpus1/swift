@@ -40,8 +40,11 @@ namespace irgen {
 
   /// Given a witness table (protocol or value), return the address of the slot
   /// for one of the witnesses.
+  /// If \p areEntriesRelative is true we are emitting code for a relative
+  /// protocol witness table.
   Address slotForLoadOfOpaqueWitness(IRGenFunction &IGF, llvm::Value *table,
-                                     WitnessIndex index);
+                                     WitnessIndex index,
+                                     bool areEntriesRelative = false);
 
   /// Given a witness table (protocol or value), load one of the
   /// witnesses.
@@ -49,6 +52,7 @@ namespace irgen {
   /// The load is marked invariant. This should not be used in contexts where
   /// the referenced witness table is still undergoing initialization.
   llvm::Value *emitInvariantLoadOfOpaqueWitness(IRGenFunction &IGF,
+                                                bool isProtocolWitness,
                                                 llvm::Value *table,
                                                 WitnessIndex index,
                                                 llvm::Value **slot = nullptr);
@@ -59,6 +63,7 @@ namespace irgen {
   /// The load is marked invariant. This should not be used in contexts where
   /// the referenced witness table is still undergoing initialization.
   llvm::Value *emitInvariantLoadOfOpaqueWitness(IRGenFunction &IGF,
+                                                bool isProtocolWitness,
                                                 llvm::Value *table,
                                                 llvm::Value *index,
                                                 llvm::Value **slot = nullptr);
@@ -210,8 +215,8 @@ namespace irgen {
   /// Emit a load of the 'alignmentMask' value witness.
   llvm::Value *emitLoadOfAlignmentMask(IRGenFunction &IGF, SILType T);
 
-  /// Emit a load of the 'isPOD' value witness.
-  llvm::Value *emitLoadOfIsPOD(IRGenFunction &IGF, SILType T);
+  /// Emit a load of the 'isTriviallyDestroyable' value witness.
+  llvm::Value *emitLoadOfIsTriviallyDestroyable(IRGenFunction &IGF, SILType T);
 
   /// Emit a load of the 'isBitwiseTakable' value witness.
   llvm::Value *emitLoadOfIsBitwiseTakable(IRGenFunction &IGF, SILType T);

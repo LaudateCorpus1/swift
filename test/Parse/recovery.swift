@@ -77,10 +77,11 @@ class ClassWithStaticDecls {
 //===--- Recovery for missing controlling expression in statements.
 
 func missingControllingExprInIf() {
-  if // expected-error {{expected expression, var, or let in 'if' condition}}
+  if
 
   if { // expected-error {{missing condition in 'if' statement}}
-  }
+  } // expected-error {{expected '{' after 'if' condition}}
+  // expected-error@-2 {{cannot convert value of type 'Void' to expected condition type 'Bool'}}
 
   if // expected-error {{missing condition in 'if' statement}}
   {
@@ -144,17 +145,17 @@ func missingWhileInRepeat() {
 func acceptsClosure<T>(t: T) -> Bool { return true }
 
 func missingControllingExprInFor() {
-  for ; { // expected-error {{C-style for statement has been removed in Swift 3}}
+  for ; { // expected-error {{C-style for statement was removed in Swift 3}}
   }
 
-  for ; // expected-error {{C-style for statement has been removed in Swift 3}}
+  for ; // expected-error {{C-style for statement was removed in Swift 3}}
   { 
   }
 
-  for ; true { // expected-error {{C-style for statement has been removed in Swift 3}}
+  for ; true { // expected-error {{C-style for statement was removed in Swift 3}}
   }
 
-  for var i = 0; true { // expected-error {{C-style for statement has been removed in Swift 3}}
+  for var i = 0; true { // expected-error {{C-style for statement was removed in Swift 3}}
     i += 1
   }
 }
@@ -234,10 +235,10 @@ func missingControllingExprInForEach() {
 }
 
 func missingControllingExprInSwitch() {
-  switch // expected-error {{expected expression in 'switch' statement}}
+  switch
 
-  switch { // expected-error {{expected expression in 'switch' statement}} expected-error {{'switch' statement body must have at least one 'case' or 'default' block}}
-  }
+  switch { // expected-error {{expected expression in 'switch' statement}}
+  } // expected-error {{expected '{' after 'switch' subject expression}}
 
   switch // expected-error {{expected expression in 'switch' statement}} expected-error {{'switch' statement body must have at least one 'case' or 'default' block}}
   {
@@ -381,16 +382,16 @@ struct ErrorTypeInVarDecl10 {
 }
 
 struct ErrorTypeInVarDecl11 {
-  var v1 : protocol<FooProtocol, // expected-error {{expected identifier for type name}}
+  var v1 : protocol<FooProtocol, // expected-error {{expected type}}
   var v2 : Int
 }
 
-func ErrorTypeInPattern1(_: protocol<) { } // expected-error {{expected identifier for type name}}
+func ErrorTypeInPattern1(_: protocol<) { } // expected-error {{expected type}}
 func ErrorTypeInPattern2(_: protocol<F) { } // expected-error {{expected '>' to complete protocol-constrained type}}
                                             // expected-note@-1 {{to match this opening '<'}}
                                             // expected-error@-2 {{cannot find type 'F' in scope}}
 
-func ErrorTypeInPattern3(_: protocol<F,) { } // expected-error {{expected identifier for type name}}
+func ErrorTypeInPattern3(_: protocol<F,) { } // expected-error {{expected type}}
                                              // expected-error@-1 {{cannot find type 'F' in scope}}
 
 struct ErrorTypeInVarDecl12 {
@@ -542,15 +543,7 @@ func exprPostfix2() {
 
 //===--- Recovery for expr-super.
 
-class Base {}
-
-class ExprSuper1 {
-  init() {
-    super // expected-error {{expected '.' or '[' after 'super'}}
-  }
-}
-
-class ExprSuper2 {
+class ExprSuper {
   init() {
     super. // expected-error {{expected member name following '.'}} 
   }
@@ -579,9 +572,8 @@ class С_43383 {
 extension С_43383 {
     print("The room where it happened, the room where it happened")
     // expected-error @-1 {{expected 'func' keyword in instance method declaration}}
-    // expected-error @-2 {{expected '{' in body of function declaration}}
-    // expected-error @-3 {{invalid redeclaration of 'print()'}}
-    // expected-error @-4 {{expected parameter name followed by ':'}}
+    // expected-error @-2 {{invalid redeclaration of 'print()'}}
+    // expected-error @-3 {{expected parameter name followed by ':'}}
 }
 
 
@@ -623,6 +615,8 @@ class WrongInheritanceClause6(Int {}
 
 // expected-error@+1 {{expected ':' to begin inheritance clause}} {{33-34=: }} 
 class WrongInheritanceClause7<T>(Int where T:AnyObject {}
+
+class Base {}
 
 // <rdar://problem/18502220> [swift-crashes 078] parser crash on invalid cast in sequence expr
 Base=1 as Base=1 // expected-error{{cannot convert value of type 'Int' to type 'Base' in coercion}}
@@ -674,6 +668,8 @@ case let (jeb):
 struct Foo19605164 {
 func a(s: S[{{g) -> Int {} // expected-note {{to match this opening '['}}
 }}} // expected-error {{expected ']' in array type}}
+// expected-error@-2{{consecutive statements on a line must be separated by ';'}}
+// expected-error@-3{{expected expression}}
 #endif
   
 // rdar://19605567
@@ -773,7 +769,7 @@ class r22240342 {
   lazy var xx: Int = {
     foo {  // expected-error {{cannot find 'foo' in scope}}
       let issueView = 42
-      issueView.delegate = 12
+      issueView.delegate = 12 // expected-error {{value of type 'Int' has no member 'delegate'}}
       
     }
     return 42
@@ -872,3 +868,10 @@ func testSkipToFindOpenBrace1() {
 func testSkipToFindOpenBrace2() {
   do { if true {} else false } // expected-error {{expected '{' or 'if' after 'else'}}
 }
+
+struct Outer {
+  struct Inner<T> {}
+}
+extension Outer.Inner<Never> { // expected-note {{in extension of 'Outer.Inner<Never>'}}
+  @someAttr
+} // expected-error {{expected declaration}}

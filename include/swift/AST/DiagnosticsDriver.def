@@ -162,6 +162,9 @@ ERROR(cannot_find_migration_script, none,
 ERROR(error_darwin_static_stdlib_not_supported, none,
       "-static-stdlib is no longer supported on Apple platforms", ())
 
+WARNING(warn_darwin_link_objc_deprecated, none,
+      "-link-objc-runtime is no longer supported on Apple platforms", ())
+
 ERROR(error_darwin_only_supports_libcxx, none,
       "The only C++ standard library supported on Apple platforms is libc++",
       ())
@@ -184,6 +187,9 @@ WARNING(warn_drv_darwin_sdk_invalid_settings, none,
 
 WARNING(warning_unsupported_driver_option,none,
         "option '%0' is only supported in swift-driver", (StringRef))
+
+WARNING(new_driver_not_found,none,
+        "using (deprecated) legacy driver, Swift installation does not contain swift-driver at: '%0'", (StringRef))
 
 WARNING(old_driver_deprecated,none,
         "legacy driver is now deprecated; consider avoiding specifying '%0'", (StringRef))

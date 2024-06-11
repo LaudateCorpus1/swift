@@ -412,7 +412,7 @@ struct SubscriptTest2 {
 }
 
 func testSubscript1(_ s2 : SubscriptTest2) {
-  _ = s2["foo"] // expected-error {{missing argument for parameter #2 in call}}
+  _ = s2["foo"] // expected-error {{missing argument for parameter #2 in subscript}}
 
   let a = s2["foo", 1.0] // expected-error {{no exact matches in call to subscript}}
 
@@ -464,15 +464,15 @@ do {
 
 struct InOutSubscripts {
   subscript(x1: inout Int) -> Int { return 0 }
-  // expected-error@-1 {{'inout' must not be used on subscript parameters}}
+  // expected-error@-1 {{'inout' may only be used on function or initializer parameters}}
 
   subscript(x2: inout Int, y2: inout Int) -> Int { return 0 }
-  // expected-error@-1 2{{'inout' must not be used on subscript parameters}}
+  // expected-error@-1 2{{'inout' may only be used on function or initializer parameters}}
 
   subscript(x3: (inout Int) -> ()) -> Int { return 0 } // ok
   subscript(x4: (inout Int, inout Int) -> ()) -> Int { return 0 } // ok
 
   subscript(inout x5: Int) -> Int { return 0 }
   // expected-error@-1 {{'inout' before a parameter name is not allowed, place it before the parameter type instead}}
-  // expected-error@-2 {{'inout' must not be used on subscript parameters}}
+  // expected-error@-2 {{'inout' may only be used on function or initializer parameters}}
 }

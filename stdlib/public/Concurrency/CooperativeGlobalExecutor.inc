@@ -18,13 +18,17 @@
 ///   swift_task_enqueueGlobalImpl
 ///   swift_task_enqueueGlobalWithDelayImpl
 ///   swift_task_enqueueMainExecutorImpl
+///   swift_task_checkIsolatedImpl
 /// as well as any cooperative-executor-specific functions in the runtime.
 ///
 ///===------------------------------------------------------------------===///
 
 #include <chrono>
-#include <thread>
-#include "swift/Basic/ListMerger.h"
+#ifndef SWIFT_THREADING_NONE
+# include <thread>
+#endif
+#include <errno.h>
+#include "swift/Basic/PriorityQueue.h"
 
 #if __has_include(<time.h>)
 # include <time.h>
@@ -46,11 +50,12 @@ struct JobQueueTraits {
   static void setNext(Job *job, Job *next) {
     storage(job) = next;
   }
-  static int compare(Job *lhs, Job *rhs) {
-    return descendingPriorityOrder(lhs->getPriority(), rhs->getPriority());
+  enum { prioritiesCount = PriorityBucketCount };
+  static int getPriorityIndex(Job *job) {
+    return getPriorityBucketIndex(job->getPriority());
   }
 };
-using JobQueueMerger = ListMerger<Job*, JobQueueTraits>;
+using JobPriorityQueue = PriorityQueue<Job*, JobQueueTraits>;
 
 using JobDeadline = std::chrono::time_point<std::chrono::steady_clock>;
 
@@ -94,17 +99,14 @@ struct JobDeadlineStorage<false> {
 
 } // end anonymous namespace
 
-static Job *JobQueue = nullptr;
+static JobPriorityQueue JobQueue;
 static Job *DelayedJobQueue = nullptr;
 
 /// Insert a job into the cooperative global queue.
 SWIFT_CC(swift)
 static void swift_task_enqueueGlobalImpl(Job *job) {
   assert(job && "no job provided");
-
-  JobQueueMerger merger(JobQueue);
-  merger.insert(job);
-  JobQueue = merger.release();
+  JobQueue.enqueue(job);
 }
 
 /// Enqueues a task on the main executor.
@@ -131,6 +133,13 @@ static void insertDelayedJob(Job *newJob, JobDeadline deadline) {
   }
   JobQueueTraits::setNext(newJob, nullptr);
   *position = newJob;
+}
+
+SWIFT_CC(swift)
+static void swift_task_checkIsolatedImpl(SerialExecutorRef executor) {
+  _task_serialExecutor_checkIsolated(
+      executor.getIdentity(), swift_getObjectType(executor.getIdentity()),
+      executor.getSerialExecutorWitnessTable());
 }
 
 /// Insert a job into the cooperative global queue with a delay.
@@ -177,7 +186,6 @@ static void recognizeReadyDelayedJobs() {
   if (!nextDelayedJob) return;
 
   auto now = std::chrono::steady_clock::now();
-  JobQueueMerger readyJobs(JobQueue);
 
   // Pull jobs off of the delayed-jobs queue whose deadline has been
   // reached, and add them to the ready queue.
@@ -187,12 +195,29 @@ static void recognizeReadyDelayedJobs() {
     JobDeadlineStorage<>::destroy(nextDelayedJob);
 
     auto next = JobQueueTraits::getNext(nextDelayedJob);
-    readyJobs.insert(nextDelayedJob);
+    JobQueue.enqueue(nextDelayedJob);
     nextDelayedJob = next;
   }
-
-  JobQueue = readyJobs.release();
   DelayedJobQueue = nextDelayedJob;
+}
+
+static void sleepThisThreadUntil(JobDeadline deadline) {
+#ifdef SWIFT_THREADING_NONE
+  auto duration = deadline - std::chrono::steady_clock::now();
+  // If the deadline is in the past, don't sleep with invalid negative value
+  if (duration <= std::chrono::nanoseconds::zero()) {
+    return;
+  }
+  auto sec = std::chrono::duration_cast<std::chrono::seconds>(duration);
+  auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(duration - sec);
+
+  struct timespec ts;
+  ts.tv_sec = sec.count();
+  ts.tv_nsec = ns.count();
+  while (nanosleep(&ts, &ts) == -1 && errno == EINTR);
+#else
+  std::this_thread::sleep_until(deadline);
+#endif
 }
 
 /// Claim the next job from the cooperative global queue.
@@ -202,8 +227,7 @@ static Job *claimNextFromCooperativeGlobalQueue() {
     recognizeReadyDelayedJobs();
 
     // If there's a job in the primary queue, run it.
-    if (auto job = JobQueue) {
-      JobQueue = JobQueueTraits::getNext(job);
+    if (auto job = JobQueue.dequeue()) {
       return job;
     }
 
@@ -211,7 +235,7 @@ static Job *claimNextFromCooperativeGlobalQueue() {
     // TODO: should the donator have some say in this?
     if (auto delayedJob = DelayedJobQueue) {
       auto deadline = JobDeadlineStorage<>::get(delayedJob);
-      std::this_thread::sleep_until(deadline);
+      sleepThisThreadUntil(deadline);
       continue;
     }
 
@@ -225,6 +249,6 @@ swift_task_donateThreadToGlobalExecutorUntil(bool (*condition)(void *),
   while (!condition(conditionContext)) {
     auto job = claimNextFromCooperativeGlobalQueue();
     if (!job) return;
-    swift_job_run(job, ExecutorRef::generic());
+    swift_job_run(job, SerialExecutorRef::generic());
   }
 }

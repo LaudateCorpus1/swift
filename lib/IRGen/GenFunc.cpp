@@ -120,47 +120,60 @@ using namespace irgen;
 namespace {
   /// Information about the IR-level signature of a function type.
   class FuncSignatureInfo {
-  private:
+  protected:
     /// The SIL function type being represented.
     const CanSILFunctionType FormalType;
-    
+
     mutable Signature TheSignature;
-    
+    mutable Signature TheCXXConstructorSignature;
+
   public:
     FuncSignatureInfo(CanSILFunctionType formalType)
       : FormalType(formalType) {}
-    
+
+    Signature
+    getCXXConstructorSignature(const clang::CXXConstructorDecl *cxxCtorDecl,
+                               IRGenModule &IGM) const;
     Signature getSignature(IRGenModule &IGM) const;
   };
 
+  class ObjCFuncSignatureInfo : public FuncSignatureInfo {
+  private:
+    mutable Signature TheDirectSignature;
+
+  public:
+    ObjCFuncSignatureInfo(CanSILFunctionType formalType)
+      : FuncSignatureInfo(formalType) {}
+
+    Signature getDirectSignature(IRGenModule &IGM) const;
+  };
+
   /// The @thin function type-info class.
-  class ThinFuncTypeInfo : public PODSingleScalarTypeInfo<ThinFuncTypeInfo,
-                                                          LoadableTypeInfo>,
-                           public FuncSignatureInfo {
-    ThinFuncTypeInfo(CanSILFunctionType formalType, llvm::Type *storageType,
+  template <class Derived>
+  class ThinFuncTypeInfoImpl :
+    public PODSingleScalarTypeInfo<Derived, LoadableTypeInfo> {
+
+  protected:
+    const Derived &asDerived() const {
+      return static_cast<const Derived &>(*this);
+    }
+
+    ThinFuncTypeInfoImpl(CanSILFunctionType formalType, llvm::Type *storageType,
                      Size size, Alignment align,
                      const SpareBitVector &spareBits)
-      : PODSingleScalarTypeInfo(storageType, size, spareBits, align),
-        FuncSignatureInfo(formalType)
+      : PODSingleScalarTypeInfo<Derived, LoadableTypeInfo>(storageType, size, spareBits, align)
     {
     }
 
   public:
-    static const ThinFuncTypeInfo *create(CanSILFunctionType formalType,
-                                          llvm::Type *storageType,
-                                          Size size, Alignment align,
-                                          const SpareBitVector &spareBits) {
-      return new ThinFuncTypeInfo(formalType, storageType, size, align,
-                                  spareBits);
-    }
-
     TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
-                                          SILType T) const override {
-      if (!IGM.getOptions().ForceStructTypeLayouts) {
-        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T);
+                                          SILType T,
+                                          bool useStructLayouts) const override {
+      if (!useStructLayouts) {
+        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(asDerived(), T);
       }
-      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T,
-                                                        ScalarKind::POD);
+      return IGM.typeLayoutCache.getOrCreateScalarEntry(asDerived(), T,
+                                                        ScalarKind::TriviallyDestroyable);
     }
 
     bool mayHaveExtraInhabitants(IRGenModule &IGM) const override {
@@ -193,6 +206,57 @@ namespace {
     }
   };
 
+  /// The @thin function type-info class.
+  class ThinFuncTypeInfo : public ThinFuncTypeInfoImpl<ThinFuncTypeInfo>,
+                           public FuncSignatureInfo {
+  public:
+
+    ThinFuncTypeInfo(CanSILFunctionType formalType, llvm::Type *storageType,
+                     Size size, Alignment align,
+                     const SpareBitVector &spareBits) :
+      ThinFuncTypeInfoImpl(formalType, storageType, size, align, spareBits),
+      FuncSignatureInfo(formalType) {}
+
+
+    static const ThinFuncTypeInfo *create(CanSILFunctionType formalType,
+                                          llvm::Type *storageType,
+                                          Size size, Alignment align,
+                                          const SpareBitVector &spareBits) {
+      return new ThinFuncTypeInfo(formalType, storageType, size, align,
+                                  spareBits);
+    }
+    void initialize(IRGenFunction &IGF, Explosion &src, Address addr,
+                    bool isOutlined) const override {
+      auto *fn = src.claimNext();
+
+      Explosion tmp;
+      tmp.add(fn);
+      PODSingleScalarTypeInfo<ThinFuncTypeInfo,LoadableTypeInfo>::initialize(IGF, tmp, addr, isOutlined);
+    }
+  };
+
+  /// The (objc_method) function type-info class.
+  class ObjCFuncTypeInfo : public ThinFuncTypeInfoImpl<ThinFuncTypeInfo>,
+                           public ObjCFuncSignatureInfo {
+  public:
+
+    ObjCFuncTypeInfo(CanSILFunctionType formalType, llvm::Type *storageType,
+                     Size size, Alignment align,
+                     const SpareBitVector &spareBits) :
+      ThinFuncTypeInfoImpl(formalType, storageType, size, align, spareBits),
+      ObjCFuncSignatureInfo(formalType) {}
+
+
+    static const ObjCFuncTypeInfo *create(CanSILFunctionType formalType,
+                                          llvm::Type *storageType,
+                                          Size size, Alignment align,
+                                          const SpareBitVector &spareBits) {
+      return new ObjCFuncTypeInfo(formalType, storageType, size, align,
+                                  spareBits);
+    }
+  };
+
+
   /// The @thick function type-info class.
   class FuncTypeInfo :
       public ScalarPairTypeInfo<FuncTypeInfo, ReferenceTypeInfo>,
@@ -200,7 +264,7 @@ namespace {
   protected:
     FuncTypeInfo(CanSILFunctionType formalType, llvm::StructType *storageType,
                  Size size, Alignment align, SpareBitVector &&spareBits,
-                 IsPOD_t pod)
+                 IsTriviallyDestroyable_t pod)
       : ScalarPairTypeInfo(storageType, size, std::move(spareBits), align, pod),
         FuncSignatureInfo(formalType)
     {
@@ -211,7 +275,7 @@ namespace {
                                       llvm::StructType *storageType,
                                       Size size, Alignment align,
                                       SpareBitVector &&spareBits,
-                                      IsPOD_t pod) {
+                                      IsTriviallyDestroyable_t pod) {
       return new FuncTypeInfo(formalType, storageType, size, align,
                               std::move(spareBits), pod);
     }
@@ -225,13 +289,15 @@ namespace {
     }
 #include "swift/AST/ReferenceStorage.def"
 
-    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
-                                        SILType T) const override {
-      if (!IGM.getOptions().ForceStructTypeLayouts) {
+    TypeLayoutEntry
+    *buildTypeLayoutEntry(IRGenModule &IGM,
+                          SILType T,
+                          bool useStructLayouts) const override {
+      if (!useStructLayouts) {
         return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T);
-      } else if (isPOD(ResilienceExpansion::Maximal)) {
+      } else if (isTriviallyDestroyable(ResilienceExpansion::Maximal)) {
         return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T,
-                                                           ScalarKind::POD);
+                                                           ScalarKind::TriviallyDestroyable);
       } else {
         return IGM.typeLayoutCache.getOrCreateScalarEntry(
             *this, T, ScalarKind::ThickFunc);
@@ -247,10 +313,12 @@ namespace {
     static bool isFirstElementTrivial() {
       return true;
     }
-    void emitRetainFirstElement(IRGenFunction &IGF, llvm::Value *fn,
-                                Optional<Atomicity> atomicity = None) const {}
-    void emitReleaseFirstElement(IRGenFunction &IGF, llvm::Value *fn,
-                                 Optional<Atomicity> atomicity = None) const {}
+    void emitRetainFirstElement(
+        IRGenFunction &IGF, llvm::Value *fn,
+        std::optional<Atomicity> atomicity = std::nullopt) const {}
+    void emitReleaseFirstElement(
+        IRGenFunction &IGF, llvm::Value *fn,
+        std::optional<Atomicity> atomicity = std::nullopt) const {}
     void emitAssignFirstElement(IRGenFunction &IGF, llvm::Value *fn,
                                 Address fnAddr) const {
       IGF.Builder.CreateStore(fn, fnAddr);
@@ -266,25 +334,27 @@ namespace {
       return ".data";
     }
     bool isSecondElementTrivial() const {
-      return isPOD(ResilienceExpansion::Maximal);
+      return isTriviallyDestroyable(ResilienceExpansion::Maximal);
     }
-    void emitRetainSecondElement(IRGenFunction &IGF, llvm::Value *data,
-                                 Optional<Atomicity> atomicity = None) const {
-      if (!isPOD(ResilienceExpansion::Maximal)) {
+    void emitRetainSecondElement(
+        IRGenFunction &IGF, llvm::Value *data,
+        std::optional<Atomicity> atomicity = std::nullopt) const {
+      if (!isTriviallyDestroyable(ResilienceExpansion::Maximal)) {
         if (!atomicity) atomicity = IGF.getDefaultAtomicity();
         IGF.emitNativeStrongRetain(data, *atomicity);
       }
     }
-    void emitReleaseSecondElement(IRGenFunction &IGF, llvm::Value *data,
-                                  Optional<Atomicity> atomicity = None) const {
-      if (!isPOD(ResilienceExpansion::Maximal)) {
+    void emitReleaseSecondElement(
+        IRGenFunction &IGF, llvm::Value *data,
+        std::optional<Atomicity> atomicity = std::nullopt) const {
+      if (!isTriviallyDestroyable(ResilienceExpansion::Maximal)) {
         if (!atomicity) atomicity = IGF.getDefaultAtomicity();
         IGF.emitNativeStrongRelease(data, *atomicity);
       }
     }
     void emitAssignSecondElement(IRGenFunction &IGF, llvm::Value *context,
                                  Address dataAddr) const {
-      if (isPOD(ResilienceExpansion::Maximal))
+      if (isTriviallyDestroyable(ResilienceExpansion::Maximal))
         IGF.Builder.CreateStore(context, dataAddr);
       else
         IGF.emitNativeStrongAssign(context, dataAddr);
@@ -407,9 +477,11 @@ namespace {
     ReferenceCounting getReferenceCounting() const {
       return ReferenceCounting::Block;
     }
-    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
-                                        SILType T) const override {
-      if (!IGM.getOptions().ForceStructTypeLayouts) {
+    TypeLayoutEntry
+    *buildTypeLayoutEntry(IRGenModule &IGM,
+                          SILType T,
+                          bool useStructLayouts) const override {
+      if (!useStructLayouts) {
         return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T);
       }
       return IGM.typeLayoutCache.getOrCreateScalarEntry(
@@ -427,15 +499,18 @@ namespace {
   public:
     BlockStorageTypeInfo(llvm::Type *type, Size size, Alignment align,
                          SpareBitVector &&spareBits,
-                         IsPOD_t pod, IsBitwiseTakable_t bt, Size captureOffset)
+                         IsTriviallyDestroyable_t pod, IsBitwiseTakable_t bt, Size captureOffset)
       : IndirectTypeInfo(type, size, std::move(spareBits), align, pod, bt,
+                         IsCopyable,
                          IsFixedSize),
         CaptureOffset(captureOffset)
     {}
     
-    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
-                                        SILType T) const override {
-      if (!IGM.getOptions().ForceStructTypeLayouts) {
+    TypeLayoutEntry
+    *buildTypeLayoutEntry(IRGenModule &IGM,
+                          SILType T,
+                          bool useStructLayouts) const override {
+      if (!useStructLayouts) {
         return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T);
       }
       return IGM.typeLayoutCache.getOrCreateScalarEntry(
@@ -488,7 +563,7 @@ const TypeInfo *TypeConverter::convertBlockStorageType(SILBlockStorageType *T) {
   spareBits.appendClearBits(captureOffset.getValueInBits());
 
   Size size = captureOffset;
-  IsPOD_t pod = IsNotPOD;
+  IsTriviallyDestroyable_t pod = IsNotTriviallyDestroyable;
   IsBitwiseTakable_t bt = IsNotBitwiseTakable;
   if (!fixedCapture) {
     IGM.unimplemented(SourceLoc(), "dynamic @block_storage capture");
@@ -501,7 +576,7 @@ const TypeInfo *TypeConverter::convertBlockStorageType(SILBlockStorageType *T) {
     spareBits.append(fixedCapture->getSpareBits());
 
     size = captureOffset + fixedCapture->getFixedSize();
-    pod = fixedCapture->isPOD(ResilienceExpansion::Maximal);
+    pod = fixedCapture->isTriviallyDestroyable(ResilienceExpansion::Maximal);
     bt = fixedCapture->isBitwiseTakable(ResilienceExpansion::Maximal);
   }
 
@@ -549,10 +624,19 @@ const TypeInfo *TypeConverter::convertFunctionType(SILFunctionType *T) {
   case SILFunctionType::Representation::Method:
   case SILFunctionType::Representation::CXXMethod:
   case SILFunctionType::Representation::WitnessMethod:
-  case SILFunctionType::Representation::ObjCMethod:
   case SILFunctionType::Representation::CFunctionPointer:
   case SILFunctionType::Representation::Closure:
+  case SILFunctionType::Representation::KeyPathAccessorGetter:
+  case SILFunctionType::Representation::KeyPathAccessorSetter:
+  case SILFunctionType::Representation::KeyPathAccessorEquals:
+  case SILFunctionType::Representation::KeyPathAccessorHash:
     return ThinFuncTypeInfo::create(CanSILFunctionType(T),
+                                    IGM.FunctionPtrTy,
+                                    IGM.getPointerSize(),
+                                    IGM.getPointerAlignment(),
+                                    IGM.getFunctionPointerSpareBits());
+  case SILFunctionType::Representation::ObjCMethod:
+    return ObjCFuncTypeInfo::create(CanSILFunctionType(T),
                                     IGM.FunctionPtrTy,
                                     IGM.getPointerSize(),
                                     IGM.getPointerAlignment(),
@@ -572,11 +656,11 @@ const TypeInfo *TypeConverter::convertFunctionType(SILFunctionType *T) {
       return FuncTypeInfo::create(
           CanSILFunctionType(T), IGM.NoEscapeFunctionPairTy,
           IGM.getPointerSize() * 2, IGM.getPointerAlignment(),
-          std::move(spareBits), IsPOD);
+          std::move(spareBits), IsTriviallyDestroyable);
     }
     return FuncTypeInfo::create(
         CanSILFunctionType(T), IGM.FunctionPairTy, IGM.getPointerSize() * 2,
-        IGM.getPointerAlignment(), std::move(spareBits), IsNotPOD);
+        IGM.getPointerAlignment(), std::move(spareBits), IsNotTriviallyDestroyable);
   }
   }
   llvm_unreachable("bad function type representation");
@@ -594,6 +678,33 @@ Signature FuncSignatureInfo::getSignature(IRGenModule &IGM) const {
   return TheSignature;
 }
 
+Signature FuncSignatureInfo::getCXXConstructorSignature(
+    const clang::CXXConstructorDecl *cxxCtorDecl, IRGenModule &IGM) const {
+  // If it's already been filled in, we're done.
+  if (TheCXXConstructorSignature.isValid())
+    return TheCXXConstructorSignature;
+
+  // Update the cache and return.
+  TheCXXConstructorSignature =
+      Signature::getUncached(IGM, FormalType, FunctionPointerKind(FormalType),
+                             /*forStaticCall*/ false, cxxCtorDecl);
+  assert(TheCXXConstructorSignature.isValid());
+  return TheCXXConstructorSignature;
+}
+
+Signature ObjCFuncSignatureInfo::getDirectSignature(IRGenModule &IGM) const {
+  // If it's already been filled in, we're done.
+  if (TheDirectSignature.isValid())
+    return TheDirectSignature;
+
+  // Update the cache and return.
+  TheDirectSignature = Signature::getUncached(IGM, FormalType,
+                                        FunctionPointerKind(FormalType),
+                                        /*forStaticCall*/ true);
+  assert(TheDirectSignature.isValid());
+  return TheDirectSignature;
+}
+
 static const FuncSignatureInfo &
 getFuncSignatureInfoForLowered(IRGenModule &IGM, CanSILFunctionType type) {
   auto &ti = IGM.getTypeInfoForLowered(type);
@@ -605,26 +716,46 @@ getFuncSignatureInfoForLowered(IRGenModule &IGM, CanSILFunctionType type) {
   case SILFunctionType::Representation::Method:
   case SILFunctionType::Representation::CXXMethod:
   case SILFunctionType::Representation::WitnessMethod:
-  case SILFunctionType::Representation::ObjCMethod:
   case SILFunctionType::Representation::Closure:
+  case SILFunctionType::Representation::KeyPathAccessorGetter:
+  case SILFunctionType::Representation::KeyPathAccessorSetter:
+  case SILFunctionType::Representation::KeyPathAccessorEquals:
+  case SILFunctionType::Representation::KeyPathAccessorHash:
     return ti.as<ThinFuncTypeInfo>();
+  case SILFunctionType::Representation::ObjCMethod:
+    return static_cast<const FuncSignatureInfo &>(ti.as<ObjCFuncTypeInfo>());
   case SILFunctionType::Representation::Thick:
     return ti.as<FuncTypeInfo>();
   }
   llvm_unreachable("bad function type representation");
 }
 
-Signature IRGenModule::getSignature(CanSILFunctionType type) {
-  return getSignature(type, FunctionPointerKind(type));
+Signature
+IRGenModule::getSignature(CanSILFunctionType type,
+                          const clang::CXXConstructorDecl *cxxCtorDecl) {
+  return getSignature(type, FunctionPointerKind(type), /*forStaticCall*/ false,
+                      cxxCtorDecl);
 }
 
-Signature IRGenModule::getSignature(CanSILFunctionType type,
-                                    FunctionPointerKind kind) {
+Signature
+IRGenModule::getSignature(CanSILFunctionType type, FunctionPointerKind kind,
+                          bool forStaticCall,
+                          const clang::CXXConstructorDecl *cxxCtorDecl) {
   // Don't bother caching if we're working with a special kind.
   if (kind.isSpecial())
     return Signature::getUncached(*this, type, kind);
 
   auto &sigInfo = getFuncSignatureInfoForLowered(*this, type);
+
+  if (forStaticCall &&
+      type->getRepresentation() == SILFunctionType::Representation::ObjCMethod) {
+    auto &objcSigInfo = static_cast<const ObjCFuncSignatureInfo &>(sigInfo);
+    return objcSigInfo.getDirectSignature(*this);
+  }
+
+  if (cxxCtorDecl)
+    return sigInfo.getCXXConstructorSignature(cxxCtorDecl, *this);
+
   return sigInfo.getSignature(*this);
 }
 
@@ -686,7 +817,7 @@ static void emitApplyArgument(IRGenFunction &IGF,
   if (!isSubstituted) {
     auto &substArgTI = cast<LoadableTypeInfo>(
         IGF.getTypeInfo(silConv.getSILType(substParam, substFnTy, context)));
-    substArgTI.reexplode(IGF, in, out);
+    substArgTI.reexplode(in, out);
     return;
   }
 
@@ -703,6 +834,13 @@ CanType irgen::getArgumentLoweringType(CanType type, SILParameterInfo paramInfo,
   case ParameterConvention::Direct_Unowned:
   case ParameterConvention::Direct_Guaranteed:
     return type;
+
+  // Capture pack parameters by value (a pointer).
+  case ParameterConvention::Pack_Guaranteed:
+  case ParameterConvention::Pack_Owned:
+  case ParameterConvention::Pack_Inout:
+    return type;
+
   // Capture indirect parameters if the closure is not [onstack]. [onstack]
   // closures don't take ownership of their arguments so we just capture the
   // address.
@@ -719,6 +857,34 @@ CanType irgen::getArgumentLoweringType(CanType type, SILParameterInfo paramInfo,
     return CanInOutType::get(type);
   }
   llvm_unreachable("unhandled convention");
+}
+
+static Size getOffsetOfOpaqueIsolationField(IRGenModule &IGM,
+                                      const LoadableTypeInfo &isolationTI) {
+  auto offset = IGM.RefCountedStructSize;
+  return offset.roundUpToAlignment(isolationTI.getFixedAlignment());
+
+}
+
+/// Load the stored isolation of an @isolated(any) function type, which
+/// is assumed to be at a known offset within a closure object.
+void irgen::emitExtractFunctionIsolation(IRGenFunction &IGF,
+                                         llvm::Value *fnContext,
+                                         Explosion &result) {
+  auto isolationTy = SILType::getOpaqueIsolationType(IGF.IGM.Context);
+  auto &isolationTI = cast<LoadableTypeInfo>(IGF.getTypeInfo(isolationTy));
+
+  Address baseAddr = Address(fnContext, IGF.IGM.RefCountedStructTy,
+                            IGF.IGM.getPointerAlignment());
+  baseAddr = IGF.Builder.CreateElementBitCast(baseAddr, IGF.IGM.Int8Ty);
+
+  auto offset = getOffsetOfOpaqueIsolationField(IGF.IGM, isolationTI);
+  Address fieldAddr = IGF.Builder.CreateConstByteArrayGEP(baseAddr, offset);
+  fieldAddr =
+    IGF.Builder.CreateElementBitCast(fieldAddr, isolationTI.getStorageType());
+
+  // Really a borrow
+  isolationTI.loadAsTake(IGF, fieldAddr, result);
 }
 
 static bool isABIIgnoredParameterWithoutStorage(IRGenModule &IGM,
@@ -764,7 +930,7 @@ protected:
   IRGenModule &IGM;
   IRGenFunction &subIGF;
   llvm::Function *fwd;
-  const Optional<FunctionPointer> &staticFnPtr;
+  const std::optional<FunctionPointer> &staticFnPtr;
   bool calleeHasContext;
   const Signature &origSig;
   CanSILFunctionType origType;
@@ -783,7 +949,7 @@ protected:
 
   PartialApplicationForwarderEmission(
       IRGenModule &IGM, IRGenFunction &subIGF, llvm::Function *fwd,
-      const Optional<FunctionPointer> &staticFnPtr, bool calleeHasContext,
+      const std::optional<FunctionPointer> &staticFnPtr, bool calleeHasContext,
       const Signature &origSig, CanSILFunctionType origType,
       CanSILFunctionType substType, CanSILFunctionType outType,
       SubstitutionMap subs, HeapLayout const *layout,
@@ -975,7 +1141,7 @@ class SyncPartialApplicationForwarderEmission
 public:
   SyncPartialApplicationForwarderEmission(
       IRGenModule &IGM, IRGenFunction &subIGF, llvm::Function *fwd,
-      const Optional<FunctionPointer> &staticFnPtr, bool calleeHasContext,
+      const std::optional<FunctionPointer> &staticFnPtr, bool calleeHasContext,
       const Signature &origSig, CanSILFunctionType origType,
       CanSILFunctionType substType, CanSILFunctionType outType,
       SubstitutionMap subs, HeapLayout const *layout,
@@ -999,6 +1165,10 @@ public:
   void forwardErrorResult() override {
     llvm::Value *errorResultPtr = origParams.claimNext();
     args.add(errorResultPtr);
+    if (origConv.isTypedError()) {
+      auto *typedErrorResultPtr = origParams.claimNext();
+      args.add(typedErrorResultPtr);
+    }
   }
   llvm::CallInst *createCall(FunctionPointer &fnPtr) override {
     return subIGF.Builder.CreateCall(fnPtr, args.claimAll());
@@ -1072,11 +1242,11 @@ class AsyncPartialApplicationForwarderEmission
     Kind kind;
     llvm::Value *value;
   };
-  Optional<Self> self = llvm::None;
+  std::optional<Self> self = std::nullopt;
   unsigned asyncParametersInsertionIndex = 0;
 
   void saveValue(ElementLayout layout, Explosion &explosion) {
-    Address addr = layout.project(subIGF, context, /*offsets*/ llvm::None);
+    Address addr = layout.project(subIGF, context, /*offsets*/ std::nullopt);
     auto &ti = cast<LoadableTypeInfo>(layout.getType());
     ti.initialize(subIGF, explosion, addr, /*isOutlined*/ false);
   }
@@ -1084,7 +1254,7 @@ class AsyncPartialApplicationForwarderEmission
 public:
   AsyncPartialApplicationForwarderEmission(
       IRGenModule &IGM, IRGenFunction &subIGF, llvm::Function *fwd,
-      const Optional<FunctionPointer> &staticFnPtr, bool calleeHasContext,
+      const std::optional<FunctionPointer> &staticFnPtr, bool calleeHasContext,
       const Signature &origSig, CanSILFunctionType origType,
       CanSILFunctionType substType, CanSILFunctionType outType,
       SubstitutionMap subs, HeapLayout const *layout,
@@ -1092,8 +1262,7 @@ public:
       : PartialApplicationForwarderEmission(
             IGM, subIGF, fwd, staticFnPtr, calleeHasContext, origSig, origType,
             substType, outType, subs, layout, conventions),
-        layout(getAsyncContextLayout(
-            subIGF.IGM, origType, substType, subs)),
+        layout(getAsyncContextLayout(subIGF.IGM, origType, substType, subs)),
         currentArgumentIndex(outType->getNumParameters()) {}
 
   void begin() override { super::begin(); }
@@ -1127,8 +1296,8 @@ public:
       auto *context = subIGF.getAsyncContext();
       if (auto schema =
               subIGF.IGM.getOptions().PointerAuth.AsyncContextParent) {
-        Address fieldAddr =
-            fieldLayout.project(subIGF, calleeContext, /*offsets*/ llvm::None);
+        Address fieldAddr = fieldLayout.project(subIGF, calleeContext,
+                                                /*offsets*/ std::nullopt);
         auto authInfo = PointerAuthInfo::emit(
             subIGF, schema, fieldAddr.getAddress(), PointerAuthEntity());
         context = emitPointerAuthSign(subIGF, context, authInfo);
@@ -1143,8 +1312,8 @@ public:
       auto fnVal = currentResumeFn;
       // Sign the pointer.
       if (auto schema = subIGF.IGM.getOptions().PointerAuth.AsyncContextResume) {
-        Address fieldAddr =
-            fieldLayout.project(subIGF, calleeContext, /*offsets*/ llvm::None);
+        Address fieldAddr = fieldLayout.project(subIGF, calleeContext,
+                                                /*offsets*/ std::nullopt);
         auto authInfo = PointerAuthInfo::emit(
             subIGF, schema, fieldAddr.getAddress(), PointerAuthEntity());
         fnVal = emitPointerAuthSign(subIGF, fnVal, authInfo);
@@ -1171,8 +1340,12 @@ public:
   }
 
   void forwardErrorResult() override {
-    // Nothing to do here.  The error result pointer is already in the
-    // appropriate position.
+    // The error result pointer is already in the appropriate position but the
+    // type error address is not.
+    if (origConv.isTypedError()) {
+      auto *typedErrorResultPtr = origParams.claimNext();
+      args.add(typedErrorResultPtr);
+    }
   }
   llvm::CallInst *createCall(FunctionPointer &fnPtr) override {
     PointerAuthInfo newAuthInfo =
@@ -1226,7 +1399,7 @@ public:
 std::unique_ptr<PartialApplicationForwarderEmission>
 getPartialApplicationForwarderEmission(
     IRGenModule &IGM, IRGenFunction &subIGF, llvm::Function *fwd,
-    const Optional<FunctionPointer> &staticFnPtr, bool calleeHasContext,
+    const std::optional<FunctionPointer> &staticFnPtr, bool calleeHasContext,
     const Signature &origSig, CanSILFunctionType origType,
     CanSILFunctionType substType, CanSILFunctionType outType,
     SubstitutionMap subs, HeapLayout const *layout,
@@ -1249,21 +1422,17 @@ getPartialApplicationForwarderEmission(
 /// If 'layout' is null, there is a single captured value of
 /// Swift-refcountable type that is being used directly as the
 /// context object.
-static llvm::Value *emitPartialApplicationForwarder(IRGenModule &IGM,
-                                   const Optional<FunctionPointer> &staticFnPtr,
-                                   bool calleeHasContext,
-                                   const Signature &origSig,
-                                   CanSILFunctionType origType,
-                                   CanSILFunctionType substType,
-                                   CanSILFunctionType outType,
-                                   SubstitutionMap subs,
-                                   HeapLayout const *layout,
-                                   ArrayRef<ParameterConvention> conventions) {
+static llvm::Value *emitPartialApplicationForwarder(
+    IRGenModule &IGM, const std::optional<FunctionPointer> &staticFnPtr,
+    bool calleeHasContext, const Signature &origSig,
+    CanSILFunctionType origType, CanSILFunctionType substType,
+    CanSILFunctionType outType, SubstitutionMap subs, HeapLayout const *layout,
+    ArrayRef<ParameterConvention> conventions) {
   auto outSig = IGM.getSignature(outType);
   llvm::AttributeList outAttrs = outSig.getAttributes();
   llvm::FunctionType *fwdTy = outSig.getType();
   SILFunctionConventions outConv(outType, IGM.getSILModule());
-  Optional<AsyncContextLayout> asyncLayout;
+  std::optional<AsyncContextLayout> asyncLayout;
 
   StringRef FnName;
   if (staticFnPtr)
@@ -1341,7 +1510,10 @@ static llvm::Value *emitPartialApplicationForwarder(IRGenModule &IGM,
   case ParameterConvention::Indirect_InoutAliasable:
   case ParameterConvention::Indirect_In:
   case ParameterConvention::Indirect_In_Guaranteed:
-    llvm_unreachable("indirect callables not supported");
+  case ParameterConvention::Pack_Guaranteed:
+  case ParameterConvention::Pack_Owned:
+  case ParameterConvention::Pack_Inout:
+    llvm_unreachable("indirect or pack callables not supported");
   }
 
   // Lower the captured arguments in the original function's generic context.
@@ -1350,7 +1522,6 @@ static llvm::Value *emitPartialApplicationForwarder(IRGenModule &IGM,
   // This is where the context parameter appears.
   llvm::Value *rawData = nullptr;
   Address data;
-  unsigned nextCapturedField = 0;
   if (!layout) {
     rawData = emission->getContext();
   } else if (!layout->isKnownEmpty()) {
@@ -1359,10 +1530,11 @@ static llvm::Value *emitPartialApplicationForwarder(IRGenModule &IGM,
 
     // Restore type metadata bindings, if we have them.
     if (layout->hasBindings()) {
-      auto bindingLayout = layout->getElement(nextCapturedField++);
+      auto bindingLayout = layout->getElement(layout->getBindingsIndex());
       // The bindings should be fixed-layout inside the object, so we can
       // pass None here. If they weren't, we'd have a chicken-egg problem.
-      auto bindingsAddr = bindingLayout.project(subIGF, data, /*offsets*/ None);
+      auto bindingsAddr =
+          bindingLayout.project(subIGF, data, /*offsets*/ std::nullopt);
       layout->getBindings().restore(subIGF, bindingsAddr,
                                     MetadataState::Complete);
     }
@@ -1445,7 +1617,7 @@ static llvm::Value *emitPartialApplicationForwarder(IRGenModule &IGM,
     // We need to retain the parameter if:
     //   - we received at +0 (either) and are passing as owned
     //   - we received as unowned and are passing as guaranteed
-    auto argConvention = conventions[nextCapturedField++];
+    auto argConvention = conventions[0];
     switch (argConvention) {
     case ParameterConvention::Indirect_In:
     case ParameterConvention::Direct_Owned:
@@ -1470,6 +1642,9 @@ static llvm::Value *emitPartialApplicationForwarder(IRGenModule &IGM,
 
     case ParameterConvention::Indirect_Inout:
     case ParameterConvention::Indirect_InoutAliasable:
+    case ParameterConvention::Pack_Guaranteed:
+    case ParameterConvention::Pack_Owned:
+    case ParameterConvention::Pack_Inout:
       llvm_unreachable("should never happen!");
     }
 
@@ -1523,12 +1698,15 @@ static llvm::Value *emitPartialApplicationForwarder(IRGenModule &IGM,
     HeapNonFixedOffsets offsets(subIGF, *layout);
 
     // Perform the loads.
-    for (unsigned n = layout->getElements().size();
-         nextCapturedField < n;
-         ++nextCapturedField) {
-      auto &fieldLayout = layout->getElement(nextCapturedField);
-      auto &fieldTy = layout->getElementTypes()[nextCapturedField];
-      auto fieldConvention = conventions[nextCapturedField];
+    for (unsigned fieldIndex : indices(layout->getElements())) {
+      // Ignore the bindings field, which we handled above.
+      if (layout->hasBindings() &&
+          fieldIndex == layout->getBindingsIndex())
+        continue;
+
+      auto &fieldLayout = layout->getElement(fieldIndex);
+      auto &fieldTy = layout->getElementTypes()[fieldIndex];
+      auto fieldConvention = conventions[fieldIndex];
       Address fieldAddr = fieldLayout.project(subIGF, data, offsets);
       auto &fieldTI = fieldLayout.getType();
       lastCapturedFieldPtr = fieldAddr.getAddress();
@@ -1582,6 +1760,11 @@ static llvm::Value *emitPartialApplicationForwarder(IRGenModule &IGM,
           dependsOnContextLifetime = true;
         }
         break;
+      case ParameterConvention::Pack_Guaranteed:
+      case ParameterConvention::Pack_Owned:
+      case ParameterConvention::Pack_Inout:
+        llvm_unreachable("partial application of pack?");
+        break;
       case ParameterConvention::Indirect_Inout:
       case ParameterConvention::Indirect_InoutAliasable:
         // Load the address of the inout parameter.
@@ -1591,7 +1774,7 @@ static llvm::Value *emitPartialApplicationForwarder(IRGenModule &IGM,
       case ParameterConvention::Direct_Unowned:
         // If the type is nontrivial, keep the context alive since the field
         // depends on the context to not be deallocated.
-        if (!fieldTI.isPOD(ResilienceExpansion::Maximal))
+        if (!fieldTI.isTriviallyDestroyable(ResilienceExpansion::Maximal))
           dependsOnContextLifetime = true;
 
         // Load these parameters directly. We can "take" since the parameter is
@@ -1787,7 +1970,7 @@ static llvm::Value *emitPartialApplicationForwarder(IRGenModule &IGM,
 
 /// Emit a partial application thunk for a function pointer applied to a partial
 /// set of argument values.
-Optional<StackAddress> irgen::emitFunctionPartialApplication(
+std::optional<StackAddress> irgen::emitFunctionPartialApplication(
     IRGenFunction &IGF, SILFunction &SILFn, const FunctionPointer &fn,
     llvm::Value *fnContext, Explosion &args, ArrayRef<SILParameterInfo> params,
     SubstitutionMap subs, CanSILFunctionType origType,
@@ -1797,8 +1980,8 @@ Optional<StackAddress> irgen::emitFunctionPartialApplication(
   // directly as our closure context without creating a box and thunk.
   enum HasSingleSwiftRefcountedContext { Maybe, Yes, No, Thunkable }
     hasSingleSwiftRefcountedContext = Maybe;
-  Optional<ParameterConvention> singleRefcountedConvention;
-  Optional<llvm::Type *> singleRefCountedType;
+  std::optional<ParameterConvention> singleRefcountedConvention;
+  std::optional<llvm::Type *> singleRefCountedType;
 
   SmallVector<const TypeInfo *, 4> argTypeInfos;
   SmallVector<SILType, 4> argValTypes;
@@ -1829,22 +2012,7 @@ Optional<StackAddress> irgen::emitFunctionPartialApplication(
     }
   }
 
-  // Reserve space for polymorphic bindings.
-  auto bindings = NecessaryBindings::forPartialApplyForwarder(
-      IGF.IGM, origType, subs, considerParameterSources);
-
-  if (!bindings.empty()) {
-    hasSingleSwiftRefcountedContext = No;
-    auto bindingsSize = bindings.getBufferSize(IGF.IGM);
-    auto &bindingsTI = IGF.IGM.getOpaqueStorageTypeInfo(bindingsSize,
-                                                 IGF.IGM.getPointerAlignment());
-    argValTypes.push_back(SILType());
-    argTypeInfos.push_back(&bindingsTI);
-    argConventions.push_back(ParameterConvention::Direct_Unowned);
-  }
-
-  // Collect the type infos for the context parameters.
-  for (auto param : params) {
+  auto addParam = [&](SILParameterInfo param) {
     SILType argType = IGF.IGM.silConv.getSILType(
         param, origType, IGF.IGM.getMaximalTypeExpansionContext());
 
@@ -1856,7 +2024,7 @@ Optional<StackAddress> irgen::emitFunctionPartialApplication(
     // Empty values don't matter.
     auto schema = ti.getSchema();
     if (schema.empty() && !param.isFormalIndirect())
-      continue;
+      return;
 
     argValTypes.push_back(argType);
     argConventions.push_back(param.getConvention());
@@ -1865,14 +2033,14 @@ Optional<StackAddress> irgen::emitFunctionPartialApplication(
     // Update the single-swift-refcounted check, unless we already ruled that
     // out.
     if (hasSingleSwiftRefcountedContext == No)
-      continue;
+      return;
     
     
     // Adding nonempty values when we already have a single refcounted pointer
     // means we don't have a single value anymore.
     if (hasSingleSwiftRefcountedContext != Maybe) {
       hasSingleSwiftRefcountedContext = No;
-      continue;
+      return;
     }
       
     if (ti.isSingleSwiftRetainablePointer(ResilienceExpansion::Maximal)) {
@@ -1882,6 +2050,37 @@ Optional<StackAddress> irgen::emitFunctionPartialApplication(
     } else {
       hasSingleSwiftRefcountedContext = No;
     }
+  };
+
+  // If the out type is @isolated(any), the storage for the erased isolation
+  // goes first.
+  bool hasErasedIsolation = outType->hasErasedIsolation();
+  if (hasErasedIsolation) {
+    assert(params[0].getInterfaceType() ==
+             SILType::getOpaqueIsolationType(IGF.IGM.Context).getASTType());
+    addParam(params[0]);
+  }
+
+  // Reserve space for polymorphic bindings.
+  auto bindings = NecessaryBindings::forPartialApplyForwarder(
+      IGF.IGM, origType, subs, outType->isNoEscape(),
+      considerParameterSources);
+
+  std::optional<unsigned> bindingsIndex;
+  if (!bindings.empty()) {
+    bindingsIndex = argTypeInfos.size();
+    hasSingleSwiftRefcountedContext = No;
+    auto bindingsSize = bindings.getBufferSize(IGF.IGM);
+    auto &bindingsTI = IGF.IGM.getOpaqueStorageTypeInfo(bindingsSize,
+                                                 IGF.IGM.getPointerAlignment());
+    argValTypes.push_back(SILType());
+    argTypeInfos.push_back(&bindingsTI);
+    argConventions.push_back(ParameterConvention::Direct_Unowned);
+  }
+
+  // Collect the type infos for the context parameters.
+  for (auto param : params.slice(hasErasedIsolation ? 1 : 0)) {
+    addParam(param);
   }
 
   // We can't just bitcast if there's an error parameter to forward.
@@ -1964,8 +2163,8 @@ Optional<StackAddress> irgen::emitFunctionPartialApplication(
     out.add(ctx);
     return {};
   }
-  
-  Optional<FunctionPointer> staticFn;
+
+  std::optional<FunctionPointer> staticFn;
   if (fn.isConstant()) staticFn = fn;
 
   // If the function pointer is dynamic, include it in the context.
@@ -1988,6 +2187,8 @@ Optional<StackAddress> irgen::emitFunctionPartialApplication(
         ParameterConvention::Indirect_InoutAliasable) {
     assert(bindings.empty());
     assert(args.size() == 1);
+    assert(!substType->hasErasedIsolation());
+    assert(!hasErasedIsolation);
 
     auto origSig = IGF.IGM.getSignature(origType);
 
@@ -2022,11 +2223,21 @@ Optional<StackAddress> irgen::emitFunctionPartialApplication(
          && "argument info lists out of sync");
   HeapLayout layout(IGF.IGM, LayoutStrategy::Optimal, argValTypes, argTypeInfos,
                     /*typeToFill*/ nullptr, std::move(bindings),
-                    /*bindingsIndex*/ 0);
+                    bindingsIndex ? *bindingsIndex : 0);
+
+#ifndef NDEBUG
+  if (hasErasedIsolation) {
+    auto &isolationFieldLayout = layout.getElement(0);
+    assert(isolationFieldLayout.hasByteOffset() &&
+           isolationFieldLayout.getByteOffset() ==
+             getOffsetOfOpaqueIsolationField(IGF.IGM,
+               cast<LoadableTypeInfo>(isolationFieldLayout.getType())));
+  }
+#endif
 
   llvm::Value *data;
 
-  Optional<StackAddress> stackAddr;
+  std::optional<StackAddress> stackAddr;
 
   if (args.empty() && layout.isKnownEmpty()) {
     if (outType->isNoEscape())
@@ -2039,7 +2250,9 @@ Optional<StackAddress> irgen::emitFunctionPartialApplication(
     HeapNonFixedOffsets offsets(IGF, layout);
     if (outType->isNoEscape()) {
       stackAddr = IGF.emitDynamicAlloca(
-          IGF.IGM.Int8Ty, layout.isFixedLayout() ? layout.emitSize(IGF.IGM) : offsets.getSize() , Alignment(16));
+          IGF.IGM.Int8Ty,
+          layout.isFixedLayout() ? layout.emitSize(IGF.IGM) : offsets.getSize(),
+          Alignment(16));
       stackAddr = stackAddr->withAddress(IGF.Builder.CreateElementBitCast(
           stackAddr->getAddress(), IGF.IGM.OpaqueTy));
       data = stackAddr->getAddress().getAddress();
@@ -2052,21 +2265,18 @@ Optional<StackAddress> irgen::emitFunctionPartialApplication(
     }
     Address dataAddr = layout.emitCastTo(IGF, data);
     
-    unsigned i = 0;
-
-    // Store necessary bindings, if we have them.
-    if (layout.hasBindings()) {
-      auto &bindingsLayout = layout.getElement(i);
-      Address bindingsAddr = bindingsLayout.project(IGF, dataAddr, offsets);
-      layout.getBindings().save(IGF, bindingsAddr);
-      ++i;
-    }
-    
     // Store the context arguments.
-    for (unsigned end = layout.getElements().size(); i < end; ++i) {
+    for (unsigned i : indices(layout.getElements())) {
       auto &fieldLayout = layout.getElement(i);
-      auto &fieldTy = layout.getElementTypes()[i];
       Address fieldAddr = fieldLayout.project(IGF, dataAddr, offsets);
+
+      // Handle necessary bindings specially.
+      if (i == bindingsIndex) {
+        layout.getBindings().save(IGF, fieldAddr);
+        continue;
+      }
+
+      auto &fieldTy = layout.getElementTypes()[i];
 
       // We don't add non-constant function pointers to the explosion above,
       // so we need to handle them specially now.
@@ -2099,7 +2309,8 @@ Optional<StackAddress> irgen::emitFunctionPartialApplication(
           auto addr =
               fieldLayout.getType().getAddressForPointer(args.claimNext());
           fieldLayout.getType().initializeWithTake(IGF, fieldAddr, addr,
-                                                   fieldTy, isOutlined);
+                                                   fieldTy, isOutlined,
+                                                   /*zeroizeIfSensitive=*/ true);
         }
         break;
       }
@@ -2111,6 +2322,12 @@ Optional<StackAddress> irgen::emitFunctionPartialApplication(
       case ParameterConvention::Indirect_InoutAliasable:
         cast<LoadableTypeInfo>(fieldLayout.getType())
             .initialize(IGF, args, fieldAddr, isOutlined);
+        break;
+
+      case ParameterConvention::Pack_Guaranteed:
+      case ParameterConvention::Pack_Owned:
+      case ParameterConvention::Pack_Inout:
+        llvm_unreachable("partial application of pack?");
         break;
       }
     }
@@ -2231,8 +2448,8 @@ void irgen::emitBlockHeader(IRGenFunction &IGF,
   uint32_t flags = 0;
   auto &captureTL
     = IGF.getTypeInfoForLowered(blockTy->getCaptureType());
-  bool isPOD = captureTL.isPOD(ResilienceExpansion::Maximal);
-  if (!isPOD)
+  bool isTriviallyDestroyable = captureTL.isTriviallyDestroyable(ResilienceExpansion::Maximal);
+  if (!isTriviallyDestroyable)
     flags |= 1 << 25;
   
   // - HAS_STRET, if the invoke function is sret
@@ -2262,7 +2479,7 @@ void irgen::emitBlockHeader(IRGenFunction &IGF,
   descriptorFields.addInt(UnsignedLongTy,
                           storageTL.getFixedSize().getValue());
   
-  if (!isPOD) {
+  if (!isTriviallyDestroyable) {
     // Define the copy and dispose helpers.
     descriptorFields.addSignedPointer(
                        emitBlockCopyHelper(IGF.IGM, blockTy, storageTL),
@@ -2393,6 +2610,7 @@ IRGenFunction::createAsyncDispatchFn(const FunctionPointer &fnPtr,
                              llvm::StringRef(name), &IGM.Module);
   dispatch->setCallingConv(IGM.SwiftAsyncCC);
   dispatch->setDoesNotThrow();
+  dispatch->addFnAttr(llvm::Attribute::AlwaysInline);
   IRGenFunction dispatchIGF(IGM, dispatch);
   // Don't emit debug info if we are generating a function for the prologue.
   if (IGM.DebugInfo && Builder.getCurrentDebugLocation())
@@ -2445,13 +2663,15 @@ void IRGenFunction::emitSuspensionPoint(Explosion &toExecutor,
 
 llvm::Function *IRGenFunction::getOrCreateResumeFromSuspensionFn() {
   auto name = "__swift_async_resume_get_context";
-  return cast<llvm::Function>(IGM.getOrCreateHelperFunction(
+  auto fn = cast<llvm::Function>(IGM.getOrCreateHelperFunction(
       name, IGM.Int8PtrTy, {IGM.Int8PtrTy},
       [&](IRGenFunction &IGF) {
         auto &Builder = IGF.Builder;
         Builder.CreateRet(&*IGF.CurFn->arg_begin());
       },
       false /*isNoInline*/));
+  fn->addFnAttr(llvm::Attribute::AlwaysInline);
+  return fn;
 }
 
 llvm::Function *IRGenFunction::createAsyncSuspendFn() {
@@ -2476,6 +2696,7 @@ llvm::Function *IRGenFunction::createAsyncSuspendFn() {
                              name, &IGM.Module);
   suspendFn->setCallingConv(IGM.SwiftAsyncCC);
   suspendFn->setDoesNotThrow();
+  suspendFn->addFnAttr(llvm::Attribute::AlwaysInline);
   IRGenFunction suspendIGF(IGM, suspendFn);
   if (IGM.DebugInfo)
     IGM.DebugInfo->emitOutlinedFunction(suspendIGF, suspendFn,
@@ -2502,8 +2723,8 @@ llvm::Function *IRGenFunction::createAsyncSuspendFn() {
   auto *suspendCall = Builder.CreateCall(
       IGM.getTaskSwitchFuncFunctionPointer(),
       {context, resumeFunction, targetExecutorFirst, targetExecutorSecond});
-  suspendCall->setDoesNotThrow();
   suspendCall->setCallingConv(IGM.SwiftAsyncCC);
+  suspendCall->setDoesNotThrow();
   suspendCall->setTailCallKind(IGM.AsyncTailCallKind);
 
   llvm::AttributeList attrs = suspendCall->getAttributes();

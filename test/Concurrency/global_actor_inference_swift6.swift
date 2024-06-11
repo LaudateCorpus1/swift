@@ -1,8 +1,11 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-swift-frontend -swift-version 6 -emit-module -emit-module-path %t/other_global_actor_inference.swiftmodule -module-name other_global_actor_inference -warn-concurrency %S/Inputs/other_global_actor_inference.swift
-// RUN: %target-typecheck-verify-swift -swift-version 6 -I %t -disable-availability-checking
+
+// RUN: %target-swift-frontend -swift-version 6 -emit-module -emit-module-path %t/other_global_actor_inference.swiftmodule -module-name other_global_actor_inference -strict-concurrency=complete %S/Inputs/other_global_actor_inference.swift
+
+// RUN: %target-swift-frontend -swift-version 6 -I %t -disable-availability-checking %s -emit-sil -o /dev/null -verify -enable-upcoming-feature GlobalActorIsolatedTypesUsability
+
 // REQUIRES: concurrency
-// REQUIRES: asserts
+
 import other_global_actor_inference
 
 actor SomeActor { }
@@ -64,11 +67,13 @@ struct WrapperOnActor<Wrapped: Sendable> {
 public struct WrapperOnMainActor<Wrapped> {
   // Make sure inference of @MainActor on wrappedValue doesn't crash.
 
+  // expected-note@+1 {{mutation of this property is only permitted within the actor}}
   public var wrappedValue: Wrapped // expected-note {{property declared here}}
 
   public var accessCount: Int
 
   nonisolated public init(wrappedValue: Wrapped) {
+    // expected-error@+1 {{main actor-isolated property 'wrappedValue' can not be mutated from a non-isolated context}}
     self.wrappedValue = wrappedValue
   }
 }
@@ -78,7 +83,7 @@ struct HasMainActorWrappedProp {
 
   var plainStorage: Int
 
-  var computedProp: Int { 0 } // expected-note {{property declared here}}
+  var computedProp: Int { 0 }
 
   nonisolated func testErrors() {
     _ = thing // expected-error {{main actor-isolated property 'thing' can not be referenced from a non-isolated context}}
@@ -89,7 +94,7 @@ struct HasMainActorWrappedProp {
 
     _ = plainStorage
 
-    _ = computedProp // expected-error {{main actor-isolated property 'computedProp' can not be referenced from a non-isolated context}}
+    _ = computedProp
   }
 }
 
@@ -110,7 +115,7 @@ struct HasWrapperOnActor {
     synced = 17
   }
 
-  @WrapperActor var actorSynced: Int = 0
+  @WrapperActor var actorSynced: Int = 0 // expected-error{{'nonisolated' is not supported on properties with property wrappers}}
 
   func testActorSynced() {
     _ = actorSynced
@@ -125,4 +130,52 @@ struct Carbon {
   nonisolated func getWeight() -> Int {
     return atomicWeight // expected-error {{main actor-isolated property 'atomicWeight' can not be referenced from a non-isolated context}}
   }
+}
+
+@MainActor
+protocol InferMainActor {}
+
+@propertyWrapper
+@preconcurrency @MainActor
+struct Wrapper<T> {
+  var wrappedValue: T {
+    fatalError()
+  }
+
+  init() {}
+}
+
+@MainActor
+class C {
+  nonisolated init() {}
+}
+
+struct S: InferMainActor {
+  @Wrapper var value: C // okay, 'S' is isolated to 'MainActor'
+}
+
+protocol InferMainActorInherited: InferMainActor {
+  func f() // expected-note{{mark the protocol requirement 'f()' 'async' to allow actor-isolated conformances}}
+  func g()
+}
+
+@SomeGlobalActor
+protocol InferSomeGlobalActor { }
+
+protocol InferenceConflict: InferMainActorInherited, InferSomeGlobalActor { }
+
+struct S2: InferMainActorInherited {
+  func f() { } // okay, 'f' is MainActor isolated, as is the requirement
+  @MainActor func g() { } // okay for the same reasons, but more explicitly
+}
+
+@SomeGlobalActor
+struct S3: InferenceConflict {
+  nonisolated func g() { }
+}
+
+extension S3 {
+  func f() { }
+  // expected-error@-1{{global actor 'SomeGlobalActor'-isolated instance method 'f()' cannot be used to satisfy main actor-isolated protocol requirement}}
+  //expected-note@-2{{add 'nonisolated' to 'f()' to make this instance method not isolated to the actor}}
 }

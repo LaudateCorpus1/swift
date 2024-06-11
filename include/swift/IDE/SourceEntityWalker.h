@@ -201,6 +201,11 @@ public:
 
   virtual bool shouldWalkIntoGenericParams() { return true; }
 
+  /// Only walk the arguments of a macro, to represent the source as written.
+  virtual MacroWalking getMacroWalkingBehavior() const {
+    return MacroWalking::Arguments;
+  }
+
 protected:
   SourceEntityWalker() = default;
   SourceEntityWalker(const SourceEntityWalker &) = default;

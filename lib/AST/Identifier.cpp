@@ -230,14 +230,15 @@ ObjCSelector::ObjCSelector(ASTContext &ctx, unsigned numArgs,
   Storage = DeclName(ctx, Identifier(), pieces);
 }
 
-llvm::Optional<ObjCSelector>
-ObjCSelector::parse(ASTContext &ctx, StringRef string) {
+std::optional<ObjCSelector> ObjCSelector::parse(ASTContext &ctx,
+                                                StringRef string) {
   // Find the first colon.
   auto colonPos = string.find(':');
 
   // If there is no colon, we have a nullary selector.
   if (colonPos == StringRef::npos) {
-    if (string.empty() || !Lexer::isIdentifier(string)) return None;
+    if (string.empty() || !Lexer::isIdentifier(string))
+      return std::nullopt;
     return ObjCSelector(ctx, 0, { ctx.getIdentifier(string) });
   }
 
@@ -248,7 +249,8 @@ ObjCSelector::parse(ASTContext &ctx, StringRef string) {
     if (piece.empty()) {
       pieces.push_back(Identifier());
     } else {
-      if (!Lexer::isIdentifier(piece)) return None;
+      if (!Lexer::isIdentifier(piece))
+        return std::nullopt;
       pieces.push_back(ctx.getIdentifier(piece));
     }
 
@@ -258,7 +260,8 @@ ObjCSelector::parse(ASTContext &ctx, StringRef string) {
   } while (colonPos != StringRef::npos);
 
   // If anything remains of the string, it's not a selector.
-  if (!string.empty()) return None;
+  if (!string.empty())
+    return std::nullopt;
 
   return ObjCSelector(ctx, pieces.size(), pieces);
 }
@@ -274,7 +277,7 @@ ObjCSelectorFamily ObjCSelector::getSelectorFamily() const {
   // Clang ARC. We're not just calling that method here because it means
   // allocating a clang::IdentifierInfo, which requires a Clang ASTContext.
   auto hasPrefix = [](StringRef text, StringRef prefix) {
-    if (!text.startswith(prefix)) return false;
+    if (!text.starts_with(prefix)) return false;
     if (text.size() == prefix.size()) return true;
     assert(text.size() > prefix.size());
     return !clang::isLowercase(text[prefix.size()]);

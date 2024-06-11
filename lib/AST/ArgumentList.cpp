@@ -24,15 +24,7 @@ using namespace swift;
 Type swift::__Expr_getType(Expr *E) { return E->getType(); }
 
 SourceRange Argument::getSourceRange() const {
-  auto labelLoc = getLabelLoc();
-  if (labelLoc.isInvalid())
-    return getExpr()->getSourceRange();
-
-  auto exprEndLoc = getExpr()->getEndLoc();
-  if (exprEndLoc.isInvalid())
-    return labelLoc;
-
-  return SourceRange(labelLoc, exprEndLoc);
+  return SourceRange::combine(getLabelLoc(), getExpr()->getSourceRange());
 }
 
 Argument Argument::implicitInOut(ASTContext &ctx, Expr *expr) {
@@ -56,11 +48,10 @@ bool Argument::isConst() const {
   return ArgExpr->isSemanticallyConstExpr();
 }
 
-ArgumentList *ArgumentList::create(ASTContext &ctx, SourceLoc lParenLoc,
-                                   ArrayRef<Argument> args, SourceLoc rParenLoc,
-                                   Optional<unsigned> firstTrailingClosureIndex,
-                                   bool isImplicit, ArgumentList *originalArgs,
-                                   AllocationArena arena) {
+ArgumentList *ArgumentList::create(
+    ASTContext &ctx, SourceLoc lParenLoc, ArrayRef<Argument> args,
+    SourceLoc rParenLoc, std::optional<unsigned> firstTrailingClosureIndex,
+    bool isImplicit, ArgumentList *originalArgs, AllocationArena arena) {
   SmallVector<Expr *, 4> exprs;
   SmallVector<Identifier, 4> labels;
   SmallVector<SourceLoc, 4> labelLocs;
@@ -108,7 +99,7 @@ ArgumentList *ArgumentList::create(ASTContext &ctx, SourceLoc lParenLoc,
 ArgumentList *
 ArgumentList::createParsed(ASTContext &ctx, SourceLoc lParenLoc,
                            ArrayRef<Argument> args, SourceLoc rParenLoc,
-                           Optional<unsigned> firstTrailingClosureIndex) {
+                           std::optional<unsigned> firstTrailingClosureIndex) {
   return create(ctx, lParenLoc, args, rParenLoc, firstTrailingClosureIndex,
                 /*implicit*/ false);
 }
@@ -117,14 +108,15 @@ ArgumentList *ArgumentList::createTypeChecked(ASTContext &ctx,
                                               ArgumentList *originalArgs,
                                               ArrayRef<Argument> newArgs) {
   return create(ctx, originalArgs->getLParenLoc(), newArgs,
-                originalArgs->getRParenLoc(), /*trailingClosureIdx*/ None,
-                originalArgs->isImplicit(), originalArgs);
+                originalArgs->getRParenLoc(),
+                /*trailingClosureIdx*/ std::nullopt, originalArgs->isImplicit(),
+                originalArgs);
 }
 
 ArgumentList *
 ArgumentList::createImplicit(ASTContext &ctx, SourceLoc lParenLoc,
                              ArrayRef<Argument> args, SourceLoc rParenLoc,
-                             Optional<unsigned> firstTrailingClosureIndex,
+                             std::optional<unsigned> firstTrailingClosureIndex,
                              AllocationArena arena) {
   return create(ctx, lParenLoc, args, rParenLoc, firstTrailingClosureIndex,
                 /*implicit*/ true,
@@ -133,7 +125,7 @@ ArgumentList::createImplicit(ASTContext &ctx, SourceLoc lParenLoc,
 
 ArgumentList *
 ArgumentList::createImplicit(ASTContext &ctx, ArrayRef<Argument> args,
-                             Optional<unsigned> firstTrailingClosureIndex,
+                             std::optional<unsigned> firstTrailingClosureIndex,
                              AllocationArena arena) {
   return createImplicit(ctx, SourceLoc(), args, SourceLoc(),
                         firstTrailingClosureIndex, arena);
@@ -222,8 +214,8 @@ ArgumentList::getArgumentLabels(SmallVectorImpl<Identifier> &scratch) const {
   return scratch;
 }
 
-Optional<unsigned> ArgumentList::findArgumentExpr(Expr *expr,
-                                                  bool allowSemantic) const {
+std::optional<unsigned>
+ArgumentList::findArgumentExpr(Expr *expr, bool allowSemantic) const {
   if (allowSemantic)
     expr = expr->getSemanticsProvidingExpr();
   for (auto idx : indices(*this)) {
@@ -234,7 +226,7 @@ Optional<unsigned> ArgumentList::findArgumentExpr(Expr *expr,
     if (expr == argExpr)
       return idx;
   }
-  return None;
+  return std::nullopt;
 }
 
 Expr *ArgumentList::packIntoImplicitTupleOrParen(

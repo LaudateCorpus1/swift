@@ -1,8 +1,10 @@
 /// @_implementationOnly imported decls (SPI or not) should not be exposed in SPI.
 
 // RUN: %empty-directory(%t)
-// RUN: %target-swift-frontend -emit-module -DLIB %s -module-name Lib -emit-module-path %t/Lib.swiftmodule
-// RUN: %target-typecheck-verify-swift -DCLIENT -I %t
+// RUN: %target-swift-frontend -emit-module -DLIB %s -module-name Lib -emit-module-path %t/Lib.swiftmodule \
+// RUN:   -swift-version 5 -enable-library-evolution
+// RUN: %target-typecheck-verify-swift -DCLIENT -I %t \
+// RUN:   -swift-version 5 -enable-library-evolution
 
 #if LIB
 
@@ -25,6 +27,7 @@ public protocol IOIProtocol {}
 #elseif CLIENT
 
 @_spi(A) @_implementationOnly import Lib
+// expected-warning @-1 {{'@_implementationOnly' is deprecated, use 'internal import' instead}}
 
 @_spi(B) public func leakSPIStruct(_ a: SPIStruct) -> SPIStruct { fatalError() } // expected-warning 2 {{cannot use struct 'SPIStruct' here; 'Lib' has been imported as implementation-only}}
 @_spi(B) public func leakIOIStruct(_ a: IOIStruct) -> IOIStruct { fatalError() } // expected-warning 2 {{cannot use struct 'IOIStruct' here; 'Lib' has been imported as implementation-only}}

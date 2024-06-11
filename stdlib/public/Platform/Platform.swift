@@ -13,7 +13,7 @@
 import SwiftShims
 import SwiftOverlayShims
 
-#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
+#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS) || os(visionOS)
 //===----------------------------------------------------------------------===//
 // MacTypes.h
 //===----------------------------------------------------------------------===//
@@ -55,6 +55,7 @@ extension DarwinBoolean : CustomReflectable {
 }
 #endif
 
+@_unavailableInEmbedded
 extension DarwinBoolean : CustomStringConvertible {
   /// A textual representation of `self`.
   public var description: String {
@@ -101,7 +102,7 @@ public var errno : Int32 {
 // stdio.h
 //===----------------------------------------------------------------------===//
 
-#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS) || os(FreeBSD) || os(PS4)
+#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS) || os(visionOS) || os(FreeBSD) || os(PS4)
 public var stdin : UnsafeMutablePointer<FILE> {
   get {
     return __stdinp
@@ -129,6 +130,7 @@ public var stderr : UnsafeMutablePointer<FILE> {
   }
 }
 
+#if !$Embedded
 public func dprintf(_ fd: Int, _ format: UnsafePointer<Int8>, _ args: CVarArg...) -> Int32 {
   return withVaList(args) { va_args in
     vdprintf(Int32(fd), format, va_args)
@@ -140,6 +142,8 @@ public func snprintf(ptr: UnsafeMutablePointer<Int8>, _ len: Int, _ format: Unsa
     return vsnprintf(ptr, len, format, va_args)
   }
 }
+#endif
+
 #elseif os(OpenBSD)
 public var stdin: UnsafeMutablePointer<FILE> { return _swift_stdlib_stdin() }
 public var stdout: UnsafeMutablePointer<FILE> { return _swift_stdlib_stdout() }
@@ -246,7 +250,7 @@ public var S_IFBLK: mode_t  { return mode_t(0o060000) }
 public var S_IFREG: mode_t  { return mode_t(0o100000) }
 public var S_IFLNK: mode_t  { return mode_t(0o120000) }
 public var S_IFSOCK: mode_t { return mode_t(0o140000) }
-#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
+#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS) || os(visionOS)
 public var S_IFWHT: mode_t  { return mode_t(0o160000) }
 #endif
 
@@ -313,7 +317,7 @@ public func ioctl(
 // unistd.h
 //===----------------------------------------------------------------------===//
 
-#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
+#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS) || os(visionOS)
 @available(*, unavailable, message: "Please use threads or posix_spawn*()")
 public func fork() -> Int32 {
   fatalError("unavailable function can't be called")
@@ -329,7 +333,7 @@ public func vfork() -> Int32 {
 // signal.h
 //===----------------------------------------------------------------------===//
 
-#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
+#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS) || os(visionOS)
 public var SIG_DFL: sig_t? { return nil }
 public var SIG_IGN: sig_t { return unsafeBitCast(1, to: sig_t.self) }
 public var SIG_ERR: sig_t { return unsafeBitCast(-1, to: sig_t.self) }
@@ -340,7 +344,9 @@ public var SIG_IGN: sig_t { return unsafeBitCast(1, to: sig_t.self) }
 public var SIG_ERR: sig_t { return unsafeBitCast(-1, to: sig_t.self) }
 public var SIG_HOLD: sig_t { return unsafeBitCast(3, to: sig_t.self) }
 #elseif os(Linux) || os(FreeBSD) || os(PS4) || os(Android) || os(Haiku)
+#if !canImport(SwiftMusl)
 public typealias sighandler_t = __sighandler_t
+#endif
 
 public var SIG_DFL: sighandler_t? { return nil }
 public var SIG_IGN: sighandler_t {
@@ -383,7 +389,7 @@ internal var _ignore = _UnsupportedPlatformError()
 // semaphore.h
 //===----------------------------------------------------------------------===//
 
-#if !os(Windows) 
+#if !os(Windows) && !os(WASI)
 
 #if os(OpenBSD)
 public typealias Semaphore = UnsafeMutablePointer<sem_t?>
@@ -393,7 +399,7 @@ public typealias Semaphore = UnsafeMutablePointer<sem_t>
 
 /// The value returned by `sem_open()` in the case of failure.
 public var SEM_FAILED: Semaphore? {
-#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
+#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS) || os(visionOS)
   // The value is ABI.  Value verified to be correct for OS X, iOS, watchOS, tvOS.
   return Semaphore(bitPattern: -1)
 #elseif os(Linux) || os(FreeBSD) || os(OpenBSD) || os(PS4) || os(Android) || os(Cygwin) || os(Haiku) || os(WASI)
@@ -426,7 +432,7 @@ public func sem_open(
 // time.h
 //===----------------------------------------------------------------------===//
 
-#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS) || os(Linux)
+#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS) || os(visionOS) || os(Linux)
 
 @available(SwiftStdlib 5.7, *)
 extension timespec {
@@ -479,11 +485,11 @@ extension Duration {
 
 // Some platforms don't have `extern char** environ` imported from C.
 #if SWIFT_STDLIB_HAS_ENVIRON
-#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS) || os(FreeBSD) || os(OpenBSD) || os(PS4)
+#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS) || os(visionOS) || os(FreeBSD) || os(OpenBSD) || os(PS4)
 public var environ: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?> {
   return _swift_stdlib_getEnviron()
 }
-#elseif os(Linux)
+#elseif os(Linux) && !canImport(SwiftMusl)
 public var environ: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?> {
   return __environ
 }

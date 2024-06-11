@@ -24,8 +24,8 @@ import SIL
 /// ```
 /// are computed.
 ///
-let computeSideEffects = FunctionPass(name: "compute-side-effects", {
-  (function: Function, context: PassContext) in
+let computeSideEffects = FunctionPass(name: "compute-side-effects") {
+  (function: Function, context: FunctionPassContext) in
 
   if function.isAvailableExternally {
     // We cannot assume anything about function, which are defined in another module,
@@ -56,7 +56,7 @@ let computeSideEffects = FunctionPass(name: "compute-side-effects", {
   // global effects to the argument, because we don't know to which "global" side-effect
   // instruction the argument might have escaped.
   for argument in function.arguments {
-    collectedEffects.addEffectsForEcapingArgument(argument: argument)
+    collectedEffects.addEffectsForEscapingArgument(argument: argument)
   }
 
   // Don't modify the effects if they didn't change. This avoids sending a change notification
@@ -71,18 +71,18 @@ let computeSideEffects = FunctionPass(name: "compute-side-effects", {
   context.modifyEffects(in: function) { (effects: inout FunctionEffects) in
     effects.sideEffects = SideEffects(arguments: collectedEffects.argumentEffects, global: collectedEffects.globalEffects)
   }
-})
+}
 
 /// The collected argument and global side effects of the function.
 private struct CollectedEffects {
 
-  private let context: PassContext
+  private let context: FunctionPassContext
   private let calleeAnalysis: CalleeAnalysis
 
   private(set) var argumentEffects: [SideEffects.ArgumentEffects]
   private(set) var globalEffects = SideEffects.GlobalEffects()
 
-  init(function: Function, _ context: PassContext) {
+  init(function: Function, _ context: FunctionPassContext) {
     self.context = context
     self.calleeAnalysis = context.calleeAnalysis
     self.argumentEffects = Array(repeating: SideEffects.ArgumentEffects(), count: function.entryBlock.arguments.count)
@@ -95,10 +95,10 @@ private struct CollectedEffects {
       addEffects(.copy, to: inst.operands[0].value, fromInitialPath: SmallProjectionPath(.anyValueFields))
 
     case is DestroyValueInst, is ReleaseValueInst, is StrongReleaseInst:
-      addDestroyEffects(of: inst.operands[0].value)
+      addDestroyEffects(ofValue: inst.operands[0].value)
 
     case let da as DestroyAddrInst:
-      addDestroyEffects(of: da.operand)
+      addDestroyEffects(ofAddress: da.destroyedAddress)
 
     case let copy as CopyAddrInst:
       addEffects(.read, to: copy.source)
@@ -108,13 +108,13 @@ private struct CollectedEffects {
         addEffects(.copy, to: copy.source)
       }
       if !copy.isInitializationOfDest {
-        addDestroyEffects(of: copy.destination)
+        addDestroyEffects(ofAddress: copy.destination)
       }
 
     case let store as StoreInst:
       addEffects(.write, to: store.destination)
-      if store.destinationOwnership == .assign {
-        addDestroyEffects(of: store.destination)
+      if store.storeOwnership == .assign {
+        addDestroyEffects(ofAddress: store.destination)
       }
 
     case let store as StoreWeakInst:
@@ -128,9 +128,9 @@ private struct CollectedEffects {
       addEffects(.read, to: addr)
 
     case let apply as FullApplySite:
-      let calleeValue = apply.callee
       if apply.callee.type.isCalleeConsumedFunction {
-        addDestroyEffects(of: calleeValue)
+        addEffects(.destroy, to: apply.callee)
+        globalEffects = .worstEffects
       }
       handleApply(apply)
       checkedIfDeinitBarrier = true
@@ -142,11 +142,29 @@ private struct CollectedEffects {
         handleApply(pa)
         checkedIfDeinitBarrier = true
       }
+      // In addition to the effects of the apply, also consider the
+      // effects of the capture, which reads the captured value in
+      // order to move it into the context. This only applies to
+      // addressible values, because capturing does not dereference
+      // any class objects.
+      //
+      // Ignore captures for on-stack partial applies. They only
+      // bitwise-move or capture by address, so the call to
+      // handleApply above is sufficient. And, if they are not applied
+      // in this function, then they are never applied.
+      if !pa.isOnStack {
+        // callee is never an address.
+        for argument in pa.arguments {
+          if argument.type.isAddress {
+            addEffects(.read, to: argument)
+          }
+        }
+      }
 
     case let fl as FixLifetimeInst:
       // A fix_lifetime instruction acts like a read on the operand to prevent
       // releases moving above the fix_lifetime.
-      addEffects(.read, to: fl.operand)
+      addEffects(.read, to: fl.operand.value)
 
       // Instructions which have effects defined in SILNodes.def, but those effects are
       // not relevant for our purpose.
@@ -196,8 +214,8 @@ private struct CollectedEffects {
     }
   }
   
-  mutating func addEffectsForEcapingArgument(argument: FunctionArgument) {
-    var escapeWalker = ArgumentEscapingWalker()
+  mutating func addEffectsForEscapingArgument(argument: FunctionArgument) {
+    var escapeWalker = ArgumentEscapingWalker(context)
 
     if escapeWalker.hasUnknownUses(argument: argument) {
       // Worst case: we don't know anything about how the argument escapes.
@@ -221,11 +239,58 @@ private struct CollectedEffects {
   
   private mutating func handleApply(_ apply: ApplySite) {
     let callees = calleeAnalysis.getCallees(callee: apply.callee)
+    let args = apply.argumentOperands.lazy.map {
+      (calleeArgumentIndex: apply.calleeArgumentIndex(of: $0)!,
+       callerArgument: $0.value)
+    }
+    addEffects(ofFunctions: callees, withArguments: args)
+  }
 
+  private mutating func addDestroyEffects(ofValue value: Value) {
+    // First thing: add the destroy effect itself.
+    addEffects(.destroy, to: value)
+
+    if value.type.isClass {
+      // Treat destroying a class value just like a call to it's destructor(s).
+      let destructors = calleeAnalysis.getDestructors(of: value.type)
+      let theSelfArgument = CollectionOfOne((calleeArgumentIndex: 0, callerArgument: value))
+      addEffects(ofFunctions: destructors, withArguments: theSelfArgument)
+    } else {
+      // TODO: dig into the type and check for destructors of individual class fields
+      addEffects(.worstEffects, to: value)
+      globalEffects = .worstEffects
+    }
+  }
+
+  private mutating func addDestroyEffects(ofAddress address: Value) {
+    // First thing: add the destroy effect itself.
+    addEffects(.destroy, to: address)
+
+    // A destroy also involves a read from the address.
+    // E.g. a `destroy_addr` is equivalent to a `%x = load [take]` and `destroy_value %x`.
+    addEffects(.read, to: address)
+    // Conceptually, it's also a write, because the stored value is not available anymore after the destroy
+    addEffects(.write, to: address)
+
+    // Second: add all effects of (potential) destructors which might be called if the destroy deallocates an object.
+    // Note that we don't need to add any effects specific to the `address`, because the memory location is not
+    // affected by a destructor of the stored value (and effects don't include anything which is loaded from memory).
+    if let destructors = calleeAnalysis.getDestructors(of: address.type) {
+      for destructor in destructors {
+        globalEffects.merge(with: destructor.getSideEffects())
+      }
+    } else {
+      globalEffects = .worstEffects
+    }
+  }
+
+  private mutating func addEffects<Arguments: Sequence>(ofFunctions callees: FunctionArray?,
+                                                        withArguments arguments: Arguments)
+                                   where Arguments.Element == (calleeArgumentIndex: Int, callerArgument: Value) {
     guard let callees = callees else {
       // We don't know which function(s) are called.
       globalEffects = .worstEffects
-      for argument in apply.arguments {
+      for (_, argument) in arguments {
         addEffects(.worstEffects, to: argument)
       }
       return
@@ -240,8 +305,7 @@ private struct CollectedEffects {
       }
     }
 
-    for (argumentIdx, argument) in apply.arguments.enumerated() {
-      let calleeArgIdx = apply.calleeArgIndex(callerArgIndex: argumentIdx)
+    for (calleeArgIdx, argument) in arguments {
       for callee in callees {
         if let sideEffects = callee.effects.sideEffects {
           let calleeEffect = sideEffects.getArgumentEffects(for: calleeArgIdx)
@@ -252,8 +316,8 @@ private struct CollectedEffects {
           if let calleePath = calleeEffect.copy    { addEffects(.copy,    to: argument, fromInitialPath: calleePath) }
           if let calleePath = calleeEffect.destroy { addEffects(.destroy, to: argument, fromInitialPath: calleePath) }
         } else {
-          let convention = callee.getArgumentConvention(for: calleeArgIdx)
-          let wholeArgument = argument.at(SmallProjectionPath(.anything))
+          let convention = callee.argumentConventions[calleeArgIdx]
+          let wholeArgument = argument.at(defaultPath(for: argument))
           let calleeEffects = callee.getSideEffects(forArgument: wholeArgument,
                                                     atIndex: calleeArgIdx,
                                                     withConvention: convention)
@@ -263,27 +327,16 @@ private struct CollectedEffects {
     }
   }
 
-  private mutating func addDestroyEffects(of addressOrValue: Value) {
-    // First thing: add the destroy effect itself.
-    addEffects(.destroy, to: addressOrValue)
-
-    // Second: add all effects of (potential) destructors which might be called if the destroy
-    // deallocates an object.
-    if let destructors = calleeAnalysis.getDestructors(of: addressOrValue.type) {
-      for destructor in destructors {
-        globalEffects.merge(with: destructor.getSideEffects())
-      }
-    } else {
-      globalEffects = .worstEffects
-    }
-  }
-
   /// Adds effects to a specific value.
   ///
-  /// If the value comes from an argument (or mutliple arguments), then the effects are added
+  /// If the value comes from an argument (or multiple arguments), then the effects are added
   /// to the corrseponding `argumentEffects`. Otherwise they are added to the `global` effects.
+  private mutating func addEffects(_ effects: SideEffects.GlobalEffects, to value: Value) {
+    addEffects(effects, to: value, fromInitialPath: defaultPath(for: value))
+  }
+
   private mutating func addEffects(_ effects: SideEffects.GlobalEffects, to value: Value,
-                                   fromInitialPath: SmallProjectionPath? = nil) {
+                                   fromInitialPath: SmallProjectionPath) {
 
     /// Collects the (non-address) roots of a value.
     struct GetRootsWalker : ValueUseDefWalker {
@@ -295,7 +348,7 @@ private struct CollectedEffects {
 
       var walkUpCache = WalkerCache<SmallProjectionPath>()
 
-      init(_ context: PassContext) {
+      init(_ context: FunctionPassContext) {
         self.roots = Stack(context)
       }
 
@@ -315,10 +368,7 @@ private struct CollectedEffects {
 
     var findRoots = GetRootsWalker(context)
     if value.type.isAddress {
-      // If there is no initial path provided, select all value fields.
-      let path = fromInitialPath ?? SmallProjectionPath(.anyValueFields)
-
-      let accessPath = value.getAccessPath(fromInitialPath: path)
+      let accessPath = value.getAccessPath(fromInitialPath: fromInitialPath)
       switch accessPath.base {
         case .stack:
           // We don't care about read and writes from/to stack locations (because they are
@@ -338,16 +388,7 @@ private struct CollectedEffects {
           }
       }
     } else {
-      // Handle non-address `value`s which are projections from a direct arguments.
-      let path: SmallProjectionPath
-      if let fromInitialPath = fromInitialPath {
-        path = fromInitialPath
-      } else if value.type.isClass {
-        path = SmallProjectionPath(.anyValueFields).push(.anyClassField)
-      } else {
-        path = SmallProjectionPath(.anyValueFields).push(.anyClassField).push(.anyValueFields)
-      }
-      _ = findRoots.walkUp(value: value, path: path)
+      _ = findRoots.walkUp(value: value, path: fromInitialPath)
     }
     // Because of phi-arguments, a single (non-address) `value` can come from multiple arguments.
     while let (arg, path) = findRoots.roots.pop() {
@@ -360,15 +401,30 @@ private struct CollectedEffects {
   }
 }
 
+private func defaultPath(for value: Value) -> SmallProjectionPath {
+  if value.type.isAddress {
+    return SmallProjectionPath(.anyValueFields)
+  }
+  if value.type.isClass {
+    return SmallProjectionPath(.anyValueFields).push(.anyClassField)
+  }
+  return SmallProjectionPath(.anyValueFields).push(.anyClassField).push(.anyValueFields)
+}
+
 /// Checks if an argument escapes to some unknown user.
 private struct ArgumentEscapingWalker : ValueDefUseWalker, AddressDefUseWalker {
   var walkDownCache = WalkerCache<UnusedWalkingPath>()
+  private let calleeAnalysis: CalleeAnalysis
 
   /// True if the argument escapes to a load which (potentially) "takes" the memory location.
   private(set) var foundTakingLoad = false
 
   /// True, if the argument escapes to a closure context which might be destroyed when called.
   private(set) var foundConsumingPartialApply = false
+
+  init(_ context: FunctionPassContext) {
+    self.calleeAnalysis = context.calleeAnalysis
+  }
 
   mutating func hasUnknownUses(argument: FunctionArgument) -> Bool {
     if argument.type.isAddress {
@@ -393,14 +449,23 @@ private struct ArgumentEscapingWalker : ValueDefUseWalker, AddressDefUseWalker {
       return .continueWalk
 
     case let apply as ApplySite:
-      if apply.isCalleeOperand(value) {
-        // `CollectedEffects.handleApply` only handles argument operands of an apply, but not the callee operand.
-        return .abortWalk
-      }
       if let pa = apply as? PartialApplyInst, !pa.isOnStack {
         foundConsumingPartialApply = true
       }
-      return .continueWalk
+      // `CollectedEffects.handleApply` only handles argument operands of an apply, but not the callee operand.
+      if let calleeArgIdx = apply.calleeArgumentIndex(of: value),
+         let callees = calleeAnalysis.getCallees(callee: apply.callee)
+      {
+        // If an argument escapes in a called function, we don't know anything about the argument's side effects.
+        // For example, it could escape to the return value and effects might occur in the caller.
+        for callee in callees {
+          if callee.effects.escapeEffects.canEscape(argumentIndex: calleeArgIdx, path: SmallProjectionPath.init(.anyValueFields)) {
+            return .abortWalk
+          }
+        }
+        return .continueWalk
+      }
+      return .abortWalk
     default:
       return .abortWalk
     }
@@ -408,7 +473,7 @@ private struct ArgumentEscapingWalker : ValueDefUseWalker, AddressDefUseWalker {
 
   mutating func leafUse(address: Operand, path: UnusedWalkingPath) -> WalkResult {
     let inst = address.instruction
-    let function = inst.function
+    let function = inst.parentFunction
     switch inst {
     case let copy as CopyAddrInst:
       if address == copy.sourceOperand &&
@@ -421,7 +486,7 @@ private struct ArgumentEscapingWalker : ValueDefUseWalker, AddressDefUseWalker {
     case let load as LoadInst:
       if !address.value.hasTrivialType &&
           // In non-ossa SIL we don't know if a load is taking.
-          (!function.hasOwnership || load.ownership == .take) {
+          (!function.hasOwnership || load.loadOwnership == .take) {
         foundTakingLoad = true
       }
       return .continueWalk
@@ -433,7 +498,8 @@ private struct ArgumentEscapingWalker : ValueDefUseWalker, AddressDefUseWalker {
       return .continueWalk
 
     // Warning: all instruction listed here, must also be handled in `CollectedEffects.addInstructionEffects`
-    case is StoreInst, is StoreWeakInst, is StoreUnownedInst, is ApplySite, is DestroyAddrInst:
+    case is StoreInst, is StoreWeakInst, is StoreUnownedInst, is ApplySite, is DestroyAddrInst,
+         is DebugValueInst:
       return .continueWalk
 
     default:
@@ -459,7 +525,7 @@ private extension SideEffects.ArgumentEffects {
 }
 
 private extension PartialApplyInst {
-  func canBeAppliedInFunction(_ context: PassContext) -> Bool {
+  func canBeAppliedInFunction(_ context: FunctionPassContext) -> Bool {
     struct EscapesToApply : EscapeVisitor {
       func visitUse(operand: Operand, path: EscapePath) -> UseResult {
         switch operand.instruction {
@@ -473,9 +539,7 @@ private extension PartialApplyInst {
           return .continueWalk
         }
       }
-      func hasRelevantType(_ value: Value, at path: SmallProjectionPath, analyzeAddresses: Bool) -> Bool {
-        true
-      }
+      var followTrivialTypes: Bool { true }
     }
 
     return self.isEscapingWhenWalkingDown(using: EscapesToApply(), context)

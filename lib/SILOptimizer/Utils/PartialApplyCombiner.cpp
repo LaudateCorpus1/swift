@@ -90,7 +90,7 @@ bool PartialApplyCombiner::copyArgsToTemporaries(
   if (argsToHandle.empty() && storeBorrowsToHandle.empty()) {
     return true;
   }
-  // Also include all destroys in the liferange for the arguments.
+  // Also include all destroys in the liverange for the arguments.
   // This is needed for later processing in tryDeleteDeadClosure: in case the
   // pai gets dead after this optimization, tryDeleteDeadClosure relies on
   // that we already copied the pai arguments to extend their lifetimes until
@@ -98,7 +98,7 @@ bool PartialApplyCombiner::copyArgsToTemporaries(
   collectDestroys(pai, paiUses);
 
   ValueLifetimeAnalysis vla(pai,
-                            llvm::makeArrayRef(paiUses.begin(), paiUses.end()));
+                            llvm::ArrayRef(paiUses.begin(), paiUses.end()));
   ValueLifetimeAnalysis::Frontier partialApplyFrontier;
 
   // Computing the frontier may fail if the frontier is located on a critical
@@ -106,6 +106,14 @@ bool PartialApplyCombiner::copyArgsToTemporaries(
   if (!vla.computeFrontier(partialApplyFrontier,
                            ValueLifetimeAnalysis::DontModifyCFG)) {
     return false;
+  }
+
+  // We must not introduce copies for move only types.
+  // TODO: in OSSA, instead of bailing, it's possible to keep the arguments
+  //       alive without the need of copies.
+  for (Operand *argOp : argsToHandle) {
+    if (argOp->get()->getType().isMoveOnly())
+      return false;
   }
 
   for (Operand *argOp : argsToHandle) {
@@ -239,10 +247,11 @@ bool PartialApplyCombiner::combine() {
     auto *use = worklist.pop_back_val();
     auto *user = use->getUser();
 
-    // Recurse through copy_value
-    if (isa<CopyValueInst>(user) || isa<BeginBorrowInst>(user)) {
-      for (auto *copyUse : cast<SingleValueInstruction>(user)->getUses())
-        worklist.push_back(copyUse);
+    // Recurse through ownership instructions.
+    if (isa<CopyValueInst>(user) || isa<BeginBorrowInst>(user) ||
+        isa<MoveValueInst>(user)) {
+      for (auto *ownershipUse : cast<SingleValueInstruction>(user)->getUses())
+        worklist.push_back(ownershipUse);
       continue;
     }
 

@@ -83,13 +83,6 @@ public:
   }
 };
 
-/// Remove all instructions in the body of \p bb in safe manner by using
-/// undef.
-void clearBlockBody(SILBasicBlock *bb);
-
-/// Handle the mechanical aspects of removing an unreachable block.
-void removeDeadBlock(SILBasicBlock *bb);
-
 /// Remove all unreachable blocks in a function.
 bool removeUnreachableBlocks(SILFunction &f);
 
@@ -101,16 +94,6 @@ inline bool isUsedOutsideOfBlock(SILValue v) {
       return true;
   return false;
 }
-
-/// Rotate a loop's header as long as it is exiting and not equal to the
-/// passed basic block.
-/// If \p RotateSingleBlockLoops is true a single basic block loop will be
-/// rotated once. ShouldVerify specifies whether to perform verification after
-/// the transformation.
-/// Returns true if the loop could be rotated.
-bool rotateLoop(SILLoop *loop, DominanceInfo *domInfo, SILLoopInfo *loopInfo,
-                bool rotateSingleBlockLoops, SILBasicBlock *upToBB,
-                bool shouldVerify);
 
 //===----------------------------------------------------------------------===//
 //                             BasicBlock Cloning
@@ -135,14 +118,20 @@ bool canCloneTerminator(TermInst *termInst);
 /// BasicBlockCloner handles this internally.
 class SinkAddressProjections {
   // Projections ordered from last to first in the chain.
-  SmallVector<SingleValueInstruction *, 4> projections;
-  SmallSetVector<SILValue, 4> inBlockDefs;
+  SmallVector<SingleValueInstruction *, 4> oldProjections;
+  // Cloned projections to avoid address phis.
+  SmallVectorImpl<SingleValueInstruction *> *newProjections;
+  llvm::SmallSetVector<SILValue, 4> inBlockDefs;
 
   // Transient per-projection data for use during cloning.
   SmallVector<Operand *, 4> usesToReplace;
   llvm::SmallDenseMap<SILBasicBlock *, Operand *, 4> firstBlockUse;
 
 public:
+  SinkAddressProjections(
+      SmallVectorImpl<SingleValueInstruction *> *newProjections = nullptr)
+      : newProjections(newProjections) {}
+
   /// Check for an address projection chain ending at \p inst. Return true if
   /// the given instruction is successfully analyzed.
   ///
@@ -163,6 +152,7 @@ public:
   ArrayRef<SILValue> getInBlockDefs() const {
     return inBlockDefs.getArrayRef();
   }
+
   /// Clone the chain of projections at their use sites.
   ///
   /// Return true if anything was done.
@@ -202,6 +192,8 @@ protected:
   // If available, the current DeadEndBlocks for incremental update.
   DeadEndBlocks *deBlocks;
 
+  SILPassManager *pm;
+
 public:
   /// An ordered list of old to new available value pairs.
   ///
@@ -210,8 +202,8 @@ public:
   SmallVector<std::pair<SILValue, SILValue>, 16> availVals;
 
   // Clone blocks starting at `origBB`, within the same function.
-  BasicBlockCloner(SILBasicBlock *origBB, DeadEndBlocks *deBlocks = nullptr)
-      : SILCloner(*origBB->getParent()), origBB(origBB), deBlocks(deBlocks) {}
+  BasicBlockCloner(SILBasicBlock *origBB, SILPassManager *pm, DeadEndBlocks *deBlocks = nullptr)
+      : SILCloner(*origBB->getParent()), origBB(origBB), deBlocks(deBlocks), pm(pm) {}
 
   bool canCloneBlock() {
     for (auto &inst : *origBB) {
@@ -273,18 +265,8 @@ public:
     bi->eraseFromParent();
   }
 
-  /// Create phis and maintain OSSA invariants.
-  ///
-  /// Note: This must be called after calling cloneBlock or cloneBranchTarget,
-  /// before using any OSSA utilities.
-  ///
-  /// The client may perform arbitrary branch fixups and dead block removal
-  /// after cloning and before calling this.
-  ///
-  /// WARNING: If client converts terminator results to phis (e.g. replaces a
-  /// switch_enum with a branch), then it must call this before performing that
-  /// transformation, or fix the OSSA representation of that value itself.
-  void updateOSSAAfterCloning();
+  /// Helper function to perform SSA updates
+  void updateSSAAfterCloning();
 
   /// Get the newly cloned block corresponding to `origBB`.
   SILBasicBlock *getNewBB() {
@@ -294,13 +276,6 @@ public:
   bool wasCloned() { return isBlockCloned(origBB); }
 
 protected:
-  /// Helper function to perform SSA updates used by updateOSSAAfterCloning.
-  void updateSSAAfterCloning(SmallVectorImpl<SILPhiArgument *> &newPhis);
-
-  /// Given a terminator result, either from the original or the cloned block,
-  /// update OSSA for any phis created for the result during edge splitting.
-  void updateOSSATerminatorResult(SILPhiArgument *termResult);
-
   // MARK: CRTP overrides.
 
   /// Override getMappedValue to allow values defined outside the block to be
@@ -358,68 +333,6 @@ public:
 
   llvm::SmallVectorImpl<value_type> &getInstructionPairs() {
     return instructionpairs;
-  }
-};
-
-/// Utility class for cloning init values into the static initializer of a
-/// SILGlobalVariable.
-class StaticInitCloner : public SILCloner<StaticInitCloner> {
-  friend class SILInstructionVisitor<StaticInitCloner>;
-  friend class SILCloner<StaticInitCloner>;
-
-  /// The number of not yet cloned operands for each instruction.
-  llvm::DenseMap<SILInstruction *, int> numOpsToClone;
-
-  /// List of instructions for which all operands are already cloned (or which
-  /// don't have any operands).
-  llvm::SmallVector<SILInstruction *, 8> readyToClone;
-
-  SILInstruction *insertionPoint = nullptr;
-
-public:
-  StaticInitCloner(SILGlobalVariable *gVar)
-      : SILCloner<StaticInitCloner>(gVar) {}
-
-  StaticInitCloner(SILInstruction *insertionPoint)
-      : SILCloner<StaticInitCloner>(*insertionPoint->getFunction()),
-        insertionPoint(insertionPoint) {
-    Builder.setInsertionPoint(insertionPoint);
-  }
-
-  /// Add \p InitVal and all its operands (transitively) for cloning.
-  ///
-  /// Note: all init values must are added, before calling clone().
-  /// Returns false if cloning is not possible, e.g. if we would end up cloning
-  /// a reference to a private function into a function which is serialized.
-  bool add(SILInstruction *initVal);
-
-  /// Clone \p InitVal and all its operands into the initializer of the
-  /// SILGlobalVariable.
-  ///
-  /// \return Returns the cloned instruction in the SILGlobalVariable.
-  SingleValueInstruction *clone(SingleValueInstruction *initVal);
-
-  /// Convenience function to clone a single \p InitVal.
-  static void appendToInitializer(SILGlobalVariable *gVar,
-                                  SingleValueInstruction *initVal) {
-    StaticInitCloner cloner(gVar);
-    bool success = cloner.add(initVal);
-    (void)success;
-    assert(success && "adding initVal cannot fail for a global variable");
-    cloner.clone(initVal);
-  }
-
-protected:
-  SILLocation remapLocation(SILLocation loc) {
-    if (insertionPoint)
-      return insertionPoint->getLoc();
-    return ArtificialUnreachableLocation();
-  }
-
-  const SILDebugScope *remapScope(const SILDebugScope *DS) {
-    if (insertionPoint)
-      return insertionPoint->getDebugScope();
-    return nullptr;
   }
 };
 

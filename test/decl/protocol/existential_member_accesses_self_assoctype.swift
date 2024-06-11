@@ -6,7 +6,7 @@
 
 struct Struct<T> {
   class Inner {}
-  struct InnerGeneric<T> {}
+  struct InnerGeneric<U> {}
 }
 class Class<T> {}
 
@@ -22,6 +22,7 @@ protocol P1 {
   func covariantSelf6() -> [String : Self]
   func covariantSelf7(_: (Self) -> Void)
   func covariantSelf8(_: (Self...) -> Void)
+  func covariantSelf9() -> Self?.Type
   func covariantSelfComplex(_: (Self.Type) -> Void,
                             _: (Self.Type...) -> Void,
                             _: (Array<Self>) -> Void,
@@ -36,6 +37,7 @@ protocol P1 {
   func covariantAssoc6() -> [String : Q]
   func covariantAssoc7(_: (Q) -> Void)
   func covariantAssoc8(_: (Q...) -> Void)
+  func covariantAssoc9() -> Q?.Type
   func covariantAssocComplex(_: (Q.Type) -> Void,
                              _: (Q.Type...) -> Void,
                              _: (Array<Q>) -> Void,
@@ -77,6 +79,12 @@ protocol P1 {
   func invariantSelf9(_: Struct<() -> Self>)
   func invariantSelf10(_: any P1 & Class<Self>)
   func invariantSelf11() -> Struct<Self>.InnerGeneric<Void>
+  // https://github.com/apple/swift/issues/61934
+  func invariantSelf12() -> any Sequence<Self>
+  // FIXME
+  // expected-error@+1 {{non-protocol, non-class type 'Sequence<Self>' cannot be used within a protocol-constrained type}}
+  func invariantSelf13() -> any P1 & Sequence<Self>
+  func invariantSelf14() -> (any Sequence<Self>).Type
   func invariantAssoc1(_: inout Q)
   func invariantAssoc2(_: (inout Q) -> Void)
   func invariantAssoc3(_: inout Array<() -> Q>)
@@ -88,6 +96,11 @@ protocol P1 {
   func invariantAssoc9(_: Struct<() -> Q>)
   func invariantAssoc10(_: any P1 & Class<Q>)
   func invariantAssoc11() -> Struct<Q>.InnerGeneric<Void>
+  func invariantAssoc12() -> any Sequence<Q>
+  // FIXME
+  // expected-error@+1 {{non-protocol, non-class type 'Sequence<Self.Q>' cannot be used within a protocol-constrained type}}
+  func invariantAssoc13() -> any P1 & Sequence<Q>
+func invariantAssoc14() -> (any Sequence<Q>).Type
 
   // Properties
   var covariantSelfProp1: Self { get }
@@ -243,6 +256,23 @@ extension P1 {
   subscript(opaqueResultTypeSubscript _: Bool) -> some P1 { self }
 }
 
+/// Used to match a type to the inferred type of an expression.
+///
+/// Use like this:
+/// ```
+/// let assertion = SwiftType<Int>.IsStaticTypeOfExprAssertion(true);
+/// assertion.assert()
+/// ```
+///
+/// Not like this: `SwiftType<Int>.IsStaticTypeOfExprAssertion(true).assert()`!
+struct SwiftType<T> {
+  struct IsStaticTypeOfExprAssertion<U> {
+    init(_: U) {}
+
+    func assert() where T == U {}
+  }
+}
+
 do {
   func testP1(arg: any P1) {
     let _: any P1 = arg.covariantSelf1()
@@ -253,6 +283,12 @@ do {
     let _: [String : any P1] = arg.covariantSelf6()
     arg.covariantSelf7 { (_: any P1) in }
     arg.covariantSelf8 { (_: any P1...) in }
+    do {
+      // FIXME: Because B?.Type to A?.Type upcast is not supported.
+      // expected-error@+1 {{member 'covariantSelf9()' cannot be used on value of type 'any P1'; consider using a generic constraint instead}}
+      let a = SwiftType<(any P1)?.Type>.IsStaticTypeOfExprAssertion(arg.covariantSelf9())
+      a.assert()
+    }
     let _: [String : () -> (any P1, any P1)] = arg.covariantSelfComplex(
       { (_: any P1.Type) in },
       { (_: any P1.Type...) in },
@@ -269,6 +305,12 @@ do {
     let _: [String : Any] = arg.covariantAssoc6()
     arg.covariantAssoc7 { (_: Any) in }
     arg.covariantAssoc8 { (_: Any...) in }
+    do {
+      // FIXME: Because B?.Type to A?.Type upcast is not supported.
+      // expected-error@+1 {{member 'covariantAssoc9()' cannot be used on value of type 'any P1'; consider using a generic constraint instead}}
+      let a = SwiftType<Any?.Type>.IsStaticTypeOfExprAssertion(arg.covariantAssoc9())
+      a.assert()
+    }
     let _: [String : () -> (Any, Any)] = arg.covariantAssocComplex(
       { (_: Any.Type) in },
       { (_: Any.Type...) in },
@@ -379,6 +421,20 @@ do {
     arg.invariantSelf9(0) // expected-error {{member 'invariantSelf9' cannot be used on value of type 'any P1'; consider using a generic constraint instead}}
     arg.invariantSelf10(0) // expected-error {{member 'invariantSelf10' cannot be used on value of type 'any P1'; consider using a generic constraint instead}}
     arg.invariantSelf11() // expected-error {{member 'invariantSelf11' cannot be used on value of type 'any P1'; consider using a generic constraint instead}}
+    do {
+      let a = SwiftType<any Sequence>.IsStaticTypeOfExprAssertion(arg.invariantSelf12())
+      a.assert()
+    }
+    do {
+      let a = SwiftType<any P1 & Sequence>.IsStaticTypeOfExprAssertion(arg.invariantSelf13())
+      a.assert()
+    }
+    do {
+      // FIXME: Because (any P<X>).Type to (any P).Type upcast is not supported.
+      // expected-error@+1 {{member 'invariantSelf14()' cannot be used on value of type 'any P1'; consider using a generic constraint instead}}
+      let a = SwiftType<(any Sequence).Type>.IsStaticTypeOfExprAssertion(arg.invariantSelf14())
+      a.assert()
+    }
     arg.invariantAssoc1(0) // expected-error {{member 'invariantAssoc1' cannot be used on value of type 'any P1'; consider using a generic constraint instead}}
     arg.invariantAssoc2(0) // expected-error {{member 'invariantAssoc2' cannot be used on value of type 'any P1'; consider using a generic constraint instead}}
     arg.invariantAssoc3(0) // expected-error {{member 'invariantAssoc3' cannot be used on value of type 'any P1'; consider using a generic constraint instead}}
@@ -390,7 +446,20 @@ do {
     arg.invariantAssoc9(0) // expected-error {{member 'invariantAssoc9' cannot be used on value of type 'any P1'; consider using a generic constraint instead}}
     arg.invariantAssoc10(0) // expected-error {{member 'invariantAssoc10' cannot be used on value of type 'any P1'; consider using a generic constraint instead}}
     arg.invariantAssoc11() // expected-error {{member 'invariantAssoc11' cannot be used on value of type 'any P1'; consider using a generic constraint instead}}
-
+    do {
+      let a = SwiftType<any Sequence>.IsStaticTypeOfExprAssertion(arg.invariantAssoc12())
+      a.assert()
+    }
+    do {
+      let a = SwiftType<any P1 & Sequence>.IsStaticTypeOfExprAssertion(arg.invariantAssoc13())
+      a.assert()
+    }
+    do {
+      // FIXME: Because (any P<X>).Type to (any P).Type upcast is not supported.
+      // expected-error@+1 {{member 'invariantAssoc14()' cannot be used on value of type 'any P1'; consider using a generic constraint instead}}
+      let a = SwiftType<(any Sequence).Type>.IsStaticTypeOfExprAssertion(arg.invariantAssoc14())
+      a.assert()
+    }
     arg.contravariantSelfProp1 // expected-error {{member 'contravariantSelfProp1' cannot be used on value of type 'any P1'; consider using a generic constraint instead}}
     arg.contravariantSelfProp2 // expected-error {{member 'contravariantSelfProp2' cannot be used on value of type 'any P1'; consider using a generic constraint instead}}
     arg.contravariantSelfProp3 // expected-error {{member 'contravariantSelfProp3' cannot be used on value of type 'any P1'; consider using a generic constraint instead}}
@@ -694,7 +763,7 @@ protocol MiscTestsProto {
 do {
   func miscTests(_ arg: any MiscTestsProto) {
     var r: any Sequence & IteratorProtocol = arg.getR()
-    r.makeIterator() // expected-error {{inferred result type 'any IteratorProtocol' requires explicit coercion due to loss of generic requirements}} {{19-19=as any IteratorProtocol}}
+    r.makeIterator() // expected-warning {{result of call to 'makeIterator()' is unused}}
     r.next() // expected-warning {{result of call to 'next()' is unused}}
     r.nonexistent() // expected-error {{value of type 'any IteratorProtocol & Sequence' has no member 'nonexistent'}}
 
@@ -855,7 +924,7 @@ do {
 class BadConformanceClass: CompositionBrokenClassConformance_a {}
 // expected-error@-1 {{type 'BadConformanceClass' does not conform to protocol 'CompositionBrokenClassConformance_a'}}
 protocol CompositionBrokenClassConformance_a {
-  associatedtype A // expected-note {{protocol requires nested type 'A'; do you want to add it?}}
+  associatedtype A // expected-note {{protocol requires nested type 'A'; add nested type 'A' for conformance}}
 }
 protocol CompositionBrokenClassConformance_b: CompositionBrokenClassConformance_a {
   func method(_: A)
@@ -864,7 +933,7 @@ do {
   // FIXME: Should GenericSignature::getConcreteType return the null type instead
   // of the error type here for Self.A, despite the broken conformance?
   let exist: any CompositionBrokenClassConformance_b & BadConformanceClass
-  exist.method(false) // expected-error {{type of expression is ambiguous without more context}}
+  exist.method(false) // expected-error {{type of expression is ambiguous without a type annotation}}
 }
 
 /// Covariant Associated Type Erasure
@@ -918,12 +987,24 @@ do {
   let _: Class2Base = exist.method5()
   let _: any Class2Base & CovariantAssocTypeErasure = exist.method6()
   let _: any Class2Base & CovariantAssocTypeErasure = exist.method7()
-
   let _: Any? = exist.method8()
   let _: (AnyObject, Bool) = exist.method9()
   let _: any CovariantAssocTypeErasure.Type = exist.method10()
   let _: Array<Class2Base> = exist.method11()
   let _: Dictionary<String, Class2Base> = exist.method12()
+
+  let _ = exist.method1()
+  let _ = exist.method2()
+  let _ = exist.method3()
+  let _ = exist.method4()
+  let _ = exist.method5()
+  let _ = exist.method6()
+  let _ = exist.method7()
+  let _ = exist.method8()
+  let _ = exist.method9()
+  let _ = exist.method10()
+  let _ = exist.method11()
+  let _ = exist.method12()
 }
 do {
   let exist: any CovariantAssocTypeErasureDerived

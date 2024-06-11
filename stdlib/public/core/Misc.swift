@@ -57,6 +57,7 @@ func _getFunctionFullNameFromMangledNameImpl(
 /// Given a function's mangled name, return a human readable name.
 /// Used e.g. by Distributed.RemoteCallTarget to hide mangled names.
 @available(SwiftStdlib 5.7, *)
+@_unavailableInEmbedded
 public // SPI (Distributed)
 func _getFunctionFullNameFromMangledName(mangledName: String) -> String? {
   let mangledNameUTF8 = Array(mangledName.utf8)
@@ -86,6 +87,7 @@ public func _getTypeName(_ type: Any.Type, qualified: Bool)
 
 /// Returns the demangled qualified name of a metatype.
 @_semantics("typeName")
+@_unavailableInEmbedded
 public // @testable
 func _typeName(_ type: Any.Type, qualified: Bool = true) -> String {
   let (stringPtr, count) = _getTypeName(type, qualified: qualified)
@@ -100,6 +102,7 @@ public func _getMangledTypeName(_ type: Any.Type)
 
 /// Returns the mangled name for a given type.
 @available(SwiftStdlib 5.3, *)
+@_unavailableInEmbedded
 public // SPI
 func _mangledTypeName(_ type: Any.Type) -> String? {
   let (stringPtr, count) = _getMangledTypeName(type)
@@ -117,6 +120,7 @@ func _mangledTypeName(_ type: Any.Type) -> String? {
 
 /// Lookup a class given a name. Until the demangled encoding of type
 /// names is stabilized, this is limited to top-level class names (Foo.bar).
+@_unavailableInEmbedded
 public // SPI(Foundation)
 func _typeByName(_ name: String) -> Any.Type? {
   let nameUTF8 = Array(name.utf8)
@@ -154,3 +158,92 @@ public func _getTypeByMangledNameInContext(
 public func _unsafePerformance<T>(_ c: () -> T) -> T {
   return c()
 }
+
+// Helper function that exploits a bug in rethrows checking to
+// allow us to call rethrows functions from generic typed-throws functions
+// and vice-versa.
+@usableFromInline
+@_alwaysEmitIntoClient
+@inline(__always)
+func _rethrowsViaClosure(_ fn: () throws -> ()) rethrows {
+  try fn()
+}
+
+/// A type whose values can be implicitly or explicitly copied.
+///
+/// Conforming to this protocol indicates that a type's value can be copied;
+/// this protocol doesn’t have any required methods or properties.
+/// You don't generally need to write an explicit conformance to `Copyable`.
+/// The following places implicitly include `Copyable` conformance:
+///
+/// * Structure declarations,
+///   unless it has a noncopyable stored property
+/// * Enumeration declarations,
+///   unless it has a case whose associated value isn't copyable
+/// * Class declarations
+/// * Actor declarations
+/// * Protocol declarations
+/// * Associated type declarations
+/// * The `Self` type in a protocol extension
+/// * In an extension, the generic parameters of the type being extended
+///
+/// A class or actor can contain noncopyable stored properties,
+/// while still being copyable itself ---
+/// classes and actors are copied by retaining and releasing references.
+///
+/// In a declaration that includes generic type parameters,
+/// each generic type parameter implicitly includes `Copyable`
+/// in its list of requirements.
+/// Metatypes and tuples of copyable types are also implicitly copyable,
+/// as are boxed protocol types.
+/// For example,
+/// all of the following pairs of declarations are equivalent:
+///
+///     struct MyStructure { }
+///     struct MyStructere: Copyable { }
+///
+///     protocol MyProtocol { }
+///     protocol MyProtocol: Copyable { }
+///
+///     protocol AnotherProtocol {
+///         associatedtype MyType
+///         associatedtype MyType: Copyable
+///     }
+///
+///     func genericFunction<T>(t: T) { }
+///     func genericFunction<T>(t: T) where T: Copyable { }
+///
+///     let x: any MyProtocol
+///     let x: any MyProtocol & Copyable
+///
+/// To suppress an implicit conformance to `Copyable` you write `~Copyable`.
+/// For example,
+/// only copyable types can conform to `MyProtocol` in the example above,
+/// but both copyable and noncopyable types
+/// can conform `NoRequirements` in the example below:
+///
+///     protocol NoRequirements: ~Copyable { }
+///
+/// Extensions to the `Copyable` protocol are not allowed.
+@_marker public protocol Copyable {}
+
+@_documentation(visibility: internal)
+@_marker public protocol Escapable {}
+
+#if $BitwiseCopyable2
+#if $NoncopyableGenerics && $NonescapableTypes
+@_marker public protocol BitwiseCopyable: ~Escapable { }
+#else
+@_marker public protocol BitwiseCopyable { }
+#endif
+
+@available(*, deprecated, message: "Use BitwiseCopyable")
+public typealias _BitwiseCopyable = BitwiseCopyable
+#else
+#if $NoncopyableGenerics && $NonescapableTypes
+@_marker public protocol _BitwiseCopyable: ~Escapable { }
+#else
+@_marker public protocol _BitwiseCopyable { }
+#endif
+public typealias BitwiseCopyable = _BitwiseCopyable
+#endif

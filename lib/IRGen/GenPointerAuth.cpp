@@ -183,6 +183,10 @@ static const PointerAuthSchema &getFunctionPointerSchema(IRGenModule &IGM,
   case SILFunctionTypeRepresentation::Method:
   case SILFunctionTypeRepresentation::WitnessMethod:
   case SILFunctionTypeRepresentation::Closure:
+  case SILFunctionTypeRepresentation::KeyPathAccessorGetter:
+  case SILFunctionTypeRepresentation::KeyPathAccessorSetter:
+  case SILFunctionTypeRepresentation::KeyPathAccessorEquals:
+  case SILFunctionTypeRepresentation::KeyPathAccessorHash:
     if (fnType->isAsync()) {
       return options.AsyncSwiftFunctionPointers;
     }
@@ -220,6 +224,60 @@ PointerAuthInfo PointerAuthInfo::emit(IRGenFunction &IGF,
 
   // Produce the 'other' discriminator.
   auto otherDiscriminator = getOtherDiscriminator(IGF.IGM, schema, entity);
+  llvm::Value *discriminator = otherDiscriminator;
+
+  // Factor in the address.
+  if (schema.isAddressDiscriminated()) {
+    assert(storageAddress &&
+           "no storage address for address-discriminated schema");
+
+    if (!otherDiscriminator->isZero()) {
+      discriminator = emitPointerAuthBlend(IGF, storageAddress, discriminator);
+    } else {
+      discriminator =
+          IGF.Builder.CreatePtrToInt(storageAddress, IGF.IGM.Int64Ty);
+    }
+  }
+
+  return PointerAuthInfo(key, discriminator);
+}
+
+PointerAuthInfo
+PointerAuthInfo::emit(IRGenFunction &IGF,
+                      clang::PointerAuthQualifier pointerAuthQual,
+                      llvm::Value *storageAddress) {
+  unsigned key = pointerAuthQual.getKey();
+
+  // Produce the 'other' discriminator.
+  auto otherDiscriminator = pointerAuthQual.getExtraDiscriminator();
+  llvm::Value *discriminator =
+      llvm::ConstantInt::get(IGF.IGM.Int64Ty, otherDiscriminator);
+
+  // Factor in the address.
+  if (pointerAuthQual.isAddressDiscriminated()) {
+    assert(storageAddress &&
+           "no storage address for address-discriminated schema");
+
+    if (otherDiscriminator != 0) {
+      discriminator = emitPointerAuthBlend(IGF, storageAddress, discriminator);
+    } else {
+      discriminator =
+          IGF.Builder.CreatePtrToInt(storageAddress, IGF.IGM.Int64Ty);
+    }
+  }
+
+  return PointerAuthInfo(key, discriminator);
+}
+
+PointerAuthInfo PointerAuthInfo::emit(IRGenFunction &IGF,
+                                      const PointerAuthSchema &schema,
+                                      llvm::Value *storageAddress,
+                                      llvm::ConstantInt *otherDiscriminator) {
+  if (!schema)
+    return PointerAuthInfo();
+
+  unsigned key = schema.getKey();
+
   llvm::Value *discriminator = otherDiscriminator;
 
   // Factor in the address.
@@ -301,6 +359,12 @@ PointerAuthEntity::getDeclDiscriminator(IRGenModule &IGM) const {
       case Special::ProtocolConformanceDescriptor:
       case Special::ProtocolConformanceDescriptorAsArgument:
         return SpecialPointerAuthDiscriminators::ProtocolConformanceDescriptor;
+      case Special::ProtocolDescriptorAsArgument:
+        return SpecialPointerAuthDiscriminators::ProtocolDescriptor;
+      case Special::OpaqueTypeDescriptorAsArgument:
+        return SpecialPointerAuthDiscriminators::OpaqueTypeDescriptor;
+      case Special::ContextDescriptorAsArgument:
+        return SpecialPointerAuthDiscriminators::ContextDescriptor;
       case Special::PartialApplyCapture:
         return PointerAuthDiscriminator_PartialApplyCapture;
       case Special::KeyPathDestroy:
@@ -325,6 +389,8 @@ PointerAuthEntity::getDeclDiscriminator(IRGenModule &IGM) const {
         return SpecialPointerAuthDiscriminators::KeyPathMetadataAccessor;
       case Special::DynamicReplacementKey:
         return SpecialPointerAuthDiscriminators::DynamicReplacementKey;
+      case Special::TypeLayoutString:
+        return SpecialPointerAuthDiscriminators::TypeLayoutString;
       case Special::BlockCopyHelper:
       case Special::BlockDisposeHelper:
         llvm_unreachable("no known discriminator for these foreign entities");
@@ -503,6 +569,9 @@ static uint64_t getTypeHash(IRGenModule &IGM, CanSILFunctionType type) {
   //   - thickness, so that we can promote thin-to-thick without rehashing;
   //   - error results, so that we can promote nonthrowing-to-throwing
   //     without rehashing;
+  //   - isolation, so that global actor annotations can change in the SDK
+  //     without breaking compatibility and so that we can erase it to
+  //     nonisolated without rehashing;
   //   - types of indirect arguments/retvals, so they can be substituted freely;
   //   - types of class arguments/retvals
   //   - types of metatype arguments/retvals
@@ -564,7 +633,11 @@ PointerAuthEntity::getTypeDiscriminator(IRGenModule &IGM) const {
     case SILFunctionTypeRepresentation::Thin:
     case SILFunctionTypeRepresentation::Method:
     case SILFunctionTypeRepresentation::WitnessMethod:
-    case SILFunctionTypeRepresentation::Closure: {
+    case SILFunctionTypeRepresentation::Closure:
+    case SILFunctionTypeRepresentation::KeyPathAccessorGetter:
+    case SILFunctionTypeRepresentation::KeyPathAccessorSetter:
+    case SILFunctionTypeRepresentation::KeyPathAccessorEquals:
+    case SILFunctionTypeRepresentation::KeyPathAccessorHash: {
       llvm::ConstantInt *&cache = IGM.getPointerAuthCaches().Types[fnType];
       if (cache) return cache;
 

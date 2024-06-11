@@ -87,11 +87,8 @@ struct SharedState : llvm::RefCountedBase<SharedState> {
   /// The collection of categories used.
   llvm::DenseMap<const char *, unsigned> Categories;
 
-  using DiagFlagsTy =
-      llvm::DenseMap<const void *, std::pair<unsigned, StringRef>>;
-
-  /// Map for uniquing strings.
-  DiagFlagsTy DiagFlags;
+  /// The collection of flags used.
+  llvm::StringMap<unsigned> Flags;
 
   /// Whether we have already started emission of any DIAG blocks. Once
   /// this becomes \c true, we never close a DIAG block until we know that we're
@@ -103,12 +100,15 @@ struct SharedState : llvm::RefCountedBase<SharedState> {
 class SerializedDiagnosticConsumer : public DiagnosticConsumer {
   /// State shared among the various clones of this diagnostic consumer.
   llvm::IntrusiveRefCntPtr<SharedState> State;
+  bool EmitMacroExpansionFiles = false;
   bool CalledFinishProcessing = false;
   bool CompilationWasComplete = true;
 
 public:
-  SerializedDiagnosticConsumer(StringRef serializedDiagnosticsPath)
-      : State(new SharedState(serializedDiagnosticsPath)) {
+  SerializedDiagnosticConsumer(StringRef serializedDiagnosticsPath,
+                               bool emitMacroExpansionFiles)
+      : State(new SharedState(serializedDiagnosticsPath)),
+        EmitMacroExpansionFiles(emitMacroExpansionFiles) {
     emitPreamble();
   }
 
@@ -188,10 +188,20 @@ private:
   }
 
   // Record identifier for the file.
-  unsigned getEmitFile(StringRef Filename);
+  unsigned getEmitFile(
+      SourceManager &SM, StringRef Filename, unsigned bufferID
+  );
 
   // Record identifier for the category.
   unsigned getEmitCategory(StringRef Category);
+
+  /// Emit a flag record that contains a semi-colon separated
+  /// list of all of the educational notes associated with the
+  /// diagnostic or `0` if there are no notes.
+  ///
+  /// \returns a flag record identifier that could be embedded in
+  /// other records.
+  unsigned emitEducationalNotes(const DiagnosticInfo &info);
 
   /// Add a source location to a record.
   void addLocToRecord(SourceLoc Loc,
@@ -211,32 +221,88 @@ private:
 
 namespace swift {
 namespace serialized_diagnostics {
-  std::unique_ptr<DiagnosticConsumer> createConsumer(StringRef outputPath) {
-    return std::make_unique<SerializedDiagnosticConsumer>(outputPath);
+  std::unique_ptr<DiagnosticConsumer> createConsumer(
+      StringRef outputPath, bool emitMacroExpansionFiles
+  ) {
+    return std::make_unique<SerializedDiagnosticConsumer>(
+        outputPath, emitMacroExpansionFiles);
   }
 } // namespace serialized_diagnostics
 } // namespace swift
 
-unsigned SerializedDiagnosticConsumer::getEmitFile(StringRef Filename) {
-  // NOTE: Using Filename.data() here relies on SourceMgr using
-  // const char* as buffer identifiers.  This is fast, but may
-  // be brittle.  We can always switch over to using a StringMap.
-  unsigned &entry = State->Files[Filename.data()];
-  if (entry)
-    return entry;
+/// Sanitize a filename for the purposes of the serialized diagnostics reader.
+static StringRef sanitizeFilename(
+    StringRef filename, SmallString<32> &scratch) {
+  if (!filename.ends_with("/") && !filename.ends_with("\\"))
+    return filename;
+
+  scratch = filename;
+  scratch += "_operator";
+  return scratch;
+}
+
+unsigned SerializedDiagnosticConsumer::getEmitFile(
+    SourceManager &SM, StringRef Filename, unsigned bufferID
+) {
+  // FIXME: Using Filename.data() here is wrong, since the provided
+  // SourceManager may not live as long as this consumer (which is
+  // the case if it's a diagnostic produced from building a module
+  // interface). We ought to switch over to using a StringMap once
+  // buffer names are unique (currently not the case for
+  // pretty-printed decl buffers).
+  unsigned &existingEntry = State->Files[Filename.data()];
+  if (existingEntry)
+    return existingEntry;
 
   // Lazily generate the record for the file.  Note that in
   // practice we only expect there to be one file, but this is
   // general and is what the diagnostic file expects.
-  entry = State->Files.size();
+  unsigned entry = State->Files.size();
+  existingEntry = entry;
   RecordData Record;
   Record.push_back(RECORD_FILENAME);
   Record.push_back(entry);
   Record.push_back(0); // For legacy.
   Record.push_back(0); // For legacy.
-  Record.push_back(Filename.size());
+  
+  // Sanitize the filename enough that the serialized diagnostics reader won't
+  // reject it.
+  SmallString<32> filenameScratch;
+  auto sanitizedFilename = sanitizeFilename(Filename, filenameScratch);
+  Record.push_back(sanitizedFilename.size());
   State->Stream.EmitRecordWithBlob(State->Abbrevs.get(RECORD_FILENAME),
-                                   Record, Filename.data());
+                                   Record, sanitizedFilename.data());
+
+  // If the buffer contains code that was synthesized by the compiler,
+  // emit the contents of the buffer.
+  auto generatedInfo = SM.getGeneratedSourceInfo(bufferID);
+  if (!generatedInfo)
+    return entry;
+
+  Record.clear();
+  Record.push_back(RECORD_SOURCE_FILE_CONTENTS);
+  Record.push_back(entry);
+
+  // The source range that this buffer was generated from, expressed as
+  // offsets into the original buffer.
+  if (generatedInfo->originalSourceRange.isValid()) {
+    auto originalFilename = SM.getDisplayNameForLoc(generatedInfo->originalSourceRange.getStart(),
+                                EmitMacroExpansionFiles);
+    addRangeToRecord(
+        generatedInfo->originalSourceRange,
+        SM, originalFilename, Record
+    );
+  } else {
+    addLocToRecord(SourceLoc(), SM, "", Record); // Start
+    addLocToRecord(SourceLoc(), SM, "", Record); // End
+  }
+
+  // Contents of the buffer.
+  auto sourceText = SM.getEntireTextForBuffer(bufferID);
+  Record.push_back(sourceText.size());
+  State->Stream.EmitRecordWithBlob(
+      State->Abbrevs.get(RECORD_SOURCE_FILE_CONTENTS),
+      Record, sourceText);
 
   return entry;
 }
@@ -253,9 +319,37 @@ unsigned SerializedDiagnosticConsumer::getEmitCategory(StringRef Category) {
   Record.push_back(entry);
   Record.push_back(Category.size());
   State->Stream.EmitRecordWithBlob(State->Abbrevs.get(RECORD_CATEGORY), Record,
-                                   Category.data());
+                                   Category);
 
   return entry;
+}
+
+unsigned
+SerializedDiagnosticConsumer::emitEducationalNotes(const DiagnosticInfo &Info) {
+  if (Info.EducationalNotePaths.empty())
+    return 0;
+
+  SmallString<32> scratch;
+  interleave(
+      Info.EducationalNotePaths,
+      [&scratch](const auto &notePath) { scratch += notePath; },
+      [&scratch] { scratch += ';'; });
+
+  StringRef paths = scratch.str();
+
+  unsigned &recordID = State->Flags[paths];
+  if (recordID)
+    return recordID;
+
+  recordID = State->Flags.size();
+
+  RecordData Record;
+  Record.push_back(RECORD_DIAG_FLAG);
+  Record.push_back(recordID);
+  Record.push_back(paths.size());
+  State->Stream.EmitRecordWithBlob(State->Abbrevs.get(RECORD_DIAG_FLAG), Record,
+                                   paths);
+  return recordID;
 }
 
 void SerializedDiagnosticConsumer::addLocToRecord(SourceLoc Loc,
@@ -275,7 +369,7 @@ void SerializedDiagnosticConsumer::addLocToRecord(SourceLoc Loc,
   unsigned line, col;
   std::tie(line, col) = SM.getPresumedLineAndColumnForLoc(Loc);
 
-  Record.push_back(getEmitFile(Filename));
+  Record.push_back(getEmitFile(SM, Filename, bufferId));
   Record.push_back(line);
   Record.push_back(col);
   Record.push_back(SM.getLocOffsetInBuffer(Loc, bufferId));
@@ -368,7 +462,7 @@ static void emitRecordID(unsigned ID, const char *Name,
 static void
 addSourceLocationAbbrev(std::shared_ptr<llvm::BitCodeAbbrev> Abbrev) {
   using namespace llvm;
-  Abbrev->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 10)); // File ID.
+  Abbrev->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::VBR, 5));    // File ID.
   Abbrev->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 32)); // Line.
   Abbrev->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 32)); // Column.
   Abbrev->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 32)); // Offset;
@@ -411,6 +505,8 @@ void SerializedDiagnosticConsumer::emitBlockInfoBlock() {
   emitRecordID(RECORD_DIAG_FLAG, "DiagFlag", Stream, Record);
   emitRecordID(RECORD_FILENAME, "FileName", Stream, Record);
   emitRecordID(RECORD_FIXIT, "FixIt", Stream, Record);
+  emitRecordID(
+      RECORD_SOURCE_FILE_CONTENTS, "SourceFileContents", Stream, Record);
 
   // Emit abbreviation for RECORD_DIAG.
   Abbrev = std::make_shared<BitCodeAbbrev>();
@@ -450,7 +546,7 @@ void SerializedDiagnosticConsumer::emitBlockInfoBlock() {
   // Emit the abbreviation for RECORD_FILENAME.
   Abbrev = std::make_shared<BitCodeAbbrev>();
   Abbrev->Add(BitCodeAbbrevOp(RECORD_FILENAME));
-  Abbrev->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 10)); // Mapped file ID.
+  Abbrev->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::VBR, 5)); // Mapped file ID.
   Abbrev->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 32)); // Size.
   Abbrev->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 32)); // Modification time.
   Abbrev->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 16)); // Text size.
@@ -466,6 +562,16 @@ void SerializedDiagnosticConsumer::emitBlockInfoBlock() {
   Abbrev->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Blob));      // FixIt text.
   Abbrevs.set(RECORD_FIXIT, Stream.EmitBlockInfoAbbrev(BLOCK_DIAG,
                                                        Abbrev));
+
+  // Emit the abbreviation for RECORD_SOURCE_FILE_CONTENTS.
+  Abbrev = std::make_shared<BitCodeAbbrev>();
+  Abbrev->Add(BitCodeAbbrevOp(RECORD_SOURCE_FILE_CONTENTS));
+  Abbrev->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::VBR, 5)); // File ID.
+  addRangeLocationAbbrev(Abbrev);
+  Abbrev->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::VBR, 16)); // File size.
+  Abbrev->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Blob)); // File contents.
+  Abbrevs.set(RECORD_SOURCE_FILE_CONTENTS,
+              Stream.EmitBlockInfoAbbrev(BLOCK_DIAG, Abbrev));
 
   Stream.ExitBlock();
 }
@@ -484,7 +590,7 @@ emitDiagnosticMessage(SourceManager &SM,
 
   StringRef filename = "";
   if (Loc.isValid())
-    filename = SM.getDisplayNameForLoc(Loc);
+    filename = SM.getDisplayNameForLoc(Loc, EmitMacroExpansionFiles);
 
   // Emit the RECORD_DIAG record.
   Record.clear();
@@ -499,8 +605,10 @@ emitDiagnosticMessage(SourceManager &SM,
     Record.push_back(0);
   }
 
-  // FIXME: Swift diagnostics currently have no flags.
-  Record.push_back(0);
+  // Use "flags" slot to emit a semi-colon separated list of
+  // educational notes. If there are no notes associated with
+  // this diagnostic `0` placeholder would be emitted instead.
+  Record.push_back(emitEducationalNotes(Info));
 
   // Emit the message.
   Record.push_back(Text.size());

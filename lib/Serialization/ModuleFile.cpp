@@ -17,6 +17,7 @@
 #include "ModuleFormat.h"
 #include "swift/Serialization/SerializationOptions.h"
 #include "swift/Subsystems.h"
+#include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTMangler.h"
 #include "swift/AST/GenericSignature.h"
@@ -90,6 +91,29 @@ static bool isTargetTooNew(const llvm::Triple &moduleTarget,
   return ctxTarget.isOSVersionLT(moduleTarget);
 }
 
+std::string ModuleFile::resolveModuleDefiningFilename(const ASTContext &ctx) {
+  if (!Core->ModuleInterfacePath.empty()) {
+    std::string interfacePath = Core->ModuleInterfacePath.str();
+    if (llvm::sys::path::is_relative(interfacePath)) {
+      SmallString<128> absoluteInterfacePath(ctx.SearchPathOpts.getSDKPath());
+      llvm::sys::path::append(absoluteInterfacePath, interfacePath);
+      return absoluteInterfacePath.str().str();
+    } else
+      return interfacePath;
+  } else
+    return getModuleLoadedFilename().str();
+}
+
+namespace swift {
+namespace serialization {
+bool areCompatible(const llvm::Triple &moduleTarget,
+                   const llvm::Triple &ctxTarget) {
+  return areCompatibleArchitectures(moduleTarget, ctxTarget) &&
+         areCompatibleOSs(moduleTarget, ctxTarget);
+}
+} // namespace serialization
+} // namespace swift
+
 ModuleFile::ModuleFile(std::shared_ptr<const ModuleFileSharedCore> core)
     : Core(core) {
   assert(!core->hasError());
@@ -109,6 +133,7 @@ ModuleFile::ModuleFile(std::shared_ptr<const ModuleFileSharedCore> core)
   allocateBuffer(Decls, core->Decls);
   allocateBuffer(LocalDeclContexts, core->LocalDeclContexts);
   allocateBuffer(Conformances, core->Conformances);
+  allocateBuffer(PackConformances, core->PackConformances);
   allocateBuffer(SILLayouts, core->SILLayouts);
   allocateBuffer(Types, core->Types);
   allocateBuffer(ClangTypes, core->ClangTypes);
@@ -122,56 +147,19 @@ bool ModuleFile::allowCompilerErrors() const {
   return getContext().LangOpts.AllowModuleWithCompilerErrors;
 }
 
-Status ModuleFile::associateWithFileContext(FileUnit *file, SourceLoc diagLoc,
-                                            bool recoverFromIncompatibility) {
-  PrettyStackTraceModuleFile stackEntry(*this);
-
-  assert(!hasError() && "error already detected; should not call this");
-  assert(!FileContext && "already associated with an AST module");
-  FileContext = file;
-  Status status = Status::Valid;
-
-  ModuleDecl *M = file->getParentModule();
-  // The real (on-disk) name of the module should be checked here as that's the
-  // actually loaded module. In case module aliasing is used when building the main
-  // module, e.g. -module-name MyModule -module-alias Foo=Bar, the loaded module
-  // that maps to 'Foo' is actually Bar.swiftmodule|.swiftinterface (applies to swift
-  // modules only), which is retrieved via M->getRealName(). If no module aliasing is
-  // used, M->getRealName() will return the same value as M->getName(), which is 'Foo'.
-  if (M->getRealName().str() != Core->Name) {
-    return error(Status::NameMismatch);
-  }
-
+Status
+ModuleFile::loadDependenciesForFileContext(const FileUnit *file,
+                                           SourceLoc diagLoc,
+                                           bool forTestable) {
   ASTContext &ctx = getContext();
-
-  llvm::Triple moduleTarget(llvm::Triple::normalize(Core->TargetTriple));
-  if (!areCompatibleArchitectures(moduleTarget, ctx.LangOpts.Target) ||
-      !areCompatibleOSs(moduleTarget, ctx.LangOpts.Target)) {
-    status = Status::TargetIncompatible;
-    if (!recoverFromIncompatibility)
-      return error(status);
-  } else if (ctx.LangOpts.EnableTargetOSChecking && !M->isResilient() &&
-             isTargetTooNew(moduleTarget, ctx.LangOpts.Target)) {
-    status = Status::TargetTooNew;
-    if (!recoverFromIncompatibility)
-      return error(status);
-  }
-
-  StringRef SDKPath = ctx.SearchPathOpts.getSDKPath();
-  if (SDKPath.empty() ||
-      !Core->ModuleInputBuffer->getBufferIdentifier().startswith(SDKPath)) {
-    for (const auto &searchPath : Core->SearchPaths) {
-      ctx.addSearchPath(
-        ctx.SearchPathOpts.SearchPathRemapper.remapPath(searchPath.Path),
-        searchPath.IsFramework,
-        searchPath.IsSystem);
-    }
-  }
-
   auto clangImporter = static_cast<ClangImporter *>(ctx.getClangModuleLoader());
+  ModuleDecl *M = file->getParentModule();
 
   bool missingDependency = false;
   for (auto &dependency : Dependencies) {
+    if (forTestable && dependency.isLoaded())
+      continue;
+
     assert(!dependency.isLoaded() && "already loaded?");
 
     if (dependency.isHeader()) {
@@ -194,20 +182,20 @@ Status ModuleFile::associateWithFileContext(FileUnit *file, SourceLoc diagLoc,
       continue;
     }
 
-    // If this module file is being installed into the main module, it's treated
-    // as a partial module.
-    auto isPartialModule = M->isMainModule();
+    ModuleLoadingBehavior transitiveBehavior =
+      getTransitiveLoadingBehavior(dependency, forTestable);
 
-    if (dependency.isImplementationOnly() &&
-        !(isPartialModule || ctx.LangOpts.DebuggerSupport)) {
-      // When building normally (and not merging partial modules), we don't
-      // want to bring in the implementation-only module, because that might
-      // change the set of visible declarations. However, when debugging we
-      // want to allow getting at the internals of this module when possible,
-      // and so we'll try to reference the implementation-only module if it's
-      // available.
-      continue;
+    if (ctx.LangOpts.EnableModuleLoadingRemarks) {
+      ctx.Diags.diagnose(diagLoc,
+                         diag::transitive_dependency_behavior,
+                         dependency.Core.getPrettyPrintedPath(),
+                         M->getName(),
+                         unsigned(transitiveBehavior));
     }
+
+    // Skip this dependency?
+    if (transitiveBehavior == ModuleLoadingBehavior::Ignored)
+      continue;
 
     ImportPath::Builder builder(ctx, dependency.Core.RawPath,
                                 /*separator=*/'\0');
@@ -226,11 +214,13 @@ Status ModuleFile::associateWithFileContext(FileUnit *file, SourceLoc diagLoc,
           modulePath.front().Item == file->getParentModule()->getName()) {
         return error(Status::MissingUnderlyingModule);
       }
-
       // Otherwise, continue trying to load dependencies, so that we can list
       // everything that's missing.
-      if (!(dependency.isImplementationOnly() && ctx.LangOpts.DebuggerSupport))
+
+      // Report a missing dependency only when really needed.
+      if (transitiveBehavior == ModuleLoadingBehavior::Required)
         missingDependency = true;
+
       continue;
     }
 
@@ -256,13 +246,85 @@ Status ModuleFile::associateWithFileContext(FileUnit *file, SourceLoc diagLoc,
     return error(Status::MissingDependency);
   }
 
+  return Status::Valid;
+}
+
+Status ModuleFile::associateWithFileContext(FileUnit *file, SourceLoc diagLoc,
+                                            bool recoverFromIncompatibility) {
+  PrettyStackTraceModuleFile stackEntry(*this);
+
+  assert(!hasError() && "error already detected; should not call this");
+  assert(!FileContext && "already associated with an AST module");
+  FileContext = file;
+  Status status = Status::Valid;
+
+  ModuleDecl *M = file->getParentModule();
+  // The real (on-disk) name of the module should be checked here as that's the
+  // actually loaded module. In case module aliasing is used when building the main
+  // module, e.g. -module-name MyModule -module-alias Foo=Bar, the loaded module
+  // that maps to 'Foo' is actually Bar.swiftmodule|.swiftinterface (applies to swift
+  // modules only), which is retrieved via M->getRealName(). If no module aliasing is
+  // used, M->getRealName() will return the same value as M->getName(), which is 'Foo'.
+  if (M->getRealName().str() != Core->Name) {
+    return error(Status::NameMismatch);
+  }
+
+  ASTContext &ctx = getContext();
+  // Resolve potentially-SDK-relative module-defining .swiftinterface path
+  ResolvedModuleDefiningFilename = resolveModuleDefiningFilename(ctx);
+
+  llvm::Triple moduleTarget(llvm::Triple::normalize(Core->TargetTriple));
+  if (!areCompatible(moduleTarget, ctx.LangOpts.Target)) {
+    status = Status::TargetIncompatible;
+    if (!recoverFromIncompatibility)
+      return error(status);
+  } else if (ctx.LangOpts.EnableTargetOSChecking && !M->isResilient() &&
+             isTargetTooNew(moduleTarget, ctx.LangOpts.Target)) {
+    status = Status::TargetTooNew;
+    if (!recoverFromIncompatibility)
+      return error(status);
+  }
+
+  StringRef SDKPath = ctx.SearchPathOpts.getSDKPath();
+  // In Swift 6 mode, we do not inherit search paths from loaded non-SDK modules.
+  if (!ctx.LangOpts.isSwiftVersionAtLeast(6) &&
+      (SDKPath.empty() ||
+       !Core->ModuleInputBuffer->getBufferIdentifier().starts_with(SDKPath))) {
+    for (const auto &searchPath : Core->SearchPaths) {
+      ctx.addSearchPath(
+        ctx.SearchPathOpts.SearchPathRemapper.remapPath(searchPath.Path),
+        searchPath.IsFramework,
+        searchPath.IsSystem);
+    }
+  }
+
+  Status res = loadDependenciesForFileContext(file, diagLoc,
+                                            /*forTestable=*/false);
+  if (res != Status::Valid) return res;
+
   if (Core->Bits.HasEntryPoint) {
-    FileContext->getParentModule()->registerEntryPointFile(FileContext,
-                                                           SourceLoc(),
-                                                           None);
+    FileContext->getParentModule()->registerEntryPointFile(
+        FileContext, SourceLoc(), std::nullopt);
   }
 
   return status;
+}
+
+ModuleLoadingBehavior
+ModuleFile::getTransitiveLoadingBehavior(const Dependency &dependency,
+    bool forTestable) const {
+  ASTContext &ctx = getContext();
+  ModuleDecl *mod = FileContext->getParentModule();
+
+  // If this module file is being installed into the main module, it's treated
+  // as a partial module.
+  auto isPartialModule = mod->isMainModule();
+
+  return Core->getTransitiveLoadingBehavior(dependency.Core,
+                                            ctx.LangOpts.DebuggerSupport,
+                                            isPartialModule,
+                                            ctx.LangOpts.PackageName,
+                                            forTestable);
 }
 
 bool ModuleFile::mayHaveDiagnosticsPointingAtBuffer() const {
@@ -292,7 +354,7 @@ void ModuleFile::lookupValue(DeclName name,
         if (!declOrError) {
           if (!getContext().LangOpts.EnableDeserializationRecovery)
             fatal(declOrError.takeError());
-          llvm::consumeError(declOrError.takeError());
+          diagnoseAndConsumeError(declOrError.takeError());
           continue;
         }
         auto VD = cast<ValueDecl>(declOrError.get());
@@ -311,7 +373,7 @@ void ModuleFile::lookupValue(DeclName name,
         if (!declOrError) {
           if (!getContext().LangOpts.EnableDeserializationRecovery)
             fatal(declOrError.takeError());
-          llvm::consumeError(declOrError.takeError());
+          diagnoseAndConsumeError(declOrError.takeError());
           continue;
         }
         auto VD = cast<ValueDecl>(declOrError.get());
@@ -356,9 +418,9 @@ ModuleFile::getModuleName(ASTContext &Ctx, StringRef modulePath,
   std::shared_ptr<const ModuleFileSharedCore> loadedModuleFile;
   bool isFramework = false;
   serialization::ValidationInfo loadInfo = ModuleFileSharedCore::load(
-      modulePath.str(), std::move(newBuf), nullptr, nullptr,
-      /*isFramework*/ isFramework, Ctx.SILOpts.EnableOSSAModules, Ctx.LangOpts.SDKName,
-      Ctx.SearchPathOpts.DeserializedPathRecoverer,
+      "", "", std::move(newBuf), nullptr, nullptr,
+      /*isFramework=*/isFramework, Ctx.SILOpts.EnableOSSAModules,
+      Ctx.LangOpts.SDKName, Ctx.SearchPathOpts.DeserializedPathRecoverer,
       loadedModuleFile);
   Name = loadedModuleFile->Name.str();
   return std::move(moduleBuf.get());
@@ -393,7 +455,14 @@ TypeDecl *ModuleFile::lookupNestedType(Identifier name,
         Decl *decl = declOrOffset;
         if (decl != parent)
           continue;
-        return cast<TypeDecl>(getDecl(entry.second));
+        Expected<Decl *> typeOrErr = getDeclChecked(entry.second);
+        if (!typeOrErr) {
+          if (!getContext().LangOpts.EnableDeserializationRecovery)
+            fatal(typeOrErr.takeError());
+          diagnoseAndConsumeError(typeOrErr.takeError());
+          continue;
+        }
+        return cast<TypeDecl>(typeOrErr.get());
       }
     }
   }
@@ -451,13 +520,21 @@ void ModuleFile::getImportedModules(SmallVectorImpl<ImportedModule> &results,
         continue;
 
     } else if (dep.isImplementationOnly()) {
-      if (!filter.contains(ModuleDecl::ImportFilterKind::ImplementationOnly))
+      // Pretend we didn't have potentially optional imports if we weren't
+      // originally asked to load it.
+      if (!filter.contains(ModuleDecl::ImportFilterKind::ImplementationOnly) ||
+          !dep.isLoaded())
         continue;
-      if (!dep.isLoaded()) {
-        // Pretend we didn't have this import if we weren't originally asked to
-        // load it.
+
+    } else if (dep.isInternalOrBelow()) {
+      if (!filter.contains(ModuleDecl::ImportFilterKind::InternalOrBelow) ||
+          !dep.isLoaded())
         continue;
-      }
+
+    } else if (dep.isPackageOnly()) {
+      if (!filter.contains(ModuleDecl::ImportFilterKind::PackageOnly) ||
+          !dep.isLoaded())
+        continue;
 
     } else {
       if (!filter.contains(ModuleDecl::ImportFilterKind::Default))
@@ -506,8 +583,9 @@ void ModuleFile::getImportDecls(SmallVectorImpl<Decl *> &Results) {
           SmallVector<ValueDecl *, 8> Decls;
           TopLevelModule->lookupQualified(
               TopLevelModule, DeclNameRef(ScopeID),
-              NL_QualifiedDefault, Decls);
-          Optional<ImportKind> FoundKind = ImportDecl::findBestImportKind(Decls);
+              SourceLoc(), NL_QualifiedDefault, Decls);
+          std::optional<ImportKind> FoundKind =
+              ImportDecl::findBestImportKind(Decls);
           assert(FoundKind.has_value() &&
                  "deserialized imports should not be ambiguous");
           Kind = *FoundKind;
@@ -545,7 +623,7 @@ void ModuleFile::lookupVisibleDecls(ImportPath::Access accessPath,
     if (!declOrError) {
       if (!getContext().LangOpts.EnableDeserializationRecovery)
         fatal(declOrError.takeError());
-      llvm::consumeError(declOrError.takeError());
+      diagnoseAndConsumeError(declOrError.takeError());
       return;
     }
     consumer.foundDecl(cast<ValueDecl>(declOrError.get()),
@@ -594,7 +672,7 @@ void ModuleFile::loadExtensions(NominalTypeDecl *nominal) {
       if (!declOrError) {
         if (!getContext().LangOpts.EnableDeserializationRecovery)
           fatal(declOrError.takeError());
-        llvm::consumeError(declOrError.takeError());
+        diagnoseAndConsumeError(declOrError.takeError());
       }
     }
   } else {
@@ -607,7 +685,7 @@ void ModuleFile::loadExtensions(NominalTypeDecl *nominal) {
       if (!declOrError) {
         if (!getContext().LangOpts.EnableDeserializationRecovery)
           fatal(declOrError.takeError());
-        llvm::consumeError(declOrError.takeError());
+        diagnoseAndConsumeError(declOrError.takeError());
       }
     }
   }
@@ -664,18 +742,19 @@ void ModuleFile::loadDerivativeFunctionConfigurations(
     if (!derivativeGenSigOrError) {
       if (!getContext().LangOpts.EnableDeserializationRecovery)
         fatal(derivativeGenSigOrError.takeError());
-      llvm::consumeError(derivativeGenSigOrError.takeError());
+      diagnoseAndConsumeError(derivativeGenSigOrError.takeError());
     }
     auto derivativeGenSig = derivativeGenSigOrError.get();
     // NOTE(TF-1038): Result indices are currently unsupported in derivative
-    // registration attributes. In the meantime, always use `{0}` (wrt the
-    // first and only result).
-    auto resultIndices = IndexSubset::get(ctx, 1, {0});
+    // registration attributes. In the meantime, always use all results.
+    auto *resultIndices =
+      autodiff::getFunctionSemanticResultIndices(originalAFD,
+                                                 parameterIndices);
     results.insert({parameterIndices, resultIndices, derivativeGenSig});
   }
 }
 
-Optional<Fingerprint>
+std::optional<Fingerprint>
 ModuleFile::loadFingerprint(const IterableDeclContext *IDC) const {
   PrettyStackTraceDecl trace("loading fingerprints for", IDC->getDecl());
 
@@ -683,12 +762,12 @@ ModuleFile::loadFingerprint(const IterableDeclContext *IDC) const {
   assert(IDC->getDeclID() != 0);
 
   if (!Core->DeclFingerprints) {
-    return None;
+    return std::nullopt;
   }
 
   auto it = Core->DeclFingerprints->find(IDC->getDeclID());
   if (it == Core->DeclFingerprints->end()) {
-    return None;
+    return std::nullopt;
   }
   return *it;
 }
@@ -838,7 +917,7 @@ void ModuleFile::lookupClassMembers(ImportPath::Access accessPath,
         if (!decl) {
           if (!getContext().LangOpts.EnableDeserializationRecovery)
             fatal(decl.takeError());
-          llvm::consumeError(decl.takeError());
+          diagnoseAndConsumeError(decl.takeError());
           continue;
         }
 
@@ -861,7 +940,7 @@ void ModuleFile::lookupClassMembers(ImportPath::Access accessPath,
         if (!decl) {
           if (!getContext().LangOpts.EnableDeserializationRecovery)
             fatal(decl.takeError());
-          llvm::consumeError(decl.takeError());
+          diagnoseAndConsumeError(decl.takeError());
           continue;
         }
 
@@ -885,8 +964,13 @@ void ModuleFile::lookupObjCMethods(
   auto found = *known;
   for (const auto &result : found) {
     // Deserialize the method and add it to the list.
-    if (auto func = dyn_cast_or_null<AbstractFunctionDecl>(
-                      getDecl(std::get<2>(result))))
+    auto declOrError = getDeclChecked(std::get<2>(result));
+    if (!declOrError) {
+        consumeError(declOrError.takeError());
+        continue;
+    }
+
+    if (auto func = dyn_cast_or_null<AbstractFunctionDecl>(declOrError.get()))
       results.push_back(func);
   }
 }
@@ -992,7 +1076,7 @@ void ModuleFile::getDisplayDecls(SmallVectorImpl<Decl *> &results, bool recursiv
   getTopLevelDecls(results);
 }
 
-Optional<CommentInfo> ModuleFile::getCommentForDecl(const Decl *D) const {
+std::optional<CommentInfo> ModuleFile::getCommentForDecl(const Decl *D) const {
   assert(D);
 
   // Keep these as assertions instead of early exits to ensure that we are not
@@ -1003,16 +1087,20 @@ Optional<CommentInfo> ModuleFile::getCommentForDecl(const Decl *D) const {
          "Decl is from a different serialized file");
 
   if (!Core->DeclCommentTable)
-    return None;
+    return std::nullopt;
   if (D->isImplicit())
-    return None;
+    return std::nullopt;
   // Compute the USR.
   llvm::SmallString<128> USRBuffer;
   llvm::raw_svector_ostream OS(USRBuffer);
   if (ide::printDeclUSR(D, OS))
-    return None;
+    return std::nullopt;
 
   return getCommentForDeclByUSR(USRBuffer.str());
+}
+
+bool ModuleFile::hasLoadedSwiftDoc() const {
+  return Core->DeclCommentTable != nullptr;
 }
 
 void ModuleFile::collectSerializedSearchPath(
@@ -1096,7 +1184,7 @@ static void readRawLoc(ExternalSourceLocs::RawLoc &Loc, const char *&Data,
   Loc.Directive.Name = readLocString(Data, StringData);
 }
 
-Optional<ExternalSourceLocs::RawLocs>
+std::optional<ExternalSourceLocs::RawLocs>
 ModuleFile::getExternalRawLocsForDecl(const Decl *D) const {
   assert(D);
   // Keep these as assertions instead of early exits to ensure that we are not
@@ -1107,22 +1195,22 @@ ModuleFile::getExternalRawLocsForDecl(const Decl *D) const {
          "Decl is from a different serialized file");
 
   if (!Core->DeclUSRsTable)
-    return None;
+    return std::nullopt;
   // Future compilers may not provide BasicDeclLocsData anymore.
   if (Core->BasicDeclLocsData.empty())
-    return None;
+    return std::nullopt;
   if (D->isImplicit())
-    return None;
+    return std::nullopt;
 
   // Compute the USR.
   llvm::SmallString<128> USRBuffer;
   llvm::raw_svector_ostream OS(USRBuffer);
   if (ide::printDeclUSR(D, OS))
-    return None;
+    return std::nullopt;
 
   auto It = Core->DeclUSRsTable->find(OS.str());
   if (It == Core->DeclUSRsTable->end())
-    return None;
+    return std::nullopt;
 
   auto UsrId = *It;
   uint32_t RecordSize =
@@ -1161,31 +1249,31 @@ ModuleFile::getExternalRawLocsForDecl(const Decl *D) const {
 
 const static StringRef Separator = "/";
 
-Optional<StringRef> ModuleFile::getGroupNameById(unsigned Id) const {
+std::optional<StringRef> ModuleFile::getGroupNameById(unsigned Id) const {
   if (!Core->GroupNamesMap)
-    return None;
+    return std::nullopt;
   const auto &GroupNamesMap = *Core->GroupNamesMap;
   auto it = GroupNamesMap.find(Id);
   if (it == GroupNamesMap.end())
-    return None;
+    return std::nullopt;
   StringRef Original = it->second;
   if (Original.empty())
-    return None;
+    return std::nullopt;
   auto SepPos = Original.find_last_of(Separator);
   assert(SepPos != StringRef::npos && "Cannot find Separator.");
   return StringRef(Original.data(), SepPos);
 }
 
-Optional<StringRef> ModuleFile::getSourceFileNameById(unsigned Id) const {
+std::optional<StringRef> ModuleFile::getSourceFileNameById(unsigned Id) const {
   if (!Core->GroupNamesMap)
-    return None;
+    return std::nullopt;
   const auto &GroupNamesMap = *Core->GroupNamesMap;
   auto it = GroupNamesMap.find(Id);
   if (it == GroupNamesMap.end())
-    return None;
+    return std::nullopt;
   StringRef Original = it->second;
   if (Original.empty())
-    return None;
+    return std::nullopt;
   auto SepPos = Original.find_last_of(Separator);
   assert(SepPos != StringRef::npos && "Cannot find Separator.");
   auto Start = Original.data() + SepPos + 1;
@@ -1193,29 +1281,27 @@ Optional<StringRef> ModuleFile::getSourceFileNameById(unsigned Id) const {
   return StringRef(Start, Len);
 }
 
-Optional<StringRef> ModuleFile::getGroupNameForDecl(const Decl *D) const {
+std::optional<StringRef> ModuleFile::getGroupNameForDecl(const Decl *D) const {
   auto Triple = getCommentForDecl(D);
   if (!Triple.has_value()) {
-    return None;
+    return std::nullopt;
   }
   return getGroupNameById(Triple.value().Group);
 }
 
-
-Optional<StringRef>
+std::optional<StringRef>
 ModuleFile::getSourceFileNameForDecl(const Decl *D) const {
   auto Triple = getCommentForDecl(D);
   if (!Triple.has_value()) {
-    return None;
+    return std::nullopt;
   }
   return getSourceFileNameById(Triple.value().Group);
 }
 
-Optional<unsigned>
-ModuleFile::getSourceOrderForDecl(const Decl *D) const {
+std::optional<unsigned> ModuleFile::getSourceOrderForDecl(const Decl *D) const {
   auto Triple = getCommentForDecl(D);
   if (!Triple.has_value()) {
-    return None;
+    return std::nullopt;
   }
   return Triple.value().SourceOrder;
 }
@@ -1238,10 +1324,10 @@ void ModuleFile::collectAllGroups(SmallVectorImpl<StringRef> &Names) const {
   }
 }
 
-Optional<CommentInfo>
+std::optional<CommentInfo>
 ModuleFile::getCommentForDeclByUSR(StringRef USR) const {
   if (!Core->DeclCommentTable)
-    return None;
+    return std::nullopt;
 
   // Use the comment cache to preserve the memory that the array of
   // `SingleRawComment`s, inside `CommentInfo`, points to, and generally avoid
@@ -1250,28 +1336,27 @@ ModuleFile::getCommentForDeclByUSR(StringRef USR) const {
   if (it != CommentsCache.end()) {
     const auto &cachePtr = it->second;
     if (!cachePtr)
-      return None;
+      return std::nullopt;
     return cachePtr->Info;
   }
 
   auto I = Core->DeclCommentTable->find(USR);
   if (I == Core->DeclCommentTable->end())
-    return None;
+    return std::nullopt;
 
   auto &cachePtr = CommentsCache[USR];
   cachePtr = *I;
   return cachePtr->Info;
 }
 
-Optional<StringRef>
-ModuleFile::getGroupNameByUSR(StringRef USR) const {
+std::optional<StringRef> ModuleFile::getGroupNameByUSR(StringRef USR) const {
   if (auto Comment = getCommentForDeclByUSR(USR)) {
     return getGroupNameById(Comment.value().Group);
   }
-  return None;
+  return std::nullopt;
 }
 
-Identifier ModuleFile::getDiscriminatorForPrivateValue(const ValueDecl *D) {
+Identifier ModuleFile::getDiscriminatorForPrivateDecl(const Decl *D) {
   Identifier discriminator = PrivateDiscriminatorsByValue.lookup(D);
   assert(!discriminator.empty() && "no discriminator found for decl");
   return discriminator;
@@ -1306,7 +1391,7 @@ ValueDecl *SerializedASTFile::getMainDecl() const {
   return cast_or_null<ValueDecl>(File.getDecl(File.getEntryPointDeclID()));
 }
 
-const version::Version &SerializedASTFile::getLanguageVersionBuiltWith() const {
+version::Version SerializedASTFile::getLanguageVersionBuiltWith() const {
   return File.getCompatibilityVersion();
 }
 
@@ -1318,4 +1403,11 @@ StringRef SerializedASTFile::getModuleDefiningPath() const {
     return parentDir;
 
   return moduleFilename;
+}
+
+StringRef SerializedASTFile::getExportedModuleName() const {
+  auto name = File.getModuleExportAsName();
+  if (!name.empty())
+    return name;
+  return FileUnit::getExportedModuleName();
 }

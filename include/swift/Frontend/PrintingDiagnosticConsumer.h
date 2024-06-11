@@ -22,28 +22,37 @@
 #include "swift/Basic/DiagnosticOptions.h"
 #include "swift/Basic/LLVM.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Process.h"
 
 namespace swift {
-class AnnotatedSourceSnippet;
 
 /// Diagnostic consumer that displays diagnostics to standard error.
 class PrintingDiagnosticConsumer : public DiagnosticConsumer {
   llvm::raw_ostream &Stream;
   bool ForceColors = false;
   bool PrintEducationalNotes = false;
+  bool EmitMacroExpansionFiles = false;
   bool DidErrorOccur = false;
   DiagnosticOptions::FormattingStyle FormattingStyle =
       DiagnosticOptions::FormattingStyle::LLVM;
-  // The current snippet used to display an error/warning/remark and the notes
-  // implicitly associated with it. Uses `std::unique_ptr` so that
-  // `AnnotatedSourceSnippet` can be forward declared.
-  std::unique_ptr<AnnotatedSourceSnippet> currentSnippet;
   // Educational notes which are buffered until the consumer is finished
   // constructing a snippet.
   SmallVector<std::string, 1> BufferedEducationalNotes;
   bool SuppressOutput = false;
+
+  /// swift-syntax rendering
+
+  /// A queued up source file known to the queued diagnostics.
+  using QueuedBuffer = void *;
+
+  /// The queued diagnostics structure.
+  void *queuedDiagnostics = nullptr;
+  llvm::DenseMap<unsigned, QueuedBuffer> queuedBuffers;
+
+  /// Source file syntax nodes cached by { source manager, buffer ID }.
+  llvm::DenseMap<std::pair<SourceManager *, unsigned>, void *> sourceFileSyntax;
 
 public:
   PrintingDiagnosticConsumer(llvm::raw_ostream &stream = llvm::errs());
@@ -71,6 +80,10 @@ public:
     FormattingStyle = style;
   }
 
+  void setEmitMacroExpansionFiles(bool ShouldEmit) {
+    EmitMacroExpansionFiles = ShouldEmit;
+  }
+
   bool didErrorOccur() {
     return DidErrorOccur;
   }
@@ -80,6 +93,11 @@ public:
   }
 
 private:
+  /// Retrieve the SourceFileSyntax for the given buffer.
+  void *getSourceFileSyntax(SourceManager &SM, unsigned bufferID,
+                            StringRef displayName);
+
+  void queueBuffer(SourceManager &sourceMgr, unsigned bufferID);
   void printDiagnostic(SourceManager &SM, const DiagnosticInfo &Info);
 };
   

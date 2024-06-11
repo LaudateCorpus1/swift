@@ -20,6 +20,7 @@
 #include "swift/AST/Stmt.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/SourceFile.h"
+#include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeRefinementContext.h"
 #include "swift/Basic/SourceManager.h"
 
@@ -41,15 +42,44 @@ TypeRefinementContext::TypeRefinementContext(ASTContext &Ctx, IntroNode Node,
 }
 
 TypeRefinementContext *
-TypeRefinementContext::createRoot(SourceFile *SF,
-                                  const AvailabilityContext &Info) {
+TypeRefinementContext::createForSourceFile(SourceFile *SF,
+                                           const AvailabilityContext &Info) {
   assert(SF);
 
   ASTContext &Ctx = SF->getASTContext();
+
+  SourceRange range;
+  TypeRefinementContext *parentContext = nullptr;
+  AvailabilityContext availabilityContext = Info;
+  switch (SF->Kind) {
+  case SourceFileKind::MacroExpansion:
+  case SourceFileKind::DefaultArgument: {
+    // Look up the parent context in the enclosing file that this file's
+    // root context should be nested under.
+    if (auto parentTRC =
+            SF->getEnclosingSourceFile()->getTypeRefinementContext()) {
+      auto charRange = Ctx.SourceMgr.getRangeForBuffer(*SF->getBufferID());
+      range = SourceRange(charRange.getStart(), charRange.getEnd());
+      auto originalNode = SF->getNodeInEnclosingSourceFile();
+      parentContext =
+          parentTRC->findMostRefinedSubContext(originalNode.getStartLoc(), Ctx);
+      if (parentContext)
+        availabilityContext = parentContext->getAvailabilityInfo();
+    }
+    break;
+  }
+  case SourceFileKind::Library:
+  case SourceFileKind::Main:
+  case SourceFileKind::Interface:
+    break;
+  case SourceFileKind::SIL:
+    llvm_unreachable("unexpected SourceFileKind");
+  }
+
   return new (Ctx)
-      TypeRefinementContext(Ctx, SF,
-                            /*Parent=*/nullptr, SourceRange(),
-                            Info, AvailabilityContext::alwaysAvailable());
+      TypeRefinementContext(Ctx, SF, parentContext, range,
+                            availabilityContext,
+                            AvailabilityContext::alwaysAvailable());
 }
 
 TypeRefinementContext *
@@ -147,18 +177,43 @@ TypeRefinementContext::createForWhileStmtBody(ASTContext &Ctx, WhileStmt *S,
       Ctx, S, Parent, S->getBody()->getSourceRange(), Info, /* ExplicitInfo */Info);
 }
 
+/// Determine whether the child location is somewhere within the parent
+/// range.
+static bool rangeContainsTokenLocWithGeneratedSource(
+    SourceManager &sourceMgr, SourceRange parentRange, SourceLoc childLoc) {
+  auto parentBuffer = sourceMgr.findBufferContainingLoc(parentRange.Start);
+  auto childBuffer = sourceMgr.findBufferContainingLoc(childLoc);
+  while (parentBuffer != childBuffer) {
+    auto info = sourceMgr.getGeneratedSourceInfo(childBuffer);
+    if (!info)
+      return false;
+
+    childLoc = info->originalSourceRange.getStart();
+    if (childLoc.isInvalid())
+      return false;
+
+    childBuffer = sourceMgr.findBufferContainingLoc(childLoc);
+  }
+
+  return sourceMgr.rangeContainsTokenLoc(parentRange, childLoc);
+}
+
 TypeRefinementContext *
 TypeRefinementContext::findMostRefinedSubContext(SourceLoc Loc,
-                                                 SourceManager &SM) {
+                                                 ASTContext &Ctx) {
   assert(Loc.isValid());
-  
-  if (SrcRange.isValid() && !SM.rangeContainsTokenLoc(SrcRange, Loc))
+
+  if (SrcRange.isValid() &&
+      !rangeContainsTokenLocWithGeneratedSource(Ctx.SourceMgr, SrcRange, Loc))
     return nullptr;
+
+  auto expandedChildren = evaluateOrDefault(
+      Ctx.evaluator, ExpandChildTypeRefinementContextsRequest{this}, {});
 
   // For the moment, we perform a linear search here, but we can and should
   // do something more efficient.
-  for (TypeRefinementContext *Child : Children) {
-    if (auto *Found = Child->findMostRefinedSubContext(Loc, SM)) {
+  for (TypeRefinementContext *Child : expandedChildren) {
+    if (auto *Found = Child->findMostRefinedSubContext(Loc, Ctx)) {
       return Found;
     }
   }
@@ -317,6 +372,10 @@ void TypeRefinementContext::print(raw_ostream &OS, SourceManager &SrcMgr,
       OS << "extension." << ED->getExtendedType().getString();
     } else if (isa<TopLevelCodeDecl>(D)) {
       OS << "<top-level-code>";
+    } else if (auto PBD = dyn_cast<PatternBindingDecl>(D)) {
+      if (auto VD = PBD->getAnchoringVarDecl(0)) {
+        OS << VD->getName();
+      }
     }
   }
 
@@ -373,4 +432,24 @@ StringRef TypeRefinementContext::getReasonName(Reason R) {
   }
 
   llvm_unreachable("Unhandled Reason in switch.");
+}
+
+void swift::simple_display(
+    llvm::raw_ostream &out, const TypeRefinementContext *trc) {
+  out << "TRC @" << trc;
+}
+
+std::optional<std::vector<TypeRefinementContext *>>
+ExpandChildTypeRefinementContextsRequest::getCachedResult() const {
+  auto *TRC = std::get<0>(getStorage());
+  if (TRC->getNeedsExpansion())
+    return std::nullopt;
+  return TRC->Children;
+}
+
+void ExpandChildTypeRefinementContextsRequest::cacheResult(
+    std::vector<TypeRefinementContext *> children) const {
+  auto *TRC = std::get<0>(getStorage());
+  TRC->Children = children;
+  TRC->setNeedsExpansion(false);
 }

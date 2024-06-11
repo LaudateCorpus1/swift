@@ -73,8 +73,8 @@ public:
   virtual size_t getCount() const { return 0; }
 
   virtual sourcekitd_uid_t getUID() const { return nullptr; }
-  virtual Optional<int64_t> getInt64() const { return None; }
-  virtual Optional<StringRef> getString() const { return None; }
+  virtual std::optional<int64_t> getInt64() const { return std::nullopt; }
+  virtual std::optional<StringRef> getString() const { return std::nullopt; }
   virtual const char *getCString() const { return nullptr; }
   virtual bool getBool() const { return false; }
   virtual const void *getDataPtr() const { return nullptr; }
@@ -165,8 +165,8 @@ public:
     return SOURCEKITD_VARIANT_TYPE_STRING;
   }
 
-  Optional<StringRef> getString() const override {
-    return Optional<StringRef>(Storage);
+  std::optional<StringRef> getString() const override {
+    return std::optional<StringRef>(Storage);
   }
 
   const char *getCString() const override {
@@ -188,9 +188,7 @@ public:
     return SOURCEKITD_VARIANT_TYPE_INT64;
   }
 
-  Optional<int64_t> getInt64() const override {
-    return Storage;
-  }
+  std::optional<int64_t> getInt64() const override { return Storage; }
 
   static bool classof(const SKDObject *O) {
     return O->getKind() == ObjectKind::Int64;
@@ -352,8 +350,8 @@ public:
       return static_cast<ImplClass*>(this)->visitString(CString);
     }
     auto OptInt = Object->getInt64();
-    if (OptInt.hasValue()) {
-      return static_cast<ImplClass*>(this)->visitInt64(OptInt.getValue());
+    if (OptInt.has_value()) {
+      return static_cast<ImplClass*>(this)->visitInt64(OptInt.value());
     }
     llvm_unreachable("unknown sourcekitd_object_t");
   }
@@ -706,29 +704,31 @@ ResponseBuilder::Dictionary ResponseBuilder::Array::appendDictionary() {
 // Internal RequestDict Implementation
 //===----------------------------------------------------------------------===//
 
-sourcekitd_uid_t RequestDict::getUID(UIdent Key) {
+sourcekitd_uid_t RequestDict::getUID(UIdent Key) const {
   auto Object = static_cast<SKDObject *>(Dict)->get(SKDUIDFromUIdent(Key));
   return Object ? Object->getUID() : nullptr;
 }
 
-Optional<StringRef> RequestDict::getString(UIdent Key) {
+std::optional<StringRef> RequestDict::getString(UIdent Key) const {
   if (auto Object = static_cast<SKDObject *>(Dict)->get(SKDUIDFromUIdent(Key))) {
     return Object->getString();
   }
-  return None;
+  return std::nullopt;
 }
 
-Optional<RequestDict> RequestDict::getDictionary(SourceKit::UIdent Key) {
+std::optional<RequestDict>
+RequestDict::getDictionary(SourceKit::UIdent Key) const {
   SKDDictionary *DictObject = nullptr;
   if (auto Object = static_cast<SKDObject *>(Dict)->get(SKDUIDFromUIdent(Key))) {
     DictObject = dyn_cast<SKDDictionary>(Object);
   }
-  return DictObject ? Optional<RequestDict>(RequestDict(DictObject)) : None;
+  return DictObject ? std::optional<RequestDict>(RequestDict(DictObject))
+                    : std::nullopt;
 }
 
 bool RequestDict::getStringArray(SourceKit::UIdent Key,
                                  llvm::SmallVectorImpl<const char *> &Arr,
-                                 bool isOptional) {
+                                 bool isOptional) const {
   auto Object = static_cast<SKDObject *>(Dict)->get(SKDUIDFromUIdent(Key));
   if (!Object)
     return !isOptional;
@@ -748,7 +748,7 @@ bool RequestDict::getStringArray(SourceKit::UIdent Key,
 
 bool RequestDict::getUIDArray(SourceKit::UIdent Key,
                               llvm::SmallVectorImpl<sourcekitd_uid_t> &Arr,
-                              bool isOptional) {
+                              bool isOptional) const {
   auto Object = static_cast<SKDObject *>(Dict)->get(SKDUIDFromUIdent(Key));
   if (!Object)
     return !isOptional;
@@ -767,7 +767,8 @@ bool RequestDict::getUIDArray(SourceKit::UIdent Key,
 }
 
 bool RequestDict::dictionaryArrayApply(
-    SourceKit::UIdent Key, llvm::function_ref<bool(RequestDict)> Applier) {
+    SourceKit::UIdent Key,
+    llvm::function_ref<bool(RequestDict)> Applier) const {
   auto Object = static_cast<SKDObject *>(Dict)->get(SKDUIDFromUIdent(Key));
   if (!Object)
     return true;
@@ -784,19 +785,20 @@ bool RequestDict::dictionaryArrayApply(
 }
 
 bool RequestDict::getInt64(SourceKit::UIdent Key, int64_t &Val,
-                           bool isOptional) {
+                           bool isOptional) const {
   auto Object = static_cast<SKDObject *>(Dict)->get(SKDUIDFromUIdent(Key));
   if (!Object)
     return !isOptional;
-  Val = Object->getInt64().getValueOr(0);
+  Val = Object->getInt64().value_or(0);
   return false;
 }
 
-Optional<int64_t> RequestDict::getOptionalInt64(SourceKit::UIdent Key) {
+std::optional<int64_t>
+RequestDict::getOptionalInt64(SourceKit::UIdent Key) const {
   auto Object = static_cast<SKDObject *>(Dict)->get(SKDUIDFromUIdent(Key));
   if (!Object)
-    return None;
-  return Object->getInt64().getValueOr(0);
+    return std::nullopt;
+  return Object->getInt64().value_or(0);
 }
 
 sourcekitd_response_t
@@ -848,7 +850,7 @@ static size_t SKDVar_array_get_count(sourcekitd_variant_t array) {
 }
 
 static int64_t SKDVar_array_get_int64(sourcekitd_variant_t array, size_t index) {
-  return SKD_OBJ(array)->get(index)->getInt64().getValueOr(0);
+  return SKD_OBJ(array)->get(index)->getInt64().value_or(0);
 }
 
 static const char *
@@ -890,7 +892,7 @@ SKDVar_dictionary_get_bool(sourcekitd_variant_t dict, sourcekitd_uid_t key) {
 static int64_t
 SKDVar_dictionary_get_int64(sourcekitd_variant_t dict, sourcekitd_uid_t key) {
   if (auto Object = SKD_OBJ(dict)->get(key)) {
-    return Object->getInt64().getValueOr(0);
+    return Object->getInt64().value_or(0);
   }
   return 0;
 }
@@ -918,7 +920,7 @@ SKDVar_dictionary_get_uid(sourcekitd_variant_t dict, sourcekitd_uid_t key) {
 
 static size_t SKDVar_string_get_length(sourcekitd_variant_t obj) {
   auto String = SKD_OBJ(obj)->getString();
-  return String.hasValue() ? String->size() : 0;
+  return String.has_value() ? String->size() : 0;
 }
 
 static const char *SKDVar_string_get_ptr(sourcekitd_variant_t obj) {
@@ -926,7 +928,7 @@ static const char *SKDVar_string_get_ptr(sourcekitd_variant_t obj) {
 }
 
 static int64_t SKDVar_int64_get_value(sourcekitd_variant_t obj) {
-  return SKD_OBJ(obj)->getInt64().getValueOr(0);
+  return SKD_OBJ(obj)->getInt64().value_or(0);
 }
 
 static sourcekitd_uid_t SKDVar_uid_get_value(sourcekitd_variant_t obj) {

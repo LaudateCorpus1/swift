@@ -61,6 +61,9 @@ internal class __SwiftNativeNSArrayWithContiguousStorage
   }
 }
 
+@available(*, unavailable)
+extension __SwiftNativeNSArrayWithContiguousStorage: Sendable {}
+
 private let NSNotFound: Int = .max
 
 // Implement the APIs required by NSArray 
@@ -322,6 +325,9 @@ extension __SwiftNativeNSArrayWithContiguousStorage {
   }
 }
 
+@available(*, unavailable)
+extension _SwiftNSMutableArray: Sendable {}
+
 /// An `NSArray` whose contiguous storage is created and filled, upon
 /// first access, by bridging the elements of a Swift `Array`.
 ///
@@ -329,7 +335,7 @@ extension __SwiftNativeNSArrayWithContiguousStorage {
 /// buffers used for Array storage.
 @_fixed_layout // FIXME(sil-serialize-all)
 @usableFromInline
-@objc internal final class __SwiftDeferredNSArray
+@objc internal class __SwiftDeferredNSArray
   : __SwiftNativeNSArrayWithContiguousStorage {
 
   // This stored property should be stored at offset zero.  We perform atomic
@@ -337,21 +343,21 @@ extension __SwiftNativeNSArrayWithContiguousStorage {
   //
   // Do not access this property directly.
   @nonobjc
-  internal var _heapBufferBridged_DoNotUse: AnyObject?
+  internal final var _heapBufferBridged_DoNotUse: AnyObject?
 
   // When this class is allocated inline, this property can become a
   // computed one.
   @usableFromInline
   @nonobjc
-  internal let _nativeStorage: __ContiguousArrayStorageBase
+  internal final let _nativeStorage: __ContiguousArrayStorageBase
 
   @nonobjc
-  internal var _heapBufferBridgedPtr: UnsafeMutablePointer<AnyObject?> {
+  internal final var _heapBufferBridgedPtr: UnsafeMutablePointer<AnyObject?> {
     return _getUnsafePointerToStoredProperties(self).assumingMemoryBound(
       to: Optional<AnyObject>.self)
   }
 
-  internal var _heapBufferBridged: __BridgingBufferStorage? {
+  internal final var _heapBufferBridged: __BridgingBufferStorage? {
     if let ref =
       _stdlib_atomicLoadARCRef(object: _heapBufferBridgedPtr) {
       return unsafeBitCast(ref, to: __BridgingBufferStorage.self)
@@ -365,11 +371,13 @@ extension __SwiftNativeNSArrayWithContiguousStorage {
     self._nativeStorage = _nativeStorage
   }
 
-  internal func _destroyBridgedStorage(_ hb: __BridgingBufferStorage?) {
+  internal final func _destroyBridgedStorage(_ hb: __BridgingBufferStorage?) {
     if let bridgedStorage = hb {
-      let buffer = _BridgingBuffer(bridgedStorage)
-      let count = buffer.count
-      buffer.baseAddress.deinitialize(count: count)
+      withExtendedLifetime(bridgedStorage) {
+        let buffer = _BridgingBuffer(bridgedStorage)
+        let count = buffer.count
+        buffer.baseAddress.deinitialize(count: count)
+      }
     }
   }
 
@@ -422,10 +430,74 @@ extension __SwiftNativeNSArrayWithContiguousStorage {
   /// This override allows the count to be read without triggering
   /// bridging of array elements.
   @objc
-  internal override var count: Int {
+  internal override final var count: Int {
     return _nativeStorage.countAndCapacity.count
   }
 }
+
+@available(*, unavailable)
+extension __SwiftDeferredNSArray: Sendable {}
+
+/// A `__SwiftDeferredNSArray` which is used for static read-only Swift Arrays.
+///
+/// In contrast to its base class, `__SwiftDeferredStaticNSArray` is generic
+/// over the element type. This is needed because the storage class of a static
+/// read-only array (`__StaticArrayStorage`) does _not_ provide the element
+/// type.
+internal final class __SwiftDeferredStaticNSArray<Element>
+  : __SwiftDeferredNSArray {
+
+  internal override func withUnsafeBufferOfObjects<R>(
+    _ body: (UnsafeBufferPointer<AnyObject>) throws -> R
+  ) rethrows -> R {
+    while true {
+      var buffer: UnsafeBufferPointer<AnyObject>
+
+      // If we've already got a buffer of bridged objects, just use it
+      if let bridgedStorage = _heapBufferBridged {
+        let bridgingBuffer = _BridgingBuffer(bridgedStorage)
+        buffer = UnsafeBufferPointer(
+            start: bridgingBuffer.baseAddress, count: bridgingBuffer.count)
+      }
+      else {
+        // Static read-only arrays can only contain non-verbatim bridged
+        // element types.
+
+        // Create buffer of bridged objects.
+        let objects = getNonVerbatimBridgingBuffer()
+
+        // Atomically store a reference to that buffer in self.
+        if !_stdlib_atomicInitializeARCRef(
+          object: _heapBufferBridgedPtr, desired: objects.storage!) {
+
+          // Another thread won the race.  Throw out our buffer.
+          _destroyBridgedStorage(
+            unsafeDowncast(objects.storage!, to: __BridgingBufferStorage.self))
+        }
+        continue // Try again
+      }
+
+      defer { _fixLifetime(self) }
+      return try body(buffer)
+    }
+  }
+
+  internal func getNonVerbatimBridgingBuffer() -> _BridgingBuffer {
+    _internalInvariant(
+      !_isBridgedVerbatimToObjectiveC(Element.self),
+      "Verbatim bridging should be handled separately")
+    let count = _nativeStorage.countAndCapacity.count
+    let result = _BridgingBuffer(count)
+    let resultPtr = result.baseAddress
+    let p = UnsafeMutablePointer<Element>(Builtin.projectTailElems(_nativeStorage, Element.self))
+    for i in 0..<count {
+      (resultPtr + i).initialize(to: _bridgeAnythingToObjectiveC(p[i]))
+    }
+    _fixLifetime(self)
+    return result
+  }
+}
+
 #else
 // Empty shim version for non-objc platforms.
 @usableFromInline
@@ -437,6 +509,10 @@ internal class __SwiftNativeNSArrayWithContiguousStorage {
   @inlinable
   deinit {}
 }
+
+@available(*, unavailable)
+extension __SwiftNativeNSArrayWithContiguousStorage: Sendable {}
+
 #endif
 
 /// Base class of the heap buffer backing arrays.  
@@ -505,6 +581,7 @@ internal class __ContiguousArrayStorageBase
 
   /// A type that every element in the array is.
   @inlinable
+  @_unavailableInEmbedded
   internal var staticElementType: Any.Type {
     _internalInvariantFailure(
       "Concrete subclasses must implement staticElementType")
@@ -516,3 +593,6 @@ internal class __ContiguousArrayStorageBase
       self !== _emptyArrayStorage, "Deallocating empty array storage?!")
   }
 }
+
+@available(*, unavailable)
+extension __ContiguousArrayStorageBase: Sendable {}

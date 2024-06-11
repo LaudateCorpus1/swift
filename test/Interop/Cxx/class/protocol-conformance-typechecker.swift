@@ -1,6 +1,9 @@
 // Tests that a C++ class can conform to a Swift protocol.
 
 // RUN: %target-typecheck-verify-swift -I %S/Inputs -enable-experimental-cxx-interop
+// RUN: %target-typecheck-verify-swift -I %S/Inputs -D VIRTUAL_METHODS -cxx-interoperability-mode=swift-5.9
+// RUN: %target-typecheck-verify-swift -I %S/Inputs -D VIRTUAL_METHODS -cxx-interoperability-mode=swift-6
+// RUN: %target-typecheck-verify-swift -I %S/Inputs -D VIRTUAL_METHODS -cxx-interoperability-mode=upcoming-swift
 
 import ProtocolConformance
 
@@ -9,6 +12,10 @@ protocol HasReturn42 {
 }
 
 extension ConformsToProtocol : HasReturn42 {}
+
+#if VIRTUAL_METHODS
+extension HasVirtualMethod : HasReturn42 {}
+#endif
 
 extension DoesNotConformToProtocol : HasReturn42 {} // expected-error {{'DoesNotConformToProtocol' does not conform to protocol}}
 
@@ -28,10 +35,17 @@ protocol HasReturnNonNull {
 extension ReturnsNonNullValue: HasReturnNonNull {}
 
 
-protocol Invertable {
+protocol Invertible {
   static prefix func !(obj: Self) -> Self
 }
 
-extension HasOperatorExclaim: Invertable {}
+extension HasOperatorExclaim: Invertible {}
 
-extension HasOperatorEqualEqual: Equatable {}
+extension HasOperatorEqualEqual: @retroactive Equatable {}
+
+
+protocol HasOperatorPlusEqualProtocol {
+  static func +=(lhs: inout Self, x: Int32)
+}
+
+extension HasOperatorPlusEqualInt : HasOperatorPlusEqualProtocol {}

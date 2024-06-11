@@ -13,13 +13,17 @@
 #ifndef SWIFT_NAME_TRANSLATION_H
 #define SWIFT_NAME_TRANSLATION_H
 
-#include "swift/AST/Identifier.h"
 #include "swift/AST/AttrKind.h"
+#include "swift/AST/DiagnosticEngine.h"
+#include "swift/AST/Identifier.h"
 
 namespace swift {
-  class ValueDecl;
-  class EnumDecl;
-  class EnumElementDecl;
+
+class EnumDecl;
+class EnumElementDecl;
+struct InverseRequirement;
+class GenericSignature;
+class ValueDecl;
 
 namespace objc_translation {
   enum CustomNamesOnly_t : bool {
@@ -66,14 +70,28 @@ getNameForCxx(const ValueDecl *VD,
 enum RepresentationKind { Representable, Unsupported };
 
 enum RepresentationError {
+  UnrepresentableObjC,
   UnrepresentableAsync,
   UnrepresentableIsolatedInActor,
   UnrepresentableRequiresClientEmission,
+  UnrepresentableGeneric,
+  UnrepresentableGenericRequirements,
+  UnrepresentableThrows,
+  UnrepresentableIndirectEnum,
+  UnrepresentableEnumCaseType,
+  UnrepresentableEnumCaseTuple,
+  UnrepresentableProtocol,
+  UnrepresentableMoveOnly,
+  UnrepresentableNested,
+  UnrepresentableMacro,
 };
+
+/// Constructs a diagnostic that describes the given C++ representation error.
+Diagnostic diagnoseRepresenationError(RepresentationError error, ValueDecl *vd);
 
 struct DeclRepresentation {
   RepresentationKind kind;
-  llvm::Optional<RepresentationError> error;
+  std::optional<RepresentationError> error;
 
   /// Returns true if the given Swift node is unsupported in Clang in any
   /// language mode.
@@ -92,6 +110,9 @@ inline bool isExposableToCxx(const ValueDecl *VD) {
 /// own accord (i.e. without considering its context)
 bool isVisibleToCxx(const ValueDecl *VD, AccessLevel minRequiredAccess,
                     bool checkParent = true);
+
+/// Determine whether the given generic signature can be exposed to C++.
+bool isExposableToCxx(GenericSignature genericSig);
 
 } // end namespace cxx_translation
 

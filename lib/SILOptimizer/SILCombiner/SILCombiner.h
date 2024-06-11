@@ -23,21 +23,22 @@
 
 #include "swift/Basic/Defer.h"
 #include "swift/SIL/BasicBlockUtils.h"
+#include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILInstructionWorklist.h"
 #include "swift/SIL/SILValue.h"
 #include "swift/SIL/SILVisitor.h"
-#include "swift/SIL/InstructionUtils.h"
+#include "swift/SILOptimizer/Analysis/BasicCalleeAnalysis.h"
 #include "swift/SILOptimizer/Analysis/ClassHierarchyAnalysis.h"
 #include "swift/SILOptimizer/Analysis/NonLocalAccessBlockAnalysis.h"
 #include "swift/SILOptimizer/Analysis/ProtocolConformanceAnalysis.h"
 #include "swift/SILOptimizer/OptimizerBridging.h"
+#include "swift/SILOptimizer/PassManager/PassManager.h"
 #include "swift/SILOptimizer/Utils/CastOptimizer.h"
 #include "swift/SILOptimizer/Utils/Existential.h"
 #include "swift/SILOptimizer/Utils/InstOptUtils.h"
 #include "swift/SILOptimizer/Utils/OwnershipOptUtils.h"
-#include "swift/SILOptimizer/PassManager/PassManager.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
@@ -55,6 +56,8 @@ class SILCombiner :
 
   AliasAnalysis *AA;
 
+  BasicCalleeAnalysis *CA;
+
   DominanceAnalysis *DA;
 
   /// Determine the set of types a protocol conforms to in whole-module
@@ -69,9 +72,11 @@ class SILCombiner :
   /// lifetimes in OSSA.
   NonLocalAccessBlockAnalysis *NLABA;
 
+public:
   /// Worklist containing all of the instructions primed for simplification.
   SmallSILInstructionWorklist<256> Worklist;
 
+private:
   /// Utility for dead code removal.
   InstructionDeleter deleter;
 
@@ -99,10 +104,12 @@ class SILCombiner :
   // The tracking list is used by `Builder` for newly added
   // instructions, which we will periodically move to our worklist.
   llvm::SmallVector<SILInstruction *, 64> TrackingList;
-  
+
+public:
   /// Builder used to insert instructions.
   SILBuilder Builder;
 
+private:
   SILOptFunctionBuilder FuncBuilder;
 
   /// Cast optimizer
@@ -231,8 +238,6 @@ public:
   SILInstruction *visitSILInstruction(SILInstruction *I) { return nullptr; }
 
   /// Instruction visitors.
-  SILInstruction *visitReleaseValueInst(ReleaseValueInst *DI);
-  SILInstruction *visitRetainValueInst(RetainValueInst *CI);
   SILInstruction *visitPartialApplyInst(PartialApplyInst *AI);
   SILInstruction *visitApplyInst(ApplyInst *AI);
   SILInstruction *visitBeginApplyInst(BeginApplyInst *BAI);
@@ -240,20 +245,16 @@ public:
   SILInstruction *optimizeStringObject(BuiltinInst *BI);
   SILInstruction *visitBuiltinInst(BuiltinInst *BI);
   SILInstruction *visitCondFailInst(CondFailInst *CFI);
-  SILInstruction *visitCopyValueInst(CopyValueInst *cvi);
-  SILInstruction *visitDestroyValueInst(DestroyValueInst *dvi);
   SILInstruction *visitRefToRawPointerInst(RefToRawPointerInst *RRPI);
   SILInstruction *visitUpcastInst(UpcastInst *UCI);
 
   // NOTE: The load optimized in this method is a load [trivial].
   SILInstruction *optimizeLoadFromStringLiteral(LoadInst *li);
 
-  SILInstruction *visitLoadInst(LoadInst *LI);
   SILInstruction *visitLoadBorrowInst(LoadBorrowInst *LI);
   SILInstruction *visitIndexAddrInst(IndexAddrInst *IA);
   bool optimizeStackAllocatedEnum(AllocStackInst *AS);
   SILInstruction *visitAllocStackInst(AllocStackInst *AS);
-  SILInstruction *visitAllocRefInst(AllocRefInst *AR);
   SILInstruction *visitSwitchEnumAddrInst(SwitchEnumAddrInst *SEAI);
   SILInstruction *visitInjectEnumAddrInst(InjectEnumAddrInst *IEAI);
   SILInstruction *visitPointerToAddressInst(PointerToAddressInst *PTAI);
@@ -297,11 +298,16 @@ public:
   SILInstruction *
   visitDifferentiableFunctionExtractInst(DifferentiableFunctionExtractInst *DFEI);
   
+  SILInstruction *visitPackLengthInst(PackLengthInst *PLI);
+  SILInstruction *visitPackElementGetInst(PackElementGetInst *PEGI);
+  SILInstruction *visitTuplePackElementAddrInst(TuplePackElementAddrInst *TPEAI);
+  SILInstruction *visitCopyAddrInst(CopyAddrInst *CAI);
+
   SILInstruction *legacyVisitGlobalValueInst(GlobalValueInst *globalValue);
 
 #define PASS(ID, TAG, DESCRIPTION)
 #define SWIFT_FUNCTION_PASS(ID, TAG, DESCRIPTION)
-#define SWIFT_INSTRUCTION_PASS(INST, TAG) \
+#define SWIFT_SILCOMBINE_PASS(INST) \
   SILInstruction *visit##INST(INST *);
 #include "swift/SILOptimizer/PassManager/Passes.def"
 
@@ -328,13 +334,7 @@ public:
   SILInstruction *optimizeApplyOfConvertFunctionInst(FullApplySite AI,
                                                      ConvertFunctionInst *CFI);
 
-  bool tryOptimizeKeypath(ApplyInst *AI);
   bool tryOptimizeInoutKeypath(BeginApplyInst *AI);
-  bool tryOptimizeKeypathApplication(ApplyInst *AI, SILFunction *callee);
-  bool tryOptimizeKeypathOffsetOf(ApplyInst *AI, FuncDecl *calleeFn,
-                                  KeyPathInst *kp);
-  bool tryOptimizeKeypathKVCString(ApplyInst *AI, FuncDecl *calleeFn,
-                                  KeyPathInst *kp);
 
   /// Sinks owned forwarding instructions to their uses if they do not have
   /// non-debug non-consuming uses. Deletes any debug_values and destroy_values
@@ -373,11 +373,11 @@ public:
 
 private:
   // Build concrete existential information using findInitExistential.
-  Optional<ConcreteOpenedExistentialInfo>
+  std::optional<ConcreteOpenedExistentialInfo>
   buildConcreteOpenedExistentialInfo(Operand &ArgOperand);
 
   // Build concrete existential information using SoleConformingType.
-  Optional<ConcreteOpenedExistentialInfo>
+  std::optional<ConcreteOpenedExistentialInfo>
   buildConcreteOpenedExistentialInfoFromSoleConformingType(Operand &ArgOperand);
 
   // Common utility function to build concrete existential information for all

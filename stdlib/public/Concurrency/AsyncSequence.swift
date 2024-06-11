@@ -27,10 +27,10 @@ import Swift
 /// over `Counter`, a custom `AsyncSequence` that produces `Int` values from
 /// `1` up to a `howHigh` value:
 ///
-///     for await i in Counter(howHigh: 10) {
-///         print(i, terminator: " ")
+///     for await number in Counter(howHigh: 10) {
+///         print(number, terminator: " ")
 ///     }
-///     // Prints "1 2 3 4 5 6 7 8 9 10"
+///     // Prints "1 2 3 4 5 6 7 8 9 10 "
 ///
 /// An `AsyncSequence` doesn't generate or contain the values; it just defines
 /// how you access them. Along with defining the type of values as an associated
@@ -69,16 +69,21 @@ import Swift
 ///     for await s in stream {
 ///         print(s, terminator: " ")
 ///     }
-///     // Prints "Odd Even Odd Even Odd Even Odd Even Odd Even"
+///     // Prints "Odd Even Odd Even Odd Even Odd Even Odd Even "
 ///
 @available(SwiftStdlib 5.1, *)
-@rethrows
-public protocol AsyncSequence {
+public protocol AsyncSequence<Element, Failure> {
   /// The type of asynchronous iterator that produces elements of this
   /// asynchronous sequence.
   associatedtype AsyncIterator: AsyncIteratorProtocol where AsyncIterator.Element == Element
   /// The type of element produced by this asynchronous sequence.
   associatedtype Element
+
+  /// The type of errors produced when iteration over the sequence fails.
+  @available(SwiftStdlib 6.0, *)
+  associatedtype Failure: Error = AsyncIterator.Failure
+      where AsyncIterator.Failure == Failure
+
   /// Creates the asynchronous iterator that produces elements of this
   /// asynchronous sequence.
   ///

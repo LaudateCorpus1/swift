@@ -547,7 +547,12 @@ class d0170_TestAvailability {
 // PASS_COMMON-LABEL: {{^}}@objc class d0180_TestIBAttrs {{{$}}
 
   @IBAction func anAction(_: AnyObject) {}
-// PASS_COMMON-NEXT: {{^}}  @objc @IBAction @MainActor func anAction(_: AnyObject){{$}}
+// Tolerate different attribute orders to support both reading from source
+// and deserializing from swiftmodule.
+// PASS_COMMON-NEXT: {{^}}  @objc
+// PASS_COMMON-DAG: @IBAction
+// PASS_COMMON-DAG: @MainActor
+// PASS_COMMON: func anAction(_: AnyObject){{$}}
 
   @IBSegueAction func aSegueAction(_ coder: AnyObject, sender: AnyObject, identifier: AnyObject?) -> Any? { fatalError() }
 // PASS_COMMON-NEXT: {{^}}  @objc @IBSegueAction func aSegueAction(_ coder: AnyObject, sender: AnyObject, identifier: AnyObject?) -> Any?{{$}}
@@ -1359,7 +1364,7 @@ public func ParamAttrs5(a : (@escaping () -> ()) -> ()) {
 // PASS_PRINT_AST: public typealias ParamAttrs6 = (@autoclosure () -> ()) -> ()
 public typealias ParamAttrs6 = (@autoclosure () -> ()) -> ()
 
-// The following type only has the internal paramter name inferred from the
+// The following type only has the internal parameter name inferred from the
 // closure on the right-hand side of `=`. Thus, it is only part of the `Type`
 // and not part of the `TypeRepr`.
 // PASS_PRINT_AST_TYPE: public var ParamAttrs7: (_ f: @escaping () -> ()) -> ()

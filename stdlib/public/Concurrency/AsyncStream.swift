@@ -192,7 +192,7 @@ public struct AsyncStream<Element> {
     /// This can be called more than once and returns to the caller immediately
     /// without blocking for any awaiting consumption from the iteration.
     @discardableResult
-    public func yield(_ value: __owned Element) -> YieldResult {
+    public func yield(_ value: sending Element) -> YieldResult {
       storage.yield(value)
     }
 
@@ -200,8 +200,8 @@ public struct AsyncStream<Element> {
     /// nil, which signifies the end of the iteration.
     ///
     /// Calling this function more than once has no effect. After calling
-    /// finish, the stream enters a terminal state and doesn't produces any additional
-    /// elements.
+    /// finish, the stream enters a terminal state and doesn't produce any
+    /// additional elements.
     public func finish() {
       storage.finish()
     }
@@ -330,8 +330,10 @@ public struct AsyncStream<Element> {
   ///     }
   ///
   ///
+  @_silgen_name("$sScS9unfolding8onCancelScSyxGxSgyYac_yyYbcSgtcfC")
+  @preconcurrency // Original API had `@Sendable` only on `onCancel`
   public init(
-    unfolding produce: @escaping () async -> Element?, 
+    unfolding produce: @escaping @Sendable () async -> Element?,
     onCancel: (@Sendable () -> Void)? = nil
   ) {
     let storage: _AsyncStreamCriticalStorage<Optional<() async -> Element?>>
@@ -377,6 +379,24 @@ extension AsyncStream: AsyncSequence {
     public mutating func next() async -> Element? {
       await context.produce()
     }
+
+    /// The next value from the asynchronous stream.
+    ///
+    /// When `next()` returns `nil`, this signifies the end of the
+    /// `AsyncStream`.
+    ///
+    /// It is a programmer error to invoke `next()` from a concurrent
+    /// context that contends with another such call, which results in a call to
+    /// `fatalError()`.
+    ///
+    /// If you cancel the task this iterator is running in while `next()`
+    /// is awaiting a value, the `AsyncStream` terminates. In this case,
+    /// `next()` might return `nil` immediately, or return `nil` on
+    /// subsequent calls.
+    @available(SwiftStdlib 6.0, *)
+    public mutating func next(isolation actor: isolated (any Actor)?) async -> Element? {
+      await context.produce()
+    }
   }
 
   /// Creates the asynchronous iterator that produces elements of this
@@ -402,11 +422,11 @@ extension AsyncStream.Continuation {
   /// blocking for any awaiting consumption from the iteration.
   @discardableResult
   public func yield(
-    with result: Result<Element, Never>
+    with result: __shared sending Result<Element, Never>
   ) -> YieldResult {
     switch result {
-      case .success(let val):
-        return storage.yield(val)
+    case .success(let val):
+      return storage.yield(val)
     }
   }
 
@@ -425,6 +445,27 @@ extension AsyncStream.Continuation {
   @discardableResult
   public func yield() -> YieldResult where Element == Void {
     return storage.yield(())
+  }
+}
+
+@available(SwiftStdlib 5.1, *)
+extension AsyncStream {
+  /// Initializes a new ``AsyncStream`` and an ``AsyncStream/Continuation``.
+  ///
+  /// - Parameters:
+  ///   - elementType: The element type of the stream.
+  ///   - limit: The buffering policy that the stream should use.
+  /// - Returns: A tuple containing the stream and its continuation. The continuation should be passed to the
+  /// producer while the stream should be passed to the consumer.
+  @available(SwiftStdlib 5.1, *)
+  @backDeployed(before: SwiftStdlib 5.9)
+  public static func makeStream(
+      of elementType: Element.Type = Element.self,
+      bufferingPolicy limit: Continuation.BufferingPolicy = .unbounded
+  ) -> (stream: AsyncStream<Element>, continuation: AsyncStream<Element>.Continuation) {
+    var continuation: AsyncStream<Element>.Continuation!
+    let stream = AsyncStream<Element>(bufferingPolicy: limit) { continuation = $0 }
+    return (stream: stream, continuation: continuation!)
   }
 }
 
@@ -460,7 +501,7 @@ public struct AsyncStream<Element> {
     @discardableResult
     @available(SwiftStdlib 5.1, *)
     @available(*, unavailable, message: "Unavailable in task-to-thread concurrency model")
-    public func yield(_ value: __owned Element) -> YieldResult {
+    public func yield(_ value: sending Element) -> YieldResult {
       fatalError("Unavailable in task-to-thread concurrency model")
     }
     @available(SwiftStdlib 5.1, *)
@@ -509,6 +550,12 @@ extension AsyncStream {
     public mutating func next() async -> Element? {
       fatalError("Unavailable in task-to-thread concurrency model")
     }
+    
+    @available(SwiftStdlib 6.0, *)
+    @available(*, unavailable, message: "Unavailable in task-to-thread concurrency model")
+    public mutating func next(isolation actor: isolated (any Actor)?) async -> Element? {
+      fatalError("Unavailable in task-to-thread concurrency model")
+    }
   }
   @available(SwiftStdlib 5.1, *)
   @available(*, unavailable, message: "Unavailable in task-to-thread concurrency model")
@@ -524,7 +571,7 @@ extension AsyncStream.Continuation {
   @available(SwiftStdlib 5.1, *)
   @available(*, unavailable, message: "Unavailable in task-to-thread concurrency model")
   public func yield(
-    with result: Result<Element, Never>
+    with result: __shared sending Result<Element, Never>
   ) -> YieldResult {
     fatalError("Unavailable in task-to-thread concurrency model")
   }

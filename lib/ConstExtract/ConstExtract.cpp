@@ -12,6 +12,7 @@
 
 #include "swift/ConstExtract/ConstExtract.h"
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/ASTMangler.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticEngine.h"
@@ -47,14 +48,39 @@ public:
       std::vector<NominalTypeDecl *> &ConformanceDecls)
       : Protocols(Protocols), ConformanceTypeDecls(ConformanceDecls) {}
 
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::ArgumentsAndExpansion;
+  }
+
   PreWalkAction walkToDeclPre(Decl *D) override {
-    if (auto *NTD = llvm::dyn_cast<NominalTypeDecl>(D))
-      if (!isa<ProtocolDecl>(NTD))
+    auto *NTD = llvm::dyn_cast<NominalTypeDecl>(D);
+    if (!NTD)
+      if (auto *ETD = dyn_cast<ExtensionDecl>(D))
+        NTD = ETD->getExtendedNominal();
+    if (NTD)
+      if (!isa<ProtocolDecl>(NTD) && CheckedDecls.insert(NTD).second) {
+        if (NTD->getAttrs().hasAttribute<ExtractConstantsFromMembersAttr>()) {
+          ConformanceTypeDecls.push_back(NTD);
+          goto visitAuxiliaryDecls;
+        }
+
         for (auto &Protocol : NTD->getAllProtocols())
-          if (Protocols.count(Protocol->getName().str().str()) != 0)
+          if (Protocol->getAttrs()
+                  .hasAttribute<ExtractConstantsFromMembersAttr>() ||
+              Protocols.count(Protocol->getName().str().str()) != 0) {
             ConformanceTypeDecls.push_back(NTD);
+            goto visitAuxiliaryDecls;
+          }
+      }
+  visitAuxiliaryDecls:
+    // Visit peers expanded from macros
+    D->visitAuxiliaryDecls([&](Decl *decl) { decl->walk(*this); },
+                           /*visitFreestandingExpanded=*/false);
     return Action::Continue();
   }
+
+private:
+  std::unordered_set<NominalTypeDecl *> CheckedDecls;
 };
 
 std::string toFullyQualifiedTypeNameString(const swift::Type &Type) {
@@ -63,9 +89,28 @@ std::string toFullyQualifiedTypeNameString(const swift::Type &Type) {
   swift::PrintOptions Options;
   Options.FullyQualifiedTypes = true;
   Options.PreferTypeRepr = true;
+  Options.AlwaysDesugarArraySliceTypes = true;
+  Options.AlwaysDesugarDictionaryTypes = true;
+  Options.AlwaysDesugarOptionalTypes = true;
+  Options.PrintTypeAliasUnderlyingType = true;
+  Options.OpaqueReturnTypePrinting =
+    PrintOptions::OpaqueReturnTypePrintingMode::WithOpaqueKeyword;
   Type.print(OutputStream, Options);
   OutputStream.flush();
   return TypeNameOutput;
+}
+
+std::string toFullyQualifiedProtocolNameString(const swift::ProtocolDecl &Protocol) {
+  // Protocols cannot be nested in other declarations, so the only fully-qualified
+  // context is the declaring module name.
+  return Protocol.getParentModule()->getNameStr().str() + "." + Protocol.getNameStr().str();
+}
+
+std::string toMangledTypeNameString(const swift::Type &Type) {
+  auto PrintingType = Type;
+  if (Type->hasArchetype())
+    PrintingType = Type->mapTypeOutOfContext();
+  return Mangle::ASTMangler().mangleTypeWithoutPrefix(PrintingType->getCanonicalType());
 }
 
 } // namespace
@@ -120,22 +165,74 @@ parseProtocolListFromFile(StringRef protocolListFilePath,
   return true;
 }
 
+static std::shared_ptr<CompileTimeValue> extractCompileTimeValue(Expr *expr);
+
+static std::vector<FunctionParameter>
+extractFunctionArguments(const ArgumentList *args) {
+  std::vector<FunctionParameter> parameters;
+
+  for (auto arg : *args) {
+    auto argExpr = arg.getExpr();
+    const auto label = arg.getLabel().str().str();
+    const auto type = argExpr->getType();
+    if (auto defaultArgument = dyn_cast<DefaultArgumentExpr>(argExpr)) {
+      auto *decl = defaultArgument->getParamDecl();
+      if (decl->hasDefaultExpr()) {
+        argExpr = decl->getTypeCheckedDefaultExpr();
+      }
+    } else if (auto optionalInject = dyn_cast<InjectIntoOptionalExpr>(argExpr)) {
+      argExpr = optionalInject->getSubExpr();
+    }
+    parameters.push_back({label, type, extractCompileTimeValue(argExpr)});
+  }
+
+  return parameters;
+}
+
+static std::optional<std::string> extractRawLiteral(Expr *expr) {
+  if (expr) {
+    switch (expr->getKind()) {
+    case ExprKind::BooleanLiteral:
+    case ExprKind::FloatLiteral:
+    case ExprKind::IntegerLiteral:
+    case ExprKind::NilLiteral: {
+      std::string literalOutput;
+      llvm::raw_string_ostream OutputStream(literalOutput);
+      expr->printConstExprValue(&OutputStream, nullptr);
+      if (!literalOutput.empty()) {
+        return literalOutput;
+      }
+      break;
+    }
+
+    case ExprKind::StringLiteral: {
+      auto stringLiteralExpression = cast<StringLiteralExpr>(expr);
+      std::string literalOutput;
+      llvm::raw_string_ostream OutputStream(literalOutput);
+      OutputStream << stringLiteralExpression->getValue();
+      return literalOutput;
+    }
+
+    default:
+      break;
+    }
+  }
+  return std::nullopt;
+}
+
 static std::shared_ptr<CompileTimeValue> extractCompileTimeValue(Expr *expr) {
   if (expr) {
     switch (expr->getKind()) {
-    case ExprKind::Dictionary:
-
     case ExprKind::BooleanLiteral:
     case ExprKind::FloatLiteral:
     case ExprKind::IntegerLiteral:
     case ExprKind::NilLiteral:
     case ExprKind::StringLiteral: {
-      std::string literalOutput;
-      llvm::raw_string_ostream OutputStream(literalOutput);
-      expr->printConstExprValue(&OutputStream, nullptr);
-      if (!literalOutput.empty()) {
-        return std::make_shared<RawLiteralValue>(literalOutput);
+      auto rawLiteral = extractRawLiteral(expr);
+      if (rawLiteral.has_value()) {
+        return std::make_shared<RawLiteralValue>(rawLiteral.value());
       }
+
       break;
     }
 
@@ -148,6 +245,18 @@ static std::shared_ptr<CompileTimeValue> extractCompileTimeValue(Expr *expr) {
       return std::make_shared<ArrayValue>(elementValues);
     }
 
+    case ExprKind::Dictionary: {
+      auto dictionaryExpr = cast<DictionaryExpr>(expr);
+      std::vector<std::shared_ptr<TupleValue>> tuples;
+      for (auto elementExpr : dictionaryExpr->getElements()) {
+        auto elementValue = extractCompileTimeValue(elementExpr);
+        if (isa<TupleValue>(elementValue.get())) {
+          tuples.push_back(std::static_pointer_cast<TupleValue>(elementValue));
+        }
+      }
+      return std::make_shared<DictionaryValue>(tuples);
+    }
+
     case ExprKind::Tuple: {
       auto tupleExpr = cast<TupleExpr>(expr);
 
@@ -158,17 +267,17 @@ static std::shared_ptr<CompileTimeValue> extractCompileTimeValue(Expr *expr) {
           auto elementExpr = std::get<0>(pair);
           auto elementName = std::get<1>(pair);
 
-          Optional<std::string> label =
+          std::optional<std::string> label =
               elementName.empty()
-                  ? Optional<std::string>()
-                  : Optional<std::string>(elementName.str().str());
+                  ? std::nullopt
+                  : std::optional<std::string>(elementName.str().str());
 
           elements.push_back({label, elementExpr->getType(),
                               extractCompileTimeValue(elementExpr)});
         }
       } else {
         for (auto elementExpr : tupleExpr->getElements()) {
-          elements.push_back({Optional<std::string>(), elementExpr->getType(),
+          elements.push_back({std::nullopt, elementExpr->getType(),
                               extractCompileTimeValue(elementExpr)});
         }
       }
@@ -178,23 +287,38 @@ static std::shared_ptr<CompileTimeValue> extractCompileTimeValue(Expr *expr) {
     case ExprKind::Call: {
       auto callExpr = cast<CallExpr>(expr);
       if (callExpr->getFn()->getKind() == ExprKind::ConstructorRefCall) {
-        std::vector<FunctionParameter> parameters;
-        const auto args = callExpr->getArgs();
-        for (auto arg : *args) {
-          auto argExpr = arg.getExpr();
-          const auto label = arg.getLabel().str().str();
-          const auto type = argExpr->getType();
-          if (auto defaultArgument = dyn_cast<DefaultArgumentExpr>(argExpr)) {
-            auto *decl = defaultArgument->getParamDecl();
-            if (decl->hasDefaultExpr()) {
-              argExpr = decl->getTypeCheckedDefaultExpr();
-            }
-          }
-          parameters.push_back({label, type, extractCompileTimeValue(argExpr)});
-        }
-        auto name = toFullyQualifiedTypeNameString(callExpr->getType());
-        return std::make_shared<InitCallValue>(name, parameters);
+        std::vector<FunctionParameter> parameters =
+            extractFunctionArguments(callExpr->getArgs());
+        return std::make_shared<InitCallValue>(callExpr->getType(), parameters);
       }
+
+      if (callExpr->getFn()->getKind() == ExprKind::DotSyntaxCall) {
+        auto dotSyntaxCallExpr = cast<DotSyntaxCallExpr>(callExpr->getFn());
+        auto fn = dotSyntaxCallExpr->getFn();
+        if (fn->getKind() == ExprKind::DeclRef) {
+          auto declRefExpr = cast<DeclRefExpr>(fn);
+          auto caseName =
+              declRefExpr->getDecl()->getName().getBaseIdentifier().str().str();
+
+          std::vector<FunctionParameter> parameters =
+              extractFunctionArguments(callExpr->getArgs());
+          return std::make_shared<EnumValue>(caseName, parameters);
+        }
+      }
+
+      break;
+    }
+
+    case ExprKind::DotSyntaxCall: {
+      auto dotSyntaxCallExpr = cast<DotSyntaxCallExpr>(expr);
+      auto fn = dotSyntaxCallExpr->getFn();
+      if (fn->getKind() == ExprKind::DeclRef) {
+        auto declRefExpr = cast<DeclRefExpr>(fn);
+        auto caseName =
+            declRefExpr->getDecl()->getName().getBaseIdentifier().str().str();
+        return std::make_shared<EnumValue>(caseName, std::nullopt);
+      }
+
       break;
     }
 
@@ -203,60 +327,147 @@ static std::shared_ptr<CompileTimeValue> extractCompileTimeValue(Expr *expr) {
       return extractCompileTimeValue(erasureExpr->getSubExpr());
     }
 
+    case ExprKind::Paren: {
+      auto parenExpr = cast<ParenExpr>(expr);
+      return extractCompileTimeValue(parenExpr->getSubExpr());
+    }
+
+    case ExprKind::PropertyWrapperValuePlaceholder: {
+      auto placeholderExpr = cast<PropertyWrapperValuePlaceholderExpr>(expr);
+      return extractCompileTimeValue(
+          placeholderExpr->getOriginalWrappedValue());
+    }
+
+    case ExprKind::Coerce: {
+      auto coerceExpr = cast<CoerceExpr>(expr);
+      return extractCompileTimeValue(coerceExpr->getSubExpr());
+    }
+
+    case ExprKind::DotSelf: {
+      auto dotSelfExpr = cast<DotSelfExpr>(expr);
+      auto dotSelfMetaType = dotSelfExpr->getType()->getAs<AnyMetatypeType>();
+      if (dotSelfMetaType)
+        return std::make_shared<TypeValue>(dotSelfMetaType->getInstanceType());
+      else
+        break;
+    }
+
+    case ExprKind::UnderlyingToOpaque: {
+      auto underlyingToOpaque = cast<UnderlyingToOpaqueExpr>(expr);
+      return extractCompileTimeValue(underlyingToOpaque->getSubExpr());
+    }
+
+    case ExprKind::DefaultArgument: {
+      auto defaultArgExpr = cast<DefaultArgumentExpr>(expr);
+      auto *decl = defaultArgExpr->getParamDecl();
+      // If there is a default expr, we should have looked through to it
+      assert(!decl->hasDefaultExpr());
+      switch (decl->getDefaultArgumentKind()) {
+      case DefaultArgumentKind::NilLiteral:
+        return std::make_shared<RawLiteralValue>("nil");
+      case DefaultArgumentKind::EmptyArray:
+        return std::make_shared<ArrayValue>(
+            std::vector<std::shared_ptr<CompileTimeValue>>());
+      case DefaultArgumentKind::EmptyDictionary:
+        return std::make_shared<DictionaryValue>(
+            std::vector<std::shared_ptr<TupleValue>>());
+      default:
+        break;
+      }
+    } break;
+
+    case ExprKind::KeyPath: {
+        auto keyPathExpr = cast<KeyPathExpr>(expr);
+
+        auto rootType = keyPathExpr->getRootType();
+        std::vector<KeyPathValue::Component> components;
+
+        for (auto component: keyPathExpr->getComponents()) {
+            if (component.isResolved()) {
+                auto declRef = component.getDeclRef();
+                auto identifier = declRef.getDecl()->getBaseIdentifier().str();
+                auto type = component.getComponentType()->getRValueType();
+                components.push_back({identifier.str(), type});
+            }
+        }
+
+        std::string path = "";
+        auto numberOfComponents = static_cast<int>(components.size());
+        for (int i = 0; i < numberOfComponents; i++) {
+            if (i != 0) {
+                path += ".";
+            }
+            path += components[i].Label;
+        }
+
+        return std::make_shared<KeyPathValue>(path, rootType, components);
+    }
+
+    case ExprKind::InjectIntoOptional: {
+      auto injectIntoOptionalExpr = cast<InjectIntoOptionalExpr>(expr);
+      return extractCompileTimeValue(injectIntoOptionalExpr->getSubExpr());
+    }
+
     default: {
       break;
     }
     }
   }
+
   return std::make_shared<RuntimeValue>();
 }
 
-static std::vector<CustomAttrValue>
-extractCustomAttrValues(VarDecl *propertyDecl) {
-  std::vector<CustomAttrValue> customAttrValues;
+static CustomAttrValue
+extractAttributeValue(const CustomAttr *attr) {
+  std::vector<FunctionParameter> parameters;
+  if (const auto *args = attr->getArgs()) {
+    for (auto arg : *args) {
+      const auto label = arg.getLabel().str().str();
+      auto argExpr = arg.getExpr();
 
-  for (auto *propertyWrapper : propertyDecl->getAttachedPropertyWrappers()) {
-    std::vector<FunctionParameter> parameters;
-
-    if (const auto *args = propertyWrapper->getArgs()) {
-      for (auto arg : *args) {
-        const auto label = arg.getLabel().str().str();
-        auto argExpr = arg.getExpr();
-
-        if (auto defaultArgument = dyn_cast<DefaultArgumentExpr>(argExpr)) {
-          auto *decl = defaultArgument->getParamDecl();
-          if (decl->hasDefaultExpr()) {
-            argExpr = decl->getTypeCheckedDefaultExpr();
-          }
+      if (auto defaultArgument = dyn_cast<DefaultArgumentExpr>(argExpr)) {
+        auto *decl = defaultArgument->getParamDecl();
+        if (decl->hasDefaultExpr()) {
+          argExpr = decl->getTypeCheckedDefaultExpr();
         }
-        parameters.push_back(
-            {label, argExpr->getType(), extractCompileTimeValue(argExpr)});
       }
+      parameters.push_back(
+          {label, argExpr->getType(), extractCompileTimeValue(argExpr)});
     }
-    customAttrValues.push_back({propertyWrapper->getType(), parameters});
   }
+  return {attr, parameters};
+}
 
+static AttrValueVector
+extractPropertyWrapperAttrValues(VarDecl *propertyDecl) {
+  AttrValueVector customAttrValues;
+  for (auto *propertyWrapper : propertyDecl->getAttachedPropertyWrappers())
+    customAttrValues.push_back(extractAttributeValue(propertyWrapper));
   return customAttrValues;
 }
 
 static ConstValueTypePropertyInfo
 extractTypePropertyInfo(VarDecl *propertyDecl) {
-  if (const auto binding = propertyDecl->getParentPatternBinding()) {
-    if (const auto originalInit = binding->getOriginalInit(0)) {
-      if (propertyDecl->hasAttachedPropertyWrapper()) {
-        return {propertyDecl, extractCompileTimeValue(originalInit),
-                extractCustomAttrValues(propertyDecl)};
-      }
+  std::optional<AttrValueVector> propertyWrapperValues;
+  if (propertyDecl->hasAttachedPropertyWrapper())
+    propertyWrapperValues = extractPropertyWrapperAttrValues(propertyDecl);
 
-      return {propertyDecl, extractCompileTimeValue(originalInit)};
+  if (const auto binding = propertyDecl->getParentPatternBinding()) {
+    if (const auto originalInit = binding->getInit(0)) {
+      return {propertyDecl, extractCompileTimeValue(originalInit),
+              propertyWrapperValues};
     }
   }
 
   if (auto accessorDecl = propertyDecl->getAccessor(AccessorKind::Get)) {
-    auto node = accessorDecl->getTypecheckedBody()->getFirstElement();
-    if (node.is<Stmt *>()) {
-      if (auto returnStmt = dyn_cast<ReturnStmt>(node.get<Stmt *>())) {
-        return {propertyDecl, extractCompileTimeValue(returnStmt->getResult())};
+    if (auto body = accessorDecl->getTypecheckedBody()) {
+      auto node = body->getFirstElement();
+      if (auto *stmt = node.dyn_cast<Stmt *>()) {
+        if (stmt->getKind() == StmtKind::Return) {
+          return {propertyDecl,
+                  extractCompileTimeValue(cast<ReturnStmt>(stmt)->getResult()),
+                  propertyWrapperValues};
+        }
       }
     }
   }
@@ -264,37 +475,91 @@ extractTypePropertyInfo(VarDecl *propertyDecl) {
   return {propertyDecl, std::make_shared<RuntimeValue>()};
 }
 
-ConstValueTypeInfo
-ConstantValueInfoRequest::evaluate(Evaluator &Evaluator,
-                                   NominalTypeDecl *Decl) const {
-  // Use 'getStoredProperties' to get lowered lazy and wrapped properties
+std::optional<std::vector<EnumElementDeclValue>>
+extractEnumCases(NominalTypeDecl *Decl) {
+  if (Decl->getKind() == DeclKind::Enum) {
+    std::vector<EnumElementDeclValue> Elements;
+    for (EnumCaseDecl *ECD : cast<EnumDecl>(Decl)->getAllCases()) {
+      for (EnumElementDecl *EED : ECD->getElements()) {
+        std::string Name = EED->getNameStr().str();
+        std::optional<std::string> RawValue =
+            extractRawLiteral(EED->getRawValueExpr());
+
+        std::vector<EnumElementParameterValue> Parameters;
+        if (const ParameterList *Params = EED->getParameterList()) {
+          for (const ParamDecl *Parameter : Params->getArray()) {
+            std::optional<std::string> Label =
+                Parameter->getParameterName().empty()
+                    ? std::nullopt
+                    : std::optional<std::string>(
+                          Parameter->getParameterName().str().str());
+
+            Parameters.push_back({Label, Parameter->getInterfaceType()});
+          }
+        }
+
+        if (Parameters.empty()) {
+          Elements.push_back({Name, RawValue, std::nullopt});
+        } else {
+          Elements.push_back({Name, RawValue, Parameters});
+        }
+      }
+    }
+    return Elements;
+  }
+
+  return std::nullopt;
+}
+
+ConstValueTypeInfo ConstantValueInfoRequest::evaluate(
+    Evaluator &Evaluator, NominalTypeDecl *Decl,
+    llvm::PointerUnion<const SourceFile *, ModuleDecl *> extractionScope)
+    const {
+
+  auto shouldExtract = [&](DeclContext *decl) {
+    if (auto SF = extractionScope.dyn_cast<const SourceFile *>())
+      return decl->getOutermostParentSourceFile() == SF;
+    return decl->getParentModule() == extractionScope.get<ModuleDecl *>();
+  };
+
+  std::vector<ConstValueTypePropertyInfo> Properties;
+  std::optional<std::vector<EnumElementDeclValue>> EnumCases;
+
+  // Use 'getStoredProperties' to get lowered lazy and wrapped properties.
+  // @_objcImplementation extensions might contain stored properties.
   auto StoredProperties = Decl->getStoredProperties();
   std::unordered_set<VarDecl *> StoredPropertiesSet(StoredProperties.begin(),
                                                     StoredProperties.end());
-
-  std::vector<ConstValueTypePropertyInfo> Properties;
   for (auto Property : StoredProperties) {
-    Properties.push_back(extractTypePropertyInfo(Property));
+    if (shouldExtract(Property->getDeclContext())) {
+      Properties.push_back(extractTypePropertyInfo(Property));
+    }
   }
 
-  for (auto Member : Decl->getMembers()) {
-    auto *VD = dyn_cast<VarDecl>(Member);
+  auto extract = [&](class Decl *Member) {
     // Ignore plain stored properties collected above,
     // instead gather up remaining static and computed properties.
-    if (!VD || StoredPropertiesSet.count(VD))
-      continue;
-    Properties.push_back(extractTypePropertyInfo(VD));
+    if (auto *VD = dyn_cast<VarDecl>(Member))
+      if (!StoredPropertiesSet.count(VD))
+        Properties.push_back(extractTypePropertyInfo(VD));
+  };
+
+  if (shouldExtract(Decl)) {
+    for (auto Member : Decl->getAllMembers()) {
+      extract(Member);
+    }
+    EnumCases = extractEnumCases(Decl);
   }
 
   for (auto Extension: Decl->getExtensions()) {
-    for (auto Member : Extension->getMembers()) {
-      if (auto *VD = dyn_cast<VarDecl>(Member)) {
-        Properties.push_back(extractTypePropertyInfo(VD));
+    if (shouldExtract(Extension)) {
+      for (auto Member : Extension->getAllMembers()) {
+        extract(Member);
       }
     }
   }
 
-  return ConstValueTypeInfo{Decl, Properties};
+  return ConstValueTypeInfo{Decl, Properties, EnumCases};
 }
 
 std::vector<ConstValueTypeInfo>
@@ -308,7 +573,8 @@ gatherConstValuesForModule(const std::unordered_set<std::string> &Protocols,
   Module->walk(ConformanceCollector);
   for (auto *CD : ConformanceDecls)
     Result.emplace_back(evaluateOrDefault(CD->getASTContext().evaluator,
-                                          ConstantValueInfoRequest{CD}, {}));
+                                          ConstantValueInfoRequest{CD, Module},
+                                          {}));
   return Result;
 }
 
@@ -322,11 +588,26 @@ gatherConstValuesForPrimary(const std::unordered_set<std::string> &Protocols,
                                                        ConformanceDecls);
   for (auto D : SF->getTopLevelDecls())
     D->walk(ConformanceCollector);
+  // Visit macro expanded extensions
+  if (auto *synthesizedSF = SF->getSynthesizedFile())
+    for (auto D : synthesizedSF->getTopLevelDecls())
+      if (isa<ExtensionDecl>(D))
+        D->walk(ConformanceCollector);
 
   for (auto *CD : ConformanceDecls)
-    Result.emplace_back(evaluateOrDefault(CD->getASTContext().evaluator,
-                                          ConstantValueInfoRequest{CD}, {}));
+    Result.emplace_back(evaluateOrDefault(
+        CD->getASTContext().evaluator, ConstantValueInfoRequest{CD, SF}, {}));
   return Result;
+}
+
+void writeLocationInformation(llvm::json::OStream &JSON, SourceLoc Loc,
+                              const ASTContext &ctx) {
+  if (Loc.isInvalid())
+    return;
+
+  JSON.attribute("file", ctx.SourceMgr.getDisplayNameForLoc(Loc));
+  JSON.attribute("line",
+                 ctx.SourceMgr.getPresumedLineAndColumnForLoc(Loc).first);
 }
 
 void writeValue(llvm::json::OStream &JSON,
@@ -344,7 +625,8 @@ void writeValue(llvm::json::OStream &JSON,
 
     JSON.attribute("valueKind", "InitCall");
     JSON.attributeObject("value", [&]() {
-      JSON.attribute("type", initCallValue->getName());
+      JSON.attribute("type",
+                     toFullyQualifiedTypeNameString(initCallValue->getType()));
       JSON.attributeArray("arguments", [&] {
         for (auto FP : initCallValue->getParameters()) {
           JSON.object([&] {
@@ -383,6 +665,17 @@ void writeValue(llvm::json::OStream &JSON,
 
   case CompileTimeValue::ValueKind::Dictionary: {
     JSON.attribute("valueKind", "Dictionary");
+    JSON.attributeArray("value", [&] {
+      for (auto tupleValue : cast<DictionaryValue>(value)->getElements()) {
+        auto tupleElements = tupleValue.get()->getElements();
+        JSON.object([&] {
+          JSON.attributeObject(
+              "key", [&] { writeValue(JSON, tupleElements[0].Value); });
+          JSON.attributeObject(
+              "value", [&] { writeValue(JSON, tupleElements[1].Value); });
+        });
+      }
+    });
     break;
   }
 
@@ -398,26 +691,15 @@ void writeValue(llvm::json::OStream &JSON,
     break;
   }
 
-  case CompileTimeValue::ValueKind::Runtime: {
-    JSON.attribute("valueKind", "Runtime");
-    break;
-  }
-  }
-}
-
-void writeAttributes(
-    llvm::json::OStream &JSON,
-    llvm::Optional<std::vector<CustomAttrValue>> PropertyWrappers) {
-  if (!PropertyWrappers.hasValue()) {
-    return;
-  }
-
-  JSON.attributeArray("attributes", [&] {
-    for (auto PW : PropertyWrappers.value()) {
-      JSON.object([&] {
-        JSON.attribute("type", toFullyQualifiedTypeNameString(PW.Type));
+  case CompileTimeValue::ValueKind::Enum: {
+    auto enumValue = cast<EnumValue>(value);
+    JSON.attribute("valueKind", "Enum");
+    JSON.attributeObject("value", [&]() {
+      JSON.attribute("name", enumValue->getIdentifier());
+      if (enumValue->getParameters().has_value()) {
+        auto params = enumValue->getParameters().value();
         JSON.attributeArray("arguments", [&] {
-          for (auto FP : PW.Parameters) {
+          for (auto FP : params) {
             JSON.object([&] {
               JSON.attribute("label", FP.Label);
               JSON.attribute("type", toFullyQualifiedTypeNameString(FP.Type));
@@ -425,38 +707,329 @@ void writeAttributes(
             });
           }
         });
+      }
+    });
+    break;
+  }
+
+  case CompileTimeValue::ValueKind::Type: {
+    auto typeValue = cast<TypeValue>(value);
+    Type type = typeValue->getType();
+    JSON.attribute("valueKind", "Type");
+    JSON.attributeObject("value", [&]() {
+      JSON.attribute("type",
+                     toFullyQualifiedTypeNameString(type));
+      JSON.attribute("mangledName",
+                     toMangledTypeNameString(type));
+    });
+    break;
+  }
+
+  case CompileTimeValue::KeyPath: {
+      auto keyPathValue = cast<KeyPathValue>(value);
+      JSON.attribute("valueKind", "KeyPath");
+      JSON.attributeObject("value", [&]() {
+        JSON.attribute("path", keyPathValue->getPath());
+        JSON.attribute("rootType", toFullyQualifiedTypeNameString(keyPathValue->getRootType()));
+        JSON.attributeArray("components", [&] {
+          auto components = keyPathValue->getComponents();
+          for (auto c : components) {
+            JSON.object([&] {
+              JSON.attribute("label", c.Label);
+              JSON.attribute("type", toFullyQualifiedTypeNameString(c.Type));
+            });
+          }
+        });
+      });
+      break;
+  }
+
+  case CompileTimeValue::ValueKind::Runtime: {
+    JSON.attribute("valueKind", "Runtime");
+    break;
+  }
+  }
+}
+
+void writeAttributeInfo(llvm::json::OStream &JSON,
+                        const CustomAttrValue &AttrVal,
+                        const ASTContext &ctx) {
+  JSON.object([&] {
+    JSON.attribute("type",
+                   toFullyQualifiedTypeNameString(AttrVal.Attr->getType()));
+    writeLocationInformation(JSON, AttrVal.Attr->getLocation(), ctx);
+    JSON.attributeArray("arguments", [&] {
+      for (auto FP : AttrVal.Parameters) {
+        JSON.object([&] {
+          JSON.attribute("label", FP.Label);
+          JSON.attribute("type", toFullyQualifiedTypeNameString(FP.Type));
+          writeValue(JSON, FP.Value);
+        });
+      }
+    });
+  });
+}
+
+void writePropertyWrapperAttributes(
+    llvm::json::OStream &JSON, std::optional<AttrValueVector> PropertyWrappers,
+    const ASTContext &ctx) {
+  if (!PropertyWrappers.has_value()) {
+    return;
+  }
+
+  JSON.attributeArray("propertyWrappers", [&] {
+    for (auto PW : PropertyWrappers.value())
+      writeAttributeInfo(JSON, PW, ctx);
+  });
+}
+
+void writeEnumCases(
+    llvm::json::OStream &JSON,
+    std::optional<std::vector<EnumElementDeclValue>> EnumElements) {
+  if (!EnumElements.has_value()) {
+    return;
+  }
+
+  JSON.attributeArray("cases", [&] {
+    for (const auto &Case : EnumElements.value()) {
+      JSON.object([&] {
+        JSON.attribute("name", Case.Name);
+        if (Case.RawValue.has_value()) {
+          JSON.attribute("rawValue", Case.RawValue.value());
+        }
+        if (Case.Parameters.has_value()) {
+          JSON.attributeArray("parameters", [&] {
+            for (const auto &Parameter : Case.Parameters.value()) {
+              JSON.object([&] {
+                if (auto Label = Parameter.Label) {
+                  JSON.attribute("label", Label);
+                }
+                JSON.attribute("type",
+                               toFullyQualifiedTypeNameString(Parameter.Type));
+              });
+            }
+          });
+        }
       });
     }
   });
 }
 
+void writeResultBuilderInformation(llvm::json::OStream &JSON,
+                                   const swift::NominalTypeDecl *TypeDecl,
+                                   const swift::VarDecl *VarDecl) {
+  if (auto *attr = VarDecl->getAttachedResultBuilder()) {
+    JSON.attributeObject("resultBuilder", [&] {
+      JSON.attribute("type", toFullyQualifiedTypeNameString(attr->getType()));
+    });
+
+    return;
+  }
+
+  for (ProtocolDecl *Decl :
+       TypeDecl->getLocalProtocols(ConformanceLookupKind::All)) {
+    // FIXME(noncopyable_generics): Should these be included?
+    if (Decl->getInvertibleProtocolKind())
+      continue;
+
+    for (auto Member : Decl->getMembers()) {
+      if (auto *VD = dyn_cast<swift::VarDecl>(Member)) {
+        if (VD->getName() != VarDecl->getName())
+          continue;
+
+        if (auto *attr = VD->getAttachedResultBuilder()) {
+          JSON.attributeObject("resultBuilder", [&] {
+            JSON.attribute("type",
+                           toFullyQualifiedTypeNameString(attr->getType()));
+          });
+        }
+
+        return;
+      }
+    }
+  }
+}
+
+void writeAttrInformation(llvm::json::OStream &JSON,
+                          const DeclAttributes &Attrs) {
+  auto availableAttr = Attrs.getAttributes<AvailableAttr>();
+  if (availableAttr.empty())
+    return;
+
+  JSON.attributeArray("availabilityAttributes", [&] {
+    for (const AvailableAttr *attr : availableAttr) {
+      JSON.object([&] {
+        if (!attr->platformString().empty())
+          JSON.attribute("platform", attr->platformString());
+
+        if (!attr->Message.empty())
+          JSON.attribute("message", attr->Message);
+
+        if (!attr->Rename.empty())
+          JSON.attribute("rename", attr->Rename);
+
+        if (attr->Introduced.has_value())
+          JSON.attribute("introducedVersion",
+                         attr->Introduced.value().getAsString());
+
+        if (attr->Deprecated.has_value())
+          JSON.attribute("deprecatedVersion",
+                         attr->Deprecated.value().getAsString());
+
+        if (attr->Obsoleted.has_value())
+          JSON.attribute("obsoletedVersion",
+                         attr->Obsoleted.value().getAsString());
+
+        JSON.attribute("isUnavailable", attr->isUnconditionallyUnavailable());
+        JSON.attribute("isDeprecated", attr->isUnconditionallyDeprecated());
+      });
+    }
+  });
+}
+
+void writeSubstitutedOpaqueTypeAliasDetails(
+    llvm::json::OStream &JSON, const OpaqueTypeArchetypeType &OpaqueTy) {
+  auto Signature = OpaqueTy.getDecl()->getOpaqueInterfaceGenericSignature();
+
+  JSON.attributeArray("opaqueTypeProtocolRequirements", [&] {
+    for (const auto Requirement : Signature.getRequirements()) {
+      // Ignore requirements whose subject type is that of the owner decl
+      if (!Requirement.getFirstType()->isEqual(OpaqueTy.getInterfaceType()))
+        continue;
+
+      if (Requirement.getKind() != RequirementKind::Conformance)
+        continue;
+
+      // FIXME(noncopyable_generics): Should these be included?
+      if (Requirement.getProtocolDecl()->getInvertibleProtocolKind())
+        continue;
+
+      JSON.value(
+          toFullyQualifiedProtocolNameString(*Requirement.getProtocolDecl()));
+    }
+  });
+
+  JSON.attributeArray("opaqueTypeSameTypeRequirements", [&] {
+    for (const auto Requirement : Signature.getRequirements()) {
+      if (Requirement.getKind() == RequirementKind::SameType) {
+        auto TypeAliasType = Requirement.getFirstType();
+        auto TypeWitness = Requirement.getSecondType();
+        JSON.object([&] {
+          auto TypeAliasName = toFullyQualifiedTypeNameString(TypeAliasType);
+          if (auto DependentMemberTy =
+                  TypeAliasType->getAs<DependentMemberType>())
+            if (const auto *Assoc = DependentMemberTy->getAssocType())
+              TypeAliasName =
+                  toFullyQualifiedProtocolNameString(*Assoc->getProtocol()) +
+                  "." + DependentMemberTy->getName().str().str();
+          JSON.attribute("typeAliasName", TypeAliasName);
+          JSON.attribute("substitutedTypeName",
+                         toFullyQualifiedTypeNameString(TypeWitness));
+          JSON.attribute("substitutedMangledTypeName",
+                         toMangledTypeNameString(TypeWitness));
+        });
+      }
+    }
+  });
+}
+
+void writeAssociatedTypeAliases(llvm::json::OStream &JSON,
+                                const NominalTypeDecl &NomTypeDecl) {
+  JSON.attributeArray("associatedTypeAliases", [&] {
+    for (auto &Conformance : NomTypeDecl.getAllConformances()) {
+      Conformance->forEachTypeWitness(
+          [&](AssociatedTypeDecl *assoc, Type type, TypeDecl *typeDecl) {
+            JSON.object([&] {
+              JSON.attribute("typeAliasName", assoc->getName().str().str());
+              JSON.attribute("substitutedTypeName",
+                             toFullyQualifiedTypeNameString(type));
+              JSON.attribute("substitutedMangledTypeName",
+                             toMangledTypeNameString(type));
+              if (auto OpaqueTy = dyn_cast<OpaqueTypeArchetypeType>(type)) {
+                writeSubstitutedOpaqueTypeAliasDetails(JSON, *OpaqueTy);
+              }
+            });
+            return false;
+          });
+    }
+  });
+}
+
+void writeProperties(llvm::json::OStream &JSON,
+                     const ConstValueTypeInfo &TypeInfo,
+                     const NominalTypeDecl &NomTypeDecl) {
+  JSON.attributeArray("properties", [&] {
+    for (const auto &PropertyInfo : TypeInfo.Properties) {
+      JSON.object([&] {
+        const auto *decl = PropertyInfo.VarDecl;
+        JSON.attribute("label", decl->getName().str().str());
+        JSON.attribute("type", toFullyQualifiedTypeNameString(
+            decl->getInterfaceType()));
+        JSON.attribute("mangledTypeName", "n/a - deprecated");
+        JSON.attribute("isStatic", decl->isStatic() ? "true" : "false");
+        JSON.attribute("isComputed", !decl->hasStorage() ? "true" : "false");
+        writeLocationInformation(JSON, decl->getLoc(),
+                                 decl->getDeclContext()->getASTContext());
+        writeValue(JSON, PropertyInfo.Value);
+        writePropertyWrapperAttributes(JSON, PropertyInfo.PropertyWrappers,
+                                       decl->getASTContext());
+        writeResultBuilderInformation(JSON, &NomTypeDecl, decl);
+        writeAttrInformation(JSON, decl->getAttrs());
+      });
+    }
+  });
+}
+
+void writeConformances(llvm::json::OStream &JSON,
+                       const NominalTypeDecl &NomTypeDecl) {
+  JSON.attributeArray("conformances", [&] {
+    for (auto *Protocol : NomTypeDecl.getAllProtocols()) {
+      // FIXME(noncopyable_generics): Should these be included?
+      if (Protocol->getInvertibleProtocolKind())
+        continue;
+
+      JSON.value(toFullyQualifiedProtocolNameString(*Protocol));
+    }
+  });
+}
+
+void writeTypeName(llvm::json::OStream &JSON, const TypeDecl &TypeDecl) {
+  JSON.attribute("typeName",
+                 toFullyQualifiedTypeNameString(
+                                 TypeDecl.getDeclaredInterfaceType()));
+  JSON.attribute("mangledTypeName",
+                 toMangledTypeNameString(TypeDecl.getDeclaredInterfaceType()));
+}
+
+void writeNominalTypeKind(llvm::json::OStream &JSON,
+                          const NominalTypeDecl &NomTypeDecl) {
+  JSON.attribute(
+      "kind",
+      NomTypeDecl.getDescriptiveKindName(NomTypeDecl.getDescriptiveKind())
+          .str());
+}
+
 bool writeAsJSONToFile(const std::vector<ConstValueTypeInfo> &ConstValueInfos,
-                       llvm::raw_fd_ostream &OS) {
+                       llvm::raw_ostream &OS) {
   llvm::json::OStream JSON(OS, 2);
   JSON.array([&] {
     for (const auto &TypeInfo : ConstValueInfos) {
+      assert(isa<NominalTypeDecl>(TypeInfo.TypeDecl) &&
+             "Expected Nominal Type Decl for a conformance");
+      const auto *NomTypeDecl = cast<NominalTypeDecl>(TypeInfo.TypeDecl);
+      const auto SourceLoc =
+          extractNearestSourceLoc(NomTypeDecl->getInnermostDeclContext());
+      const auto &Ctx = NomTypeDecl->getInnermostDeclContext()->getASTContext();
+
       JSON.object([&] {
-        const auto *TypeDecl = TypeInfo.TypeDecl;
-        JSON.attribute("typeName", toFullyQualifiedTypeNameString(TypeDecl->getDeclaredInterfaceType()));
-        JSON.attribute(
-            "kind",
-            TypeDecl->getDescriptiveKindName(TypeDecl->getDescriptiveKind())
-                .str());
-        JSON.attributeArray("properties", [&] {
-          for (const auto &PropertyInfo : TypeInfo.Properties) {
-            JSON.object([&] {
-              const auto *decl = PropertyInfo.VarDecl;
-              JSON.attribute("label", decl->getName().str().str());
-              JSON.attribute("type",
-                             toFullyQualifiedTypeNameString(decl->getType()));
-              JSON.attribute("isStatic", decl->isStatic() ? "true" : "false");
-              JSON.attribute("isComputed",
-                             !decl->hasStorage() ? "true" : "false");
-              writeValue(JSON, PropertyInfo.Value);
-              writeAttributes(JSON, PropertyInfo.PropertyWrappers);
-            });
-          }
-        });
+        writeTypeName(JSON, *NomTypeDecl);
+        writeNominalTypeKind(JSON, *NomTypeDecl);
+        writeLocationInformation(JSON, SourceLoc, Ctx);
+        writeConformances(JSON, *NomTypeDecl);
+        writeAssociatedTypeAliases(JSON, *NomTypeDecl);
+        writeProperties(JSON, TypeInfo, *NomTypeDecl);
+        writeEnumCases(JSON, TypeInfo.EnumElements);
+        writeAttrInformation(JSON, NomTypeDecl->getAttrs());
       });
     }
   });

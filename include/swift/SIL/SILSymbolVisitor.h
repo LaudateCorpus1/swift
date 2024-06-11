@@ -31,14 +31,17 @@ struct SILSymbolVisitorOptions {
   /// are needed (e.g. decls with `@_originallyDefinedIn`.
   bool LinkerDirectivesOnly = false;
 
-  /// Whether to only visit symbols with public linkage.
-  bool PublicSymbolsOnly = true;
+  /// Whether to only visit symbols with public or package linkage.
+  bool PublicOrPackageSymbolsOnly = true;
 
   /// Whether LLVM IR Virtual Function Elimination is enabled.
   bool VirtualFunctionElimination = false;
 
   /// Whether LLVM IR Witness Method Elimination is enabled.
   bool WitnessMethodElimination = false;
+
+  /// Whether resilient protocols should be emitted fragile.
+  bool FragileResilientProtocols = false;
 };
 
 /// Context for `SILSymbolVisitor` symbol enumeration.
@@ -109,6 +112,7 @@ public:
   virtual void addMethodLookupFunction(ClassDecl *CD) {}
   virtual void addNominalTypeDescriptor(NominalTypeDecl *NTD) {}
   virtual void addObjCInterface(ClassDecl *CD) {}
+  virtual void addObjCMetaclass(ClassDecl *CD) {}
   virtual void addObjCMethod(AbstractFunctionDecl *AFD) {}
   virtual void addObjCResilientClassStub(ClassDecl *CD) {}
   virtual void addOpaqueTypeDescriptor(OpaqueTypeDecl *OTD) {}
@@ -128,6 +132,14 @@ public:
 
 template <typename F>
 void enumerateFunctionsForHasSymbol(SILModule &M, ValueDecl *D, F Handler) {
+  // Handle clang decls separately.
+  if (auto *clangDecl = D->getClangDecl()) {
+    if (isa<clang::FunctionDecl>(clangDecl))
+      Handler(SILDeclRef(D).asForeign());
+
+    return;
+  }
+
   class SymbolVisitor : public SILSymbolVisitor {
     F Handler;
 

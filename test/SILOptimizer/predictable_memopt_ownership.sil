@@ -1,4 +1,4 @@
-// RUN: %target-sil-opt -enable-sil-verify-all %s -predictable-memaccess-opts -predictable-deadalloc-elim  | %FileCheck %s
+// RUN: %target-sil-opt -enable-sil-verify-all %s -update-borrowed-from -predictable-memaccess-opts -predictable-deadalloc-elim  | %FileCheck %s
 
 sil_stage raw
 
@@ -1340,6 +1340,25 @@ bb5:
 bbEnd(%8 : @owned $Optional<Builtin.NativeObject>):
   return %8 : $Optional<Builtin.NativeObject>
 }
+
+// CHECK-LABEL: sil [ossa] @dont_promote_load_borrow_with_reborrows :
+// CHECK:         load_borrow
+// CHECK:       } // end sil function 'dont_promote_load_borrow_with_reborrows'
+sil [ossa] @dont_promote_load_borrow_with_reborrows : $@convention(thin) (@owned SomeClass) -> () {
+bb0(%0 : @owned $SomeClass):
+  %1 = alloc_stack $SomeClass
+  store %0 to [init] %1 : $*SomeClass
+  %3 = load_borrow %1 : $*SomeClass
+  br bb1(%3 : $SomeClass)
+
+bb1(%5 : @reborrow @guaranteed $SomeClass):
+  end_borrow %5 : $SomeClass
+  destroy_addr %1 : $*SomeClass
+  dealloc_stack %1 : $*SomeClass
+  %9 = tuple ()
+  return %9 : $()
+}
+
 
 class Foo {}
 struct MyInt {

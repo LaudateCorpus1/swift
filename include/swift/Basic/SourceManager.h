@@ -16,12 +16,17 @@
 #include "swift/Basic/FileSystem.h"
 #include "swift/Basic/SourceLoc.h"
 #include "clang/Basic/FileManager.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/Optional.h"
 #include "llvm/Support/SourceMgr.h"
 #include <map>
+#include <optional>
+#include <vector>
 
 namespace swift {
+
+class CustomAttr;
+class DeclContext;
 
 /// Augments a buffer that was created specifically to hold generated source
 /// code with the reasons for it being generated.
@@ -29,16 +34,18 @@ class GeneratedSourceInfo {
 public:
   /// The kind of generated source code.
   enum Kind {
-    /// The expansion of a macro.
-    MacroExpansion,
+#define MACRO_ROLE(Name, Description) Name##MacroExpansion,
+#include "swift/Basic/MacroRoles.def"
 
     /// A new function body that is replacing an existing function body.
     ReplacedFunctionBody,
-  } kind;
 
-  /// The buffer ID for the enclosing buffer, in which originalSourceRange
-  /// resides.
-  unsigned originalBufferID;
+    /// Pretty-printed declarations that have no source location.
+    PrettyPrinted,
+
+    /// The expansion of default argument at caller side
+    DefaultArgument,
+  } kind;
 
   /// The source range in the enclosing buffer where this source was generated.
   ///
@@ -46,15 +53,29 @@ public:
   /// which source code was generated. Conceptually, one can think of the
   /// buffer described by a \c GeneratedSource instance as replacing the
   /// code in the \c originalSourceRange.
-  SourceRange originalSourceRange;
+  CharSourceRange originalSourceRange;
 
   /// The source range in the generated-source buffer where the generated
   /// code exists. This might be a subrange of the buffer containing the
   /// generated source, but it will never be from a different buffer.
-  SourceRange generatedSourceRange;
+  CharSourceRange generatedSourceRange;
 
-  /// The opaque pointer for an ASTNode.
-  void *astNode;
+  /// The opaque pointer for an ASTNode for which this buffer was generated.
+  void *astNode = nullptr;
+
+  /// The declaration context in which this buffer logically resides.
+  DeclContext *declContext = nullptr;
+
+  /// The custom attribute for an attached macro.
+  CustomAttr *attachedMacroCustomAttr = nullptr;
+
+  /// The name of the source file on disk that was created to hold the
+  /// contents of this file for external clients.
+  StringRef onDiskBufferCopyFileName = StringRef();
+
+  /// Contains the ancestors of this source buffer, starting with the root source
+  /// buffer and ending at this source buffer.
+  mutable llvm::ArrayRef<unsigned> ancestors = llvm::ArrayRef<unsigned>();
 };
 
 /// This class manages and owns source buffers.
@@ -100,11 +121,35 @@ private:
   std::map<const char *, VirtualFile> VirtualFiles;
   mutable std::pair<const char *, const VirtualFile*> CachedVFile = {nullptr, nullptr};
 
-  Optional<unsigned> findBufferContainingLocInternal(SourceLoc Loc) const;
+  /// A cache that improves the speed of location -> buffer lookups.
+  struct BufferLocCache {
+    /// The set of memory buffers IDs, sorted by the start of their source range.
+    std::vector<unsigned> sortedBuffers;
+
+    /// The number of buffers that were present when sortedBuffers was formed.
+    ///
+    /// There can be multiple buffers that refer to the same source range,
+    /// and we remove duplicates as part of the processing of forming the
+    /// vector of sorted buffers. This number is the number of original buffers,
+    /// used to determine when the sorted buffers are out of date.
+    unsigned numBuffersOriginal = 0;
+
+    /// The last buffer we looked in. This acts as a one-element MRU cache for
+    /// lookups based on source locations.
+    std::optional<unsigned> lastBufferID;
+  };
+
+  /// The cache that's used to quickly map a source location to a particular
+  /// buffer ID.
+  mutable BufferLocCache LocCache;
+
+  std::optional<unsigned> findBufferContainingLocInternal(SourceLoc Loc) const;
+
 public:
   SourceManager(llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FS =
                     llvm::vfs::getRealFileSystem())
     : FileSystem(FS) {}
+  ~SourceManager();
 
   llvm::SourceMgr &getLLVMSourceMgr() {
     return LLVMSourceMgr;
@@ -142,6 +187,17 @@ public:
 
   SourceLoc getIDEInspectionTargetLoc() const;
 
+  /// Returns whether `Range` contains `Loc`. This also respects the
+  /// `ReplacedRanges`, i.e. if `Loc` is in a range that replaces a range which
+  /// overlaps `Range`, this also returns `true`.
+  bool containsRespectingReplacedRanges(SourceRange Range, SourceLoc Loc) const;
+
+  /// Returns whether `Enclosing` contains `Inner`. This also respects the
+  /// `ReplacedRanges`, i.e. if `Inner` is contained in a range that replaces a
+  /// range which overlaps `Range`, this also returns `true`.
+  bool rangeContainsRespectingReplacedRanges(SourceRange Enclosing,
+                                             SourceRange Inner) const;
+
   const llvm::DenseMap<SourceRange, SourceRange> &getReplacedRanges() const {
     return ReplacedRanges;
   }
@@ -149,8 +205,21 @@ public:
   /// Set the generated source information associated with a given buffer.
   void setGeneratedSourceInfo(unsigned bufferID, GeneratedSourceInfo);
 
+  /// Checks whether the given buffer has generated source information.
+  bool hasGeneratedSourceInfo(unsigned bufferID);
+
   /// Retrieve the generated source information for the given buffer.
-  Optional<GeneratedSourceInfo> getGeneratedSourceInfo(unsigned bufferID) const;
+  std::optional<GeneratedSourceInfo>
+  getGeneratedSourceInfo(unsigned bufferID) const;
+
+  /// Retrieve the list of ancestors of the given source buffer, starting with
+  /// the root buffer and proceding to the given buffer ID at the end.
+  ///
+  /// The scratch parameter will be used to avoid allocation in the case where
+  /// the given buffer ID is the top-level buffer, in which case bufferID will
+  /// be written into scratch at the returned array will contain that one
+  /// element.
+  ArrayRef<unsigned> getAncestors(unsigned bufferID, unsigned &scratch) const;
 
   /// Record the starting source location of a regex literal.
   void recordRegexLiteralStartLoc(SourceLoc loc) {
@@ -163,16 +232,59 @@ public:
     return RegexLiteralStartLocs.contains(loc);
   }
 
-  /// Returns true if \c LHS is before \c RHS in the source buffer.
+  /// Returns true if \c first is before \c second in the same source file,
+  /// accounting for the possibility that first and second are in different
+  /// source buffers that are conceptually within the same source file,
+  /// due to macro expansion.
+  bool isBefore(SourceLoc first, SourceLoc second) const;
+
+  /// Returns true if \c first is at or before \c second in the same source
+  /// file, accounting for the possibility that first and second are in
+  /// different source buffers that are conceptually within the same source
+  /// file, due to macro expansion.
+  bool isAtOrBefore(SourceLoc first, SourceLoc second) const;
+
+  /// Returns true if \c LHS is before \c RHS in the same source buffer.
   bool isBeforeInBuffer(SourceLoc LHS, SourceLoc RHS) const {
     return LHS.Value.getPointer() < RHS.Value.getPointer();
   }
 
-  /// Returns true if range \c R contains the location \c Loc.  The location
-  /// \c Loc should point at the beginning of the token.
+  /// Returns true if \c range contains the location \c loc.  The location
+  /// \c loc should point at the beginning of the token.
+  ///
+  /// This function accounts for the possibility that the source locations
+  /// provided might come from different source buffers that are conceptually
+  /// part of the same source file, for example due to macro expansion.
+  bool containsTokenLoc(SourceRange range, SourceLoc loc) const;
+
+  /// Returns true if \c range contains the location \c loc.
+  ///
+  /// This function accounts for the possibility that the source locations
+  /// provided might come from different source buffers that are conceptually
+  /// part of the same source file, for example due to macro expansion.
+  bool containsLoc(SourceRange range, SourceLoc loc) const;
+
+  /// Returns true if \c enclosing contains the whole range \c inner.
+  ///
+  /// This function accounts for the possibility that the source locations
+  /// provided might come from different source buffers that are conceptually
+  /// part of the same source file, for example due to macro expansion.
+  bool encloses(SourceRange enclosing, SourceRange inner) const;
+
+  /// Returns true if range \c R contains the location \c Loc, where all
+  /// locations are known to be in the same source buffer.
+  ///
+  /// The location \c Loc should point at the beginning of the token.
   bool rangeContainsTokenLoc(SourceRange R, SourceLoc Loc) const {
     return Loc == R.Start || Loc == R.End ||
            (isBeforeInBuffer(R.Start, Loc) && isBeforeInBuffer(Loc, R.End));
+  }
+
+  /// Returns true if range \c R contains the location \c Loc.  The location
+  /// \c Loc should point at the beginning of the token.
+  bool rangeContainsTokenLoc(CharSourceRange R, SourceLoc Loc) const {
+    return Loc == R.getStart() || (isBeforeInBuffer(R.getStart(), Loc) &&
+                                   isBeforeInBuffer(Loc, R.getEnd()));
   }
 
   /// Returns true if range \c Enclosing contains the range \c Inner.
@@ -182,10 +294,11 @@ public:
   }
 
   /// Returns true if range \p R contains the code-completion location, if any.
-  bool rangeContainsIDEInspectionTarget(SourceRange R) const {
-    return IDEInspectionTargetBufferID
-               ? rangeContainsTokenLoc(R, getIDEInspectionTargetLoc())
-               : false;
+  bool rangeContainsIDEInspectionTarget(CharSourceRange R) const {
+    if (!IDEInspectionTargetBufferID) {
+      return false;
+    }
+    return rangeContainsTokenLoc(R, getIDEInspectionTargetLoc());
   }
 
   /// Returns the buffer ID for the specified *valid* location.
@@ -230,17 +343,25 @@ public:
 
   /// Returns a buffer ID for a previously added buffer with the given
   /// buffer identifier, or None if there is no such buffer.
-  Optional<unsigned> getIDForBufferIdentifier(StringRef BufIdentifier) const;
+  std::optional<unsigned>
+  getIDForBufferIdentifier(StringRef BufIdentifier) const;
 
   /// Returns the identifier for the buffer with the given ID.
   ///
   /// \p BufferID must be a valid buffer ID.
   ///
+  /// \p ForceGeneratedSourceToDisk can be set to true to create a temporary
+  /// file on-disk for buffers containing generated source code, returning the
+  /// name of that temporary file.
+  ///
   /// This should not be used for displaying information about the \e contents
   /// of a buffer, since lines within the buffer may be marked as coming from
   /// other files using \c #sourceLocation. Use #getDisplayNameForLoc instead
   /// in that case.
-  StringRef getIdentifierForBuffer(unsigned BufferID) const;
+  StringRef getIdentifierForBuffer(
+      unsigned BufferID,
+      bool ForceGeneratedSourceToDisk = false
+  ) const;
 
   /// Returns a SourceRange covering the entire specified buffer.
   ///
@@ -272,10 +393,15 @@ public:
   /// Returns a buffer identifier suitable for display to the user containing
   /// the given source location.
   ///
+  /// \p ForceGeneratedSourceToDisk can be set to true to create a temporary
+  /// file on-disk for buffers containing generated source code, returning the
+  /// name of that temporary file.
+  ///
   /// This respects \c #sourceLocation directives and the 'use-external-names'
   /// directive in VFS overlay files. If you need an on-disk file name, use
   /// #getIdentifierForBuffer instead.
-  StringRef getDisplayNameForLoc(SourceLoc Loc) const;
+  StringRef getDisplayNameForLoc(
+      SourceLoc Loc, bool ForceGeneratedSourceToDisk = false) const;
 
   /// Returns the line and column represented by the given source location.
   ///
@@ -309,35 +435,34 @@ public:
   StringRef getEntireTextForBuffer(unsigned BufferID) const;
 
   StringRef extractText(CharSourceRange Range,
-                        Optional<unsigned> BufferID = None) const;
+                        std::optional<unsigned> BufferID = std::nullopt) const;
 
   llvm::SMDiagnostic GetMessage(SourceLoc Loc, llvm::SourceMgr::DiagKind Kind,
                                 const Twine &Msg,
                                 ArrayRef<llvm::SMRange> Ranges,
-                                ArrayRef<llvm::SMFixIt> FixIts) const;
+                                ArrayRef<llvm::SMFixIt> FixIts,
+                                bool EmitMacroExpansionFiles = false) const;
 
   /// Verifies that all buffers are still valid.
   void verifyAllBuffers() const;
 
   /// Translate line and column pair to the offset.
   /// If the column number is the maximum unsinged int, return the offset of the end of the line.
-  llvm::Optional<unsigned> resolveFromLineCol(unsigned BufferId, unsigned Line,
-                                              unsigned Col) const;
+  std::optional<unsigned> resolveFromLineCol(unsigned BufferId, unsigned Line,
+                                             unsigned Col) const;
 
   /// Translate the end position of the given line to the offset.
-  llvm::Optional<unsigned> resolveOffsetForEndOfLine(unsigned BufferId,
-                                                     unsigned Line) const;
+  std::optional<unsigned> resolveOffsetForEndOfLine(unsigned BufferId,
+                                                    unsigned Line) const;
 
   /// Get the length of the line
-  llvm::Optional<unsigned> getLineLength(unsigned BufferId, unsigned Line) const;
+  std::optional<unsigned> getLineLength(unsigned BufferId, unsigned Line) const;
 
   SourceLoc getLocForLineCol(unsigned BufferId, unsigned Line, unsigned Col) const {
     auto Offset = resolveFromLineCol(BufferId, Line, Col);
     return Offset.has_value() ? getLocForOffset(BufferId, Offset.value()) :
                                SourceLoc();
   }
-
-  std::string getLineString(unsigned BufferID, unsigned LineNumber);
 
   /// Retrieve the buffer ID for \p Path, loading if necessary.
   unsigned getExternalSourceBufferID(StringRef Path);

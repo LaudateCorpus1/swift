@@ -99,17 +99,23 @@ raw_ostream &operator<<(raw_ostream &os, const AddressCapture &capture) {
 
 // For each non-escaping closure, record the indices of arguments that
 // require dynamic enforcement.
+//
+// A note on closure cycles: local functions can be recursive, creating closure
+// cycles. DynamicCaptures ignores such cycles, simply processing the call graph
+// top-down. This relies on a simple rule: if a captured variable is passed as a
+// box a local function (presumably because the function escapes), then it must
+// also be passed as a box to any other local function called by the
+// first. Therefore, if any capture escapes in a closure cycle, then it must be
+// passed as a box in all closures within the cycle. DynamicCaptures does not
+// care about boxes, because they are always dynamically enforced.
 class DynamicCaptures {
-  const ClosureFunctionOrder &closureOrder;
-
   // This only maps functions that have at least one inout_aliasable argument.
   llvm::DenseMap<SILFunction *, SmallVector<unsigned, 4>> dynamicCaptureMap;
 
   DynamicCaptures(DynamicCaptures &) = delete;
 
 public:
-  DynamicCaptures(const ClosureFunctionOrder &closureOrder):
-    closureOrder(closureOrder) {}
+  DynamicCaptures() {}
 
   void recordCapture(AddressCapture capture) {
     LLVM_DEBUG(llvm::dbgs() << "Dynamic Capture: " << capture);
@@ -127,10 +133,10 @@ public:
   }
 
   bool isDynamic(SILFunctionArgument *arg) const {
-    // If the current function is a local function that directly or indirectly
-    // refers to itself, then conservatively assume dynamic enforcement.
-    if (closureOrder.isHeadOfClosureCycle(arg->getFunction()))
-      return true;
+    // This closure may be the head of a closure cycle. That's ok, because we
+    // only care about whether this argument escapes in the calling function
+    // this is *not* part of the cycle. If the capture escapes anywhere in the
+    // cycle, then it is passed as a box to all closures in that cycle.
 
     auto pos = dynamicCaptureMap.find(arg->getFunction());
     if (pos == dynamicCaptureMap.end())
@@ -278,7 +284,8 @@ static void checkUsesOfAccess(BeginAccessInst *access) {
     auto user = use->getUser();
     assert(!isa<BeginAccessInst>(user));
     assert(!isa<PartialApplyInst>(user) ||
-           onlyUsedByAssignByWrapper(cast<PartialApplyInst>(user)));
+           onlyUsedByAssignByWrapper(cast<PartialApplyInst>(user)) ||
+           onlyUsedByAssignOrInit(cast<PartialApplyInst>(user)));
   }
 #endif
 }
@@ -288,7 +295,7 @@ void SelectEnforcement::analyzeProjection(SingleValueInstruction *projection) {
     auto user = use->getUser();
 
     // Look through mark must check.
-    if (auto *mmi = dyn_cast<MarkMustCheckInst>(user)) {
+    if (auto *mmi = dyn_cast<MarkUnresolvedNonCopyableValueInst>(user)) {
       analyzeProjection(mmi);
       continue;
     }
@@ -610,7 +617,7 @@ public:
 
 protected:
   void processFunction(SILFunction *F);
-  SourceAccess getAccessKindForBox(ProjectBoxInst *projection);
+  SourceAccess getAccessKindForBox(SILValue boxOperand);
   SourceAccess getSourceAccess(SILValue address);
   void handleApply(ApplySite apply);
   void handleAccess(BeginAccessInst *access);
@@ -621,7 +628,7 @@ void AccessEnforcementSelection::run() {
   ClosureFunctionOrder closureOrder(CSA);
   closureOrder.compute();
 
-  dynamicCaptures = std::make_unique<DynamicCaptures>(closureOrder);
+  dynamicCaptures = std::make_unique<DynamicCaptures>();
   SWIFT_DEFER { dynamicCaptures.reset(); };
 
   for (SILFunction *function : closureOrder.getTopDownFunctions()) {
@@ -675,9 +682,7 @@ processFunction(SILFunction *F) {
 #endif
 }
 
-SourceAccess
-AccessEnforcementSelection::getAccessKindForBox(ProjectBoxInst *projection) {
-  SILValue source = projection->getOperand();
+SourceAccess AccessEnforcementSelection::getAccessKindForBox(SILValue source) {
   if (auto *BBI = dyn_cast<BeginBorrowInst>(source))
     source = BBI->getOperand();
   if (auto *MUI = dyn_cast<MarkUninitializedInst>(source))
@@ -699,11 +704,25 @@ SourceAccess AccessEnforcementSelection::getSourceAccess(SILValue address) {
     return getSourceAccess(mui->getOperand());
 
   // Recurse through mark must check.
-  if (auto *mmci = dyn_cast<MarkMustCheckInst>(address))
+  if (auto *mmci = dyn_cast<MarkUnresolvedNonCopyableValueInst>(address))
     return getSourceAccess(mmci->getOperand());
 
+  // Recur through moveonlywrapper_to_copyable_addr or vice versa.
+  if (auto *m = dyn_cast<MoveOnlyWrapperToCopyableAddrInst>(address))
+    return getSourceAccess(m->getOperand());
+  if (auto *c = dyn_cast<CopyableToMoveOnlyWrapperAddrInst>(address))
+    return getSourceAccess(c->getOperand());
+
+  // Recurse through drop_deinit.
+  if (auto *ddi = dyn_cast<DropDeinitInst>(address))
+    return getSourceAccess(ddi->getOperand());
+
+  // Recurse through moveonlywrapper_to_copyable_box.
+  if (auto *m = dyn_cast<MoveOnlyWrapperToCopyableBoxInst>(address))
+    return getAccessKindForBox(m->getOperand());
+
   if (auto box = dyn_cast<ProjectBoxInst>(address))
-    return getAccessKindForBox(box);
+    return getAccessKindForBox(box->getOperand());
 
   if (auto arg = dyn_cast<SILFunctionArgument>(address)) {
     switch (arg->getArgumentConvention()) {

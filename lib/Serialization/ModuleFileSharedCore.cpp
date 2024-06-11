@@ -16,6 +16,7 @@
 #include "ModuleFileCoreTableInfo.h"
 #include "swift/Basic/LangOptions.h"
 #include "swift/Parse/ParseVersion.h"
+#include "swift/Serialization/SerializedModuleLoader.h"
 #include "swift/Strings.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/OnDiskHashTable.h"
@@ -126,6 +127,27 @@ static bool readOptionsBlock(llvm::BitstreamCursor &cursor,
     case options_block::XCC:
       extendedInfo.addExtraClangImporterOption(blobData);
       break;
+    case options_block::PLUGIN_SEARCH_OPTION: {
+      unsigned kind;
+      options_block::ResilienceStrategyLayout::readRecord(scratch, kind);
+      PluginSearchOption::Kind optKind;
+      switch (PluginSearchOptionKind(kind)) {
+      case PluginSearchOptionKind::PluginPath:
+        optKind = PluginSearchOption::Kind::PluginPath;
+        break;
+      case PluginSearchOptionKind::ExternalPluginPath:
+        optKind = PluginSearchOption::Kind::ExternalPluginPath;
+        break;
+      case PluginSearchOptionKind::LoadPluginLibrary:
+        optKind = PluginSearchOption::Kind::LoadPluginLibrary;
+        break;
+      case PluginSearchOptionKind::LoadPluginExecutable:
+        optKind = PluginSearchOption::Kind::LoadPluginExecutable;
+        break;
+      }
+      extendedInfo.addPluginSearchOption({optKind, blobData});
+      break;
+    }
     case options_block::IS_SIB:
       bool IsSIB;
       options_block::IsSIBLayout::readRecord(scratch, IsSIB);
@@ -136,6 +158,9 @@ static bool readOptionsBlock(llvm::BitstreamCursor &cursor,
       break;
     case options_block::HAS_HERMETIC_SEAL_AT_LINK:
       extendedInfo.setHasHermeticSealAtLink(true);
+      break;
+    case options_block::IS_EMBEDDED_SWIFT_MODULE:
+      extendedInfo.setIsEmbeddedSwiftModule(true);
       break;
     case options_block::IS_TESTABLE:
       extendedInfo.setIsTestable(true);
@@ -163,6 +188,21 @@ static bool readOptionsBlock(llvm::BitstreamCursor &cursor,
     case options_block::IS_CONCURRENCY_CHECKED:
       extendedInfo.setIsConcurrencyChecked(true);
       break;
+    case options_block::MODULE_PACKAGE_NAME:
+      extendedInfo.setModulePackageName(blobData);
+      break;
+    case options_block::MODULE_EXPORT_AS_NAME:
+      extendedInfo.setExportAsName(blobData);
+      break;
+    case options_block::HAS_CXX_INTEROPERABILITY_ENABLED:
+      extendedInfo.setHasCxxInteroperability(true);
+      break;
+    case options_block::ALLOW_NON_RESILIENT_ACCESS:
+      extendedInfo.setAllowNonResilientAccess(true);
+      break;
+    case options_block::SERIALIZE_PACKAGE_ENABLED:
+      extendedInfo.setSerializePackageEnabled(true);
+      break;
     default:
       // Unknown options record, possibly for use by a future version of the
       // module format.
@@ -175,7 +215,8 @@ static bool readOptionsBlock(llvm::BitstreamCursor &cursor,
 
 static ValidationInfo validateControlBlock(
     llvm::BitstreamCursor &cursor, SmallVectorImpl<uint64_t> &scratch,
-    std::pair<uint16_t, uint16_t> expectedVersion, bool requiresOSSAModules,
+    std::pair<uint16_t, uint16_t> expectedVersion,
+    bool requiresOSSAModules,
     bool requiresRevisionMatch,
     StringRef requiredSDK,
     ExtendedValidationInfo *extendedInfo,
@@ -293,6 +334,12 @@ static ValidationInfo validateControlBlock(
         LLVM_FALLTHROUGH;
       case 3:
         result.shortVersion = blobData.slice(0, scratch[2]);
+
+        // If the format version doesn't match, give up after also getting the
+        // compiler version. This provides better diagnostics.
+        if (result.status != Status::Valid)
+          return result;
+
         LLVM_FALLTHROUGH;
       case 2:
       case 1:
@@ -312,6 +359,9 @@ static ValidationInfo validateControlBlock(
       break;
     case control_block::ALLOWABLE_CLIENT_NAME:
       result.allowableClients.push_back(blobData);
+      break;
+    case control_block::SDK_VERSION:
+      result.sdkVersion = blobData;
       break;
     case control_block::SDK_NAME: {
       result.sdkName = blobData;
@@ -334,7 +384,7 @@ static ValidationInfo validateControlBlock(
       // recommended configuration and may lead to unreadable swiftmodules.
       StringRef moduleSDK = blobData;
       if (!moduleSDK.empty() && !requiredSDK.empty() &&
-          !requiredSDK.startswith(moduleSDK)) {
+          !requiredSDK.starts_with(moduleSDK)) {
         result.status = Status::SDKMismatch;
         return result;
       }
@@ -350,7 +400,7 @@ static ValidationInfo validateControlBlock(
       // Disable this restriction for compiler testing by setting this
       // env var to any value.
       static const char* ignoreRevision =
-        ::getenv("SWIFT_DEBUG_IGNORE_SWIFTMODULE_REVISION");
+        ::getenv("SWIFT_IGNORE_SWIFTMODULE_REVISION");
       if (ignoreRevision)
         break;
 
@@ -364,13 +414,36 @@ static ValidationInfo validateControlBlock(
       if (forcedDebugRevision ||
           (requiresRevisionMatch && version::isCurrentCompilerTagged())) {
         StringRef compilerRevision = forcedDebugRevision ?
-          forcedDebugRevision : version::getCurrentCompilerTag();
+          forcedDebugRevision : version::getCurrentCompilerSerializationTag();
         if (moduleRevision != compilerRevision) {
-          result.status = Status::RevisionIncompatible;
+          // The module versions are mismatching, record it and diagnose later.
+          result.problematicRevision = moduleRevision;
 
-          // We can't trust this module format at this point.
-          return result;
+          // Reject the module only it still mismatches without the last digit.
+          StringRef compilerRevisionHead = compilerRevision.rsplit('.').first;
+          StringRef moduleRevisionHead = moduleRevision.rsplit('.').first;
+          if (moduleRevisionHead != compilerRevisionHead) {
+            result.status = Status::RevisionIncompatible;
+
+            // We can't trust the module format at this point.
+            return result;
+          }
         }
+      }
+      break;
+    }
+    case control_block::CHANNEL: {
+      static const char* ignoreRevision =
+        ::getenv("SWIFT_IGNORE_SWIFTMODULE_REVISION");
+      if (ignoreRevision)
+        break;
+
+      StringRef moduleChannel = blobData,
+                compilerChannel = version::getCurrentCompilerChannel();
+      if (requiresRevisionMatch && !compilerChannel.empty() &&
+          moduleChannel != compilerChannel) {
+        result.problematicChannel = moduleChannel;
+        result.status = Status::ChannelIncompatible;
       }
       break;
     }
@@ -476,15 +549,38 @@ static bool validateInputBlock(
   return false;
 }
 
+std::string serialization::StatusToString(Status S) {
+  switch (S) {
+  case Status::Valid: return "Valid";
+  case Status::FormatTooOld: return "FormatTooOld";
+  case Status::FormatTooNew: return "FormatTooNew";
+  case Status::RevisionIncompatible: return "RevisionIncompatible";
+  case Status::ChannelIncompatible: return "ChannelIncompatible";
+  case Status::NotInOSSA: return "NotInOSSA";
+  case Status::MissingDependency: return "MissingDependency";
+  case Status::MissingUnderlyingModule: return "MissingUnderlyingModule";
+  case Status::CircularDependency: return "CircularDependency";
+  case Status::FailedToLoadBridgingHeader: return "FailedToLoadBridgingHeader";
+  case Status::Malformed: return "Malformed";
+  case Status::MalformedDocumentation: return "MalformedDocumentation";
+  case Status::NameMismatch: return "NameMismatch";
+  case Status::TargetIncompatible: return "TargetIncompatible";
+  case Status::TargetTooNew: return "TargetTooNew";
+  case Status::SDKMismatch: return "SDKMismatch";
+  }
+  llvm_unreachable("The switch should cover all cases");
+}
+
 bool serialization::isSerializedAST(StringRef data) {
   StringRef signatureStr(reinterpret_cast<const char *>(SWIFTMODULE_SIGNATURE),
-                         llvm::array_lengthof(SWIFTMODULE_SIGNATURE));
-  return data.startswith(signatureStr);
+                         std::size(SWIFTMODULE_SIGNATURE));
+  return data.starts_with(signatureStr);
 }
 
 ValidationInfo serialization::validateSerializedAST(
-    StringRef data, bool requiresOSSAModules, StringRef requiredSDK,
-    bool requiresRevisionMatch, ExtendedValidationInfo *extendedInfo,
+    StringRef data, bool requiresOSSAModules,
+    StringRef requiredSDK,
+    ExtendedValidationInfo *extendedInfo,
     SmallVectorImpl<SerializationOptions::FileDependency> *dependencies,
     SmallVectorImpl<SearchPath> *searchPaths) {
   ValidationInfo result;
@@ -527,10 +623,11 @@ ValidationInfo serialization::validateSerializedAST(
       result = validateControlBlock(
           cursor, scratch,
           {SWIFTMODULE_VERSION_MAJOR, SWIFTMODULE_VERSION_MINOR},
-          requiresOSSAModules, requiresRevisionMatch,
+          requiresOSSAModules,
+          /*requiresRevisionMatch=*/true,
           requiredSDK,
           extendedInfo, localObfuscator);
-      if (result.status == Status::Malformed)
+      if (result.status != Status::Valid)
         return result;
     } else if ((dependencies || searchPaths) &&
                result.status == Status::Valid &&
@@ -602,7 +699,10 @@ void ModuleFileSharedCore::outputDiagnosticInfo(llvm::raw_ostream &os) const {
      << "', builder version '" << MiscVersion
      << "', built from "
      << (Bits.IsBuiltFromInterface? "swiftinterface": "source")
+     << " against SDK " << SDKVersion
      << ", " << (resilient? "resilient": "non-resilient");
+  if (Bits.AllowNonResilientAccess)
+    os << ", built with -experimental-allow-non-resilient-access";
   if (Bits.IsAllowModuleWithCompilerErrorsEnabled)
     os << ", built with -experimental-allow-module-with-compiler-errors";
   if (ModuleInputBuffer)
@@ -876,6 +976,10 @@ bool ModuleFileSharedCore::readIndexBlock(llvm::BitstreamCursor &cursor) {
         assert(blobData.empty());
         allocateBuffer(Conformances, scratch);
         break;
+      case index_block::PACK_CONFORMANCE_OFFSETS:
+        assert(blobData.empty());
+        allocateBuffer(PackConformances, scratch);
+        break;
       case index_block::SIL_LAYOUT_OFFSETS:
         assert(blobData.empty());
         allocateBuffer(SILLayouts, scratch);
@@ -980,10 +1084,11 @@ bool ModuleFileSharedCore::readCommentBlock(llvm::BitstreamCursor &cursor) {
   return false;
 }
 
-static Optional<swift::LibraryKind> getActualLibraryKind(unsigned rawKind) {
+static std::optional<swift::LibraryKind>
+getActualLibraryKind(unsigned rawKind) {
   auto stableKind = static_cast<serialization::LibraryKind>(rawKind);
   if (stableKind != rawKind)
-    return None;
+    return std::nullopt;
 
   switch (stableKind) {
   case serialization::LibraryKind::Library:
@@ -993,10 +1098,10 @@ static Optional<swift::LibraryKind> getActualLibraryKind(unsigned rawKind) {
   }
 
   // If there's a new case value in the module file, ignore it.
-  return None;
+  return std::nullopt;
 }
 
-static Optional<ModuleDecl::ImportFilterKind>
+static std::optional<ModuleDecl::ImportFilterKind>
 getActualImportControl(unsigned rawValue) {
   // We switch on the raw value rather than the enum in order to handle future
   // values.
@@ -1007,8 +1112,12 @@ getActualImportControl(unsigned rawValue) {
     return ModuleDecl::ImportFilterKind::Exported;
   case static_cast<unsigned>(serialization::ImportControl::ImplementationOnly):
     return ModuleDecl::ImportFilterKind::ImplementationOnly;
+  case static_cast<unsigned>(serialization::ImportControl::InternalOrBelow):
+    return ModuleDecl::ImportFilterKind::InternalOrBelow;
+  case static_cast<unsigned>(serialization::ImportControl::PackageOnly):
+    return ModuleDecl::ImportFilterKind::PackageOnly;
   default:
-    return None;
+    return std::nullopt;
   }
 }
 
@@ -1050,7 +1159,8 @@ bool ModuleFileSharedCore::readModuleDocIfPresent(PathObfuscator &pathRecoverer)
 
       info = validateControlBlock(
           docCursor, scratch, {SWIFTDOC_VERSION_MAJOR, SWIFTDOC_VERSION_MINOR},
-          RequiresOSSAModules, /*requiresRevisionMatch*/false,
+          RequiresOSSAModules,
+          /*requiresRevisionMatch*/false,
           /*requiredSDK*/StringRef(), /*extendedInfo*/nullptr, pathRecoverer);
       if (info.status != Status::Valid)
         return false;
@@ -1194,7 +1304,8 @@ bool ModuleFileSharedCore::readModuleSourceInfoIfPresent(PathObfuscator &pathRec
       info = validateControlBlock(
           infoCursor, scratch,
           {SWIFTSOURCEINFO_VERSION_MAJOR, SWIFTSOURCEINFO_VERSION_MINOR},
-          RequiresOSSAModules, /*requiresRevisionMatch*/false,
+          RequiresOSSAModules,
+          /*requiresRevisionMatch*/false,
           /*requiredSDK*/StringRef(), /*extendedInfo*/nullptr, pathRecoverer);
       if (info.status != Status::Valid)
         return false;
@@ -1269,7 +1380,9 @@ ModuleFileSharedCore::ModuleFileSharedCore(
     std::unique_ptr<llvm::MemoryBuffer> moduleInputBuffer,
     std::unique_ptr<llvm::MemoryBuffer> moduleDocInputBuffer,
     std::unique_ptr<llvm::MemoryBuffer> moduleSourceInfoInputBuffer,
-    bool isFramework, bool requiresOSSAModules, StringRef requiredSDK,
+    bool isFramework,
+    bool requiresOSSAModules,
+    StringRef requiredSDK,
     serialization::ValidationInfo &info, PathObfuscator &pathRecoverer)
     : ModuleInputBuffer(std::move(moduleInputBuffer)),
       ModuleDocInputBuffer(std::move(moduleDocInputBuffer)),
@@ -1321,7 +1434,8 @@ ModuleFileSharedCore::ModuleFileSharedCore(
       info = validateControlBlock(
           cursor, scratch,
           {SWIFTMODULE_VERSION_MAJOR, SWIFTMODULE_VERSION_MINOR},
-          RequiresOSSAModules, /*requiresRevisionMatch=*/true, requiredSDK,
+          RequiresOSSAModules,
+          /*requiresRevisionMatch=*/true, requiredSDK,
           &extInfo, pathRecoverer);
       if (info.status != Status::Valid) {
         error(info.status);
@@ -1337,6 +1451,7 @@ ModuleFileSharedCore::ModuleFileSharedCore(
       Bits.IsSIB = extInfo.isSIB();
       Bits.IsStaticLibrary = extInfo.isStaticLibrary();
       Bits.HasHermeticSealAtLink = extInfo.hasHermeticSealAtLink();
+      Bits.IsEmbeddedSwiftModule = extInfo.isEmbeddedSwiftModule();
       Bits.IsTestable = extInfo.isTestable();
       Bits.ResilienceStrategy = unsigned(extInfo.getResilienceStrategy());
       Bits.IsImplicitDynamicEnabled = extInfo.isImplicitDynamicEnabled();
@@ -1344,8 +1459,14 @@ ModuleFileSharedCore::ModuleFileSharedCore(
       Bits.IsAllowModuleWithCompilerErrorsEnabled =
           extInfo.isAllowModuleWithCompilerErrorsEnabled();
       Bits.IsConcurrencyChecked = extInfo.isConcurrencyChecked();
+      Bits.HasCxxInteroperability = extInfo.hasCxxInteroperability();
+      Bits.AllowNonResilientAccess = extInfo.allowNonResilientAccess();
+      Bits.SerializePackageEnabled = extInfo.serializePackageEnabled();
       MiscVersion = info.miscVersion;
+      SDKVersion = info.sdkVersion;
       ModuleABIName = extInfo.getModuleABIName();
+      ModulePackageName = extInfo.getModulePackageName();
+      ModuleExportAsName = extInfo.getExportAsName();
 
       hasValidControlBlock = true;
       break;
@@ -1661,4 +1782,66 @@ ModuleFileSharedCore::ModuleFileSharedCore(
 
 bool ModuleFileSharedCore::hasSourceInfo() const {
   return !!DeclUSRsTable;
+}
+
+ModuleLoadingBehavior
+ModuleFileSharedCore::getTransitiveLoadingBehavior(
+                                          const Dependency &dependency,
+                                          bool debuggerMode,
+                                          bool isPartialModule,
+                                          StringRef packageName,
+                                          bool forTestable) const {
+  if (isPartialModule) {
+    // Keep the merge-module behavior for legacy support. In that case
+    // we load all transitive dependencies from partial modules and
+    // error if it fails.
+    return ModuleLoadingBehavior::Required;
+  }
+
+  bool moduleIsResilient = getResilienceStrategy() ==
+                             ResilienceStrategy::Resilient;
+  if (dependency.isImplementationOnly()) {
+    // Implementation-only dependencies are not usually loaded from
+    // transitive imports.
+    if (debuggerMode || forTestable) {
+      // In the debugger, try to load the module if possible.
+      // Same in the case of a testable import, try to load the dependency
+      // but don't fail if it's missing as this could be source breaking.
+      return ModuleLoadingBehavior::Optional;
+    } else {
+      // When building normally, ignore transitive implementation-only
+      // imports.
+      return ModuleLoadingBehavior::Ignored;
+    }
+  }
+
+  if (dependency.isInternalOrBelow()) {
+    // Non-public imports are similar to implementation-only, the module
+    // loading behavior differs on loading those dependencies
+    // on testable imports.
+    if (forTestable || !moduleIsResilient) {
+      return ModuleLoadingBehavior::Required;
+    } else if (debuggerMode) {
+      return ModuleLoadingBehavior::Optional;
+    } else {
+      return ModuleLoadingBehavior::Ignored;
+    }
+  }
+
+  if (dependency.isPackageOnly()) {
+    // Package dependencies are usually loaded only for import from the same
+    // package.
+    if ((!packageName.empty() && packageName == getModulePackageName()) ||
+        forTestable ||
+        !moduleIsResilient) {
+      return ModuleLoadingBehavior::Required;
+    } else if (debuggerMode) {
+      return ModuleLoadingBehavior::Optional;
+    } else {
+      return ModuleLoadingBehavior::Ignored;
+    }
+  }
+
+  // By default, imports are required dependencies.
+  return ModuleLoadingBehavior::Required;
 }

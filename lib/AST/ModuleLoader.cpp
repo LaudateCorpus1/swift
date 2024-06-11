@@ -59,6 +59,11 @@ void DependencyTracker::addIncrementalDependency(StringRef File,
   }
 }
 
+void DependencyTracker::addMacroPluginDependency(StringRef File,
+                                                 Identifier ModuleName) {
+  macroPluginDeps.insert({ModuleName, std::string(File)});
+}
+
 ArrayRef<std::string>
 DependencyTracker::getDependencies() const {
   return clangCollector->getDependencies();
@@ -67,6 +72,11 @@ DependencyTracker::getDependencies() const {
 ArrayRef<DependencyTracker::IncrementalDependency>
 DependencyTracker::getIncrementalDependencies() const {
   return incrementalDeps;
+}
+
+ArrayRef<DependencyTracker::MacroPluginDependency>
+DependencyTracker::getMacroPluginDependencies() const {
+  return macroPluginDeps.getArrayRef();
 }
 
 std::shared_ptr<clang::DependencyCollector>
@@ -94,7 +104,9 @@ static bool findOverlayFilesInDirectory(ASTContext &ctx, StringRef path,
     callback(file);
   }
 
-  if (error && error != std::errc::no_such_file_or_directory) {
+  // A CAS file list returns operation not permitted on directory iterations.
+  if (error && error != std::errc::no_such_file_or_directory &&
+      error != std::errc::operation_not_permitted) {
     ctx.Diags.diagnose(diagLoc, diag::cannot_list_swiftcrossimport_dir,
                        moduleName, error.message(), path);
   }
@@ -159,6 +171,19 @@ void ModuleLoader::findOverlayFiles(SourceLoc diagLoc, ModuleDecl *module,
   using namespace llvm::sys;
   using namespace file_types;
 
+  // If cross import information is passed on command-line, prefer use that.
+  auto &crossImports = module->getASTContext().SearchPathOpts.CrossImportInfo;
+  auto overlays = crossImports.find(module->getNameStr());
+  if (overlays != crossImports.end()) {
+    for (auto entry : overlays->second) {
+      module->addCrossImportOverlayFile(entry);
+      if (dependencyTracker)
+        dependencyTracker->addDependency(entry, module->isSystemModule());
+    }
+  }
+  if (module->getASTContext().SearchPathOpts.DisableCrossImportOverlaySearch)
+    return;
+
   if (file->getModuleDefiningPath().empty())
     return;
   findOverlayFilesInternal(module->getASTContext(),
@@ -174,16 +199,17 @@ void ModuleLoader::findOverlayFiles(SourceLoc diagLoc, ModuleDecl *module,
 }
 
 llvm::StringMap<llvm::SmallSetVector<Identifier, 4>>
-ModuleDependencies::collectCrossImportOverlayNames(ASTContext &ctx,
-                                                   StringRef moduleName) {
+ModuleDependencyInfo::collectCrossImportOverlayNames(
+    ASTContext &ctx, StringRef moduleName,
+    std::vector<std::pair<std::string, std::string>> &overlayFiles) const {
   using namespace llvm::sys;
   using namespace file_types;
-  Optional<std::string> modulePath;
+  std::optional<std::string> modulePath;
   // A map from secondary module name to a vector of overlay names.
   llvm::StringMap<llvm::SmallSetVector<Identifier, 4>> result;
 
   switch (getKind()) {
-    case swift::ModuleDependenciesKind::SwiftInterface: {
+    case swift::ModuleDependencyKind::SwiftInterface: {
       auto *swiftDep = getAsSwiftInterfaceModule();
       // Prefer interface path to binary module path if we have it.
       modulePath = swiftDep->swiftInterfaceFile;
@@ -194,7 +220,7 @@ ModuleDependencies::collectCrossImportOverlayNames(ASTContext &ctx,
       }
       break;
     }
-    case swift::ModuleDependenciesKind::SwiftBinary: {
+    case swift::ModuleDependencyKind::SwiftBinary: {
       auto *swiftBinaryDep = getAsSwiftBinaryModule();
       modulePath = swiftBinaryDep->compiledModulePath;
       assert(modulePath.has_value());
@@ -204,21 +230,19 @@ ModuleDependencies::collectCrossImportOverlayNames(ASTContext &ctx,
       }
       break;
     }
-    case swift::ModuleDependenciesKind::Clang: {
+    case swift::ModuleDependencyKind::Clang: {
       auto *clangDep = getAsClangModule();
       modulePath = clangDep->moduleMapFile;
       assert(modulePath.has_value());
       break;
     }
-    case swift::ModuleDependenciesKind::SwiftSource: {
-      auto *swiftSourceDep = getAsSwiftSourceModule();
-      assert(!swiftSourceDep->sourceFiles.empty());
+    case swift::ModuleDependencyKind::SwiftSource: {
       return result;
     }
-    case swift::ModuleDependenciesKind::SwiftPlaceholder: {
+    case swift::ModuleDependencyKind::SwiftPlaceholder: {
       return result;
     }
-    case swift::ModuleDependenciesKind::LastKind:
+    case swift::ModuleDependencyKind::LastKind:
       llvm_unreachable("Unhandled dependency kind.");
   }
   // Mimic getModuleDefiningPath() for Swift and Clang module.
@@ -229,6 +253,7 @@ ModuleDependencies::collectCrossImportOverlayNames(ASTContext &ctx,
       ModuleDecl::collectCrossImportOverlay(ctx, file, moduleName,
                                             bystandingModule);
     result[bystandingModule] = std::move(overlayNames);
+    overlayFiles.push_back({moduleName.str(), file.str()});
   });
   return result;
 }

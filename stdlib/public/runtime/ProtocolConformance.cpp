@@ -30,6 +30,7 @@
 #include "../CompatibilityOverride/CompatibilityOverride.h"
 #include "ImageInspection.h"
 #include "Private.h"
+#include "Tracing.h"
 
 #include <new>
 #include <vector>
@@ -124,7 +125,7 @@ static const char *class_getName(const ClassMetadata* type) {
 }
 
 template<> void ProtocolConformanceDescriptor::dump() const {
-  llvm::Optional<SymbolInfo> info;
+  std::optional<SymbolInfo> info;
   auto symbolName = [&](const void *addr) -> const char * {
     info = SymbolInfo::lookup(addr);
     if (info.has_value() && info->getSymbolName()) {
@@ -206,7 +207,7 @@ tryGetCompleteMetadataNonblocking(const Metadata *metadata) {
 /// MetadataState::Abstract} to indicate that there's an uninstantiated
 /// superclass that was not returned.
 static MetadataResponse getSuperclassForMaybeIncompleteMetadata(
-    const Metadata *metadata, llvm::Optional<MetadataState> knownMetadataState,
+    const Metadata *metadata, std::optional<MetadataState> knownMetadataState,
     bool instantiateSuperclassMetadata) {
   const ClassMetadata *classMetadata = dyn_cast<ClassMetadata>(metadata);
   if (!classMetadata)
@@ -261,12 +262,12 @@ static MetadataResponse getSuperclassForMaybeIncompleteMetadata(
 
 struct MaybeIncompleteSuperclassIterator {
   const Metadata *metadata;
-  llvm::Optional<MetadataState> state;
+  std::optional<MetadataState> state;
   bool instantiateSuperclassMetadata;
 
   MaybeIncompleteSuperclassIterator(const Metadata *metadata,
                                     bool instantiateSuperclassMetadata)
-      : metadata(metadata), state(llvm::None),
+      : metadata(metadata), state(std::nullopt),
         instantiateSuperclassMetadata(instantiateSuperclassMetadata) {}
 
   MaybeIncompleteSuperclassIterator &operator++() {
@@ -327,12 +328,20 @@ const WitnessTable *
 ProtocolConformanceDescriptor::getWitnessTable(const Metadata *type) const {
   // If needed, check the conditional requirements.
   llvm::SmallVector<const void *, 8> conditionalArgs;
-  if (hasConditionalRequirements()) {
+
+  llvm::ArrayRef<GenericParamDescriptor> genericParams;
+  if (auto typeDescriptor = type->getTypeContextDescriptor())
+    genericParams = typeDescriptor->getGenericParams();
+
+  if (hasConditionalRequirements() || !genericParams.empty()) {
     SubstGenericParametersFromMetadata substitutions(type);
     auto error = _checkGenericRequirements(
-        getConditionalRequirements(), conditionalArgs,
+        genericParams, getConditionalRequirements(), conditionalArgs,
         [&substitutions](unsigned depth, unsigned index) {
-          return substitutions.getMetadata(depth, index);
+          return substitutions.getMetadata(depth, index).Ptr;
+        },
+        [&substitutions](unsigned ordinal) {
+          return substitutions.getMetadataOrdinal(ordinal).Ptr;
         },
         [&substitutions](const Metadata *type, unsigned index) {
           return substitutions.getWitnessTable(type, index);
@@ -340,8 +349,12 @@ ProtocolConformanceDescriptor::getWitnessTable(const Metadata *type) const {
     if (error)
       return nullptr;
   }
-
+#if SWIFT_STDLIB_USE_RELATIVE_PROTOCOL_WITNESS_TABLES
+  return (const WitnessTable *)
+    swift_getWitnessTableRelative(this, type, conditionalArgs.data());
+#else
   return swift_getWitnessTable(this, type, conditionalArgs.data());
+#endif
 }
 
 namespace {
@@ -715,7 +728,7 @@ namespace {
     /// be a superclass of the given type. Returns null if this type does not
     /// match this conformance, along with the final metadata state of the
     /// superclass iterator.
-    std::pair<const Metadata *, llvm::Optional<MetadataState>>
+    std::pair<const Metadata *, std::optional<MetadataState>>
     getMatchingType(const Metadata *conformingType,
                     bool instantiateSuperclassMetadata) const {
       MaybeIncompleteSuperclassIterator superclassIterator{
@@ -723,7 +736,7 @@ namespace {
       for (; auto conformingType = superclassIterator.metadata;
            ++superclassIterator) {
         if (matches(conformingType))
-          return {conformingType, llvm::None};
+          return {conformingType, std::nullopt};
       }
 
       return {nullptr, superclassIterator.state};
@@ -987,7 +1000,7 @@ swift_conformsToProtocolMaybeInstantiateSuperclasses(
   // only look at the state after the last iteration, we might have hit a false
   // negative before that no longer shows up.
   bool hasUninstantiatedSuperclass = false;
-  auto noteFinalMetadataState = [&](llvm::Optional<MetadataState> state) {
+  auto noteFinalMetadataState = [&](std::optional<MetadataState> state) {
     hasUninstantiatedSuperclass =
         hasUninstantiatedSuperclass || state == MetadataState::Abstract;
   };
@@ -1064,7 +1077,7 @@ swift_conformsToProtocolMaybeInstantiateSuperclasses(
       // always cache them.
       ConformanceCandidate candidate(descriptor);
       const Metadata *matchingType;
-      llvm::Optional<MetadataState> finalState;
+      std::optional<MetadataState> finalState;
       std::tie(matchingType, finalState) =
           candidate.getMatchingType(type, instantiateSuperclassMetadata);
       noteFinalMetadataState(finalState);
@@ -1083,6 +1096,9 @@ swift_conformsToProtocolMaybeInstantiateSuperclasses(
         processDescriptor(*record.get());
     }
   };
+
+  auto traceState =
+      runtime::trace::protocol_conformance_scan_begin(type, protocol);
 
   auto snapshot = C.SectionsToScan.snapshot();
   if (C.scanSectionsBackwards) {
@@ -1120,6 +1136,8 @@ swift_conformsToProtocolMaybeInstantiateSuperclasses(
   }
   noteFinalMetadataState(superclassIterator.state);
 
+  traceState.end(foundWitness);
+
   // If it's for a superclass or if we didn't find anything, then add an
   // authoritative entry for this type.
   if (foundType != type)
@@ -1137,8 +1155,8 @@ swift_conformsToProtocolMaybeInstantiateSuperclasses(
 }
 
 static const WitnessTable *
-swift_conformsToProtocolImpl(const Metadata *const type,
-                             const ProtocolDescriptor *protocol) {
+swift_conformsToProtocolCommonImpl(const Metadata *const type,
+                                   const ProtocolDescriptor *protocol) {
   const WitnessTable *table;
   bool hasUninstantiatedSuperclass;
 
@@ -1159,18 +1177,41 @@ swift_conformsToProtocolImpl(const Metadata *const type,
     std::tie(table, hasUninstantiatedSuperclass) =
         swift_conformsToProtocolMaybeInstantiateSuperclasses(
             type, protocol, true /*instantiateSuperclassMetadata*/);
+
   return table;
+}
+
+static const WitnessTable *
+swift_conformsToProtocol2Impl(const Metadata *const type,
+                              const ProtocolDescriptor *protocol) {
+  protocol = swift_auth_data_non_address(
+      protocol, SpecialPointerAuthDiscriminators::ProtocolDescriptor);
+  return swift_conformsToProtocolCommonImpl(type, protocol);
+}
+
+static const WitnessTable *
+swift_conformsToProtocolImpl(const Metadata *const type,
+                             const void *protocol) {
+  // This call takes `protocol` without a ptrauth signature. We declare
+  // it as `void *` to avoid the implicit ptrauth we get from the
+  // ptrauth_struct attribute. The static_cast implicitly signs the
+  // pointer when we call through to the implementation in
+  // swift_conformsToProtocolCommon.
+  return swift_conformsToProtocolCommonImpl(
+      type, static_cast<const ProtocolDescriptor *>(protocol));
 }
 
 const ContextDescriptor *
 swift::_searchConformancesByMangledTypeName(Demangle::NodePointer node) {
+  auto traceState = runtime::trace::protocol_conformance_scan_begin(node);
+
   auto &C = Conformances.get();
 
   for (auto &section : C.SectionsToScan.snapshot()) {
     for (const auto &record : section) {
       if (auto ntd = record->getTypeDescriptor()) {
         if (_contextDescriptorMatchesMangling(ntd, node))
-          return ntd;
+          return traceState.end(ntd);
       }
     }
   }
@@ -1184,7 +1225,7 @@ bool isSwiftClassMetadataSubclass(const ClassMetadata *subclass,
   assert(subclass);
   assert(superclass);
 
-  llvm::Optional<MetadataState> subclassState = llvm::None;
+  std::optional<MetadataState> subclassState = std::nullopt;
   while (true) {
     auto response = getSuperclassForMaybeIncompleteMetadata(
         subclass, subclassState, true /*instantiateSuperclassMetadata*/);
@@ -1269,121 +1310,637 @@ static bool isSubclass(const Metadata *subclass, const Metadata *superclass) {
                                       });
 }
 
-llvm::Optional<TypeLookupError> swift::_checkGenericRequirements(
-    llvm::ArrayRef<GenericRequirementDescriptor> requirements,
+static bool isSubclassOrExistential(const Metadata *subclass,
+                                    const Metadata *superclass) {
+  // If the type which is constrained to a base class is an existential
+  // type, and if that existential type includes a superclass constraint,
+  // just require that the superclass by which the existential is
+  // constrained is a subclass of the base class.
+  if (auto *existential = dyn_cast<ExistentialTypeMetadata>(subclass)) {
+    if (auto *superclassConstraint = existential->getSuperclassConstraint())
+      subclass = superclassConstraint;
+  }
+
+  return isSubclass(subclass, superclass);
+}
+
+static std::optional<TypeLookupError>
+satisfiesLayoutConstraint(const GenericRequirementDescriptor &req,
+                          const Metadata *subjectType) {
+  switch (req.getLayout()) {
+  case GenericRequirementLayoutKind::Class:
+    if (!subjectType->satisfiesClassConstraint()) {
+      return TYPE_LOOKUP_ERROR_FMT(
+          "subject type %.*s does not satisfy class constraint",
+          (int)req.getParam().size(), req.getParam().data());
+    }
+    return std::nullopt;
+  }
+
+  // Unknown layout.
+  return TYPE_LOOKUP_ERROR_FMT("unknown layout kind %u",
+                               static_cast<uint32_t>(req.getLayout()));
+}
+
+SWIFT_CC(swift)
+SWIFT_RUNTIME_STDLIB_SPI
+bool swift::_swift_class_isSubclass(const Metadata *subclass,
+                                    const Metadata *superclass) {
+  return isSubclass(subclass, superclass);
+}
+
+static std::optional<TypeLookupError>
+checkInvertibleRequirements(const Metadata *type,
+                              InvertibleProtocolSet ignored);
+
+static std::optional<TypeLookupError>
+checkGenericRequirement(
+    const GenericRequirementDescriptor &req,
     llvm::SmallVectorImpl<const void *> &extraArguments,
     SubstGenericParameterFn substGenericParam,
-    SubstDependentWitnessTableFn substWitnessTable) {
-  for (const auto &req : requirements) {
-    // Make sure we understand the requirement we're dealing with.
-    if (!req.hasKnownKind())
-      return TypeLookupError("unknown kind");
+    SubstDependentWitnessTableFn substWitnessTable,
+    llvm::SmallVectorImpl<InvertibleProtocolSet> &suppressed) {
+  assert(!req.getFlags().isPackRequirement());
 
-    // Resolve the subject generic parameter.
+  // Make sure we understand the requirement we're dealing with.
+  if (!req.hasKnownKind())
+    return TypeLookupError("unknown kind");
+
+  // Resolve the subject generic parameter.
+  auto result = swift_getTypeByMangledName(
+      MetadataState::Abstract, req.getParam(), extraArguments.data(),
+      substGenericParam, substWitnessTable);
+  if (result.getError())
+    return *result.getError();
+  const Metadata *subjectType = result.getType().getMetadata();
+
+  // Check the requirement.
+  switch (req.getKind()) {
+  case GenericRequirementKind::Protocol: {
+    const WitnessTable *witnessTable = nullptr;
+    if (!_conformsToProtocol(nullptr, subjectType, req.getProtocol(),
+                             &witnessTable)) {
+      const char *protoName =
+          req.getProtocol() ? req.getProtocol().getName() : "<null>";
+      return TYPE_LOOKUP_ERROR_FMT(
+          "subject type %.*s does not conform to protocol %s",
+          (int)req.getParam().size(), req.getParam().data(), protoName);
+    }
+
+    // If we need a witness table, add it.
+    if (req.getProtocol().needsWitnessTable()) {
+      assert(witnessTable);
+      extraArguments.push_back(witnessTable);
+    }
+
+    return std::nullopt;
+  }
+
+  case GenericRequirementKind::SameType: {
+    // Demangle the second type under the given substitutions.
     auto result = swift_getTypeByMangledName(
-        MetadataState::Abstract, req.getParam(), extraArguments.data(),
-        substGenericParam, substWitnessTable);
+        MetadataState::Abstract, req.getMangledTypeName(),
+        extraArguments.data(), substGenericParam, substWitnessTable);
     if (result.getError())
       return *result.getError();
-    const Metadata *subjectType = result.getType().getMetadata();
+    auto otherType = result.getType().getMetadata();
 
-    // Check the requirement.
-    switch (req.getKind()) {
-    case GenericRequirementKind::Protocol: {
+    // Check that the types are equivalent.
+    if (subjectType != otherType) {
+      return TYPE_LOOKUP_ERROR_FMT(
+          "subject type %.*s does not match %.*s", (int)req.getParam().size(),
+          req.getParam().data(), (int)req.getMangledTypeName().size(),
+          req.getMangledTypeName().data());
+    }
+
+    return std::nullopt;
+  }
+
+  case GenericRequirementKind::Layout: {
+    return satisfiesLayoutConstraint(req, subjectType);
+  }
+
+  case GenericRequirementKind::BaseClass: {
+    // Demangle the base type under the given substitutions.
+    auto result = swift_getTypeByMangledName(
+        MetadataState::Abstract, req.getMangledTypeName(),
+        extraArguments.data(), substGenericParam, substWitnessTable);
+    if (result.getError())
+      return *result.getError();
+    auto baseType = result.getType().getMetadata();
+
+    if (!isSubclassOrExistential(subjectType, baseType))
+      return TYPE_LOOKUP_ERROR_FMT(
+          "%.*s is not subclass of %.*s", (int)req.getParam().size(),
+          req.getParam().data(), (int)req.getMangledTypeName().size(),
+          req.getMangledTypeName().data());
+
+    return std::nullopt;
+  }
+
+  case GenericRequirementKind::SameConformance: {
+    // FIXME: Implement this check.
+    return std::nullopt;
+  }
+
+  case GenericRequirementKind::SameShape: {
+    return TYPE_LOOKUP_ERROR_FMT("can't have same-shape requirement where "
+                                 "subject type is not a pack");
+  }
+  case GenericRequirementKind::InvertedProtocols: {
+    uint16_t index = req.getInvertedProtocolsGenericParamIndex();
+    if (index == 0xFFFF) {
+      return checkInvertibleRequirements(subjectType,
+                                         req.getInvertedProtocols());
+    }
+
+    // Expand the suppression set so we can record these protocols.
+    if (index >= suppressed.size()) {
+      suppressed.resize(index + 1, InvertibleProtocolSet());
+    }
+
+    // Record these suppressed protocols for this generic parameter.
+    suppressed[index] |= req.getInvertedProtocols();
+    return std::nullopt;
+  }
+  }
+
+  // Unknown generic requirement kind.
+  return TYPE_LOOKUP_ERROR_FMT("unknown generic requirement kind %u",
+                               (unsigned)req.getKind());
+}
+
+static std::optional<TypeLookupError>
+checkGenericPackRequirement(
+    const GenericRequirementDescriptor &req,
+    llvm::SmallVectorImpl<const void *> &extraArguments,
+    SubstGenericParameterFn substGenericParam,
+    SubstDependentWitnessTableFn substWitnessTable,
+    llvm::SmallVectorImpl<InvertibleProtocolSet> &suppressed) {
+  assert(req.getFlags().isPackRequirement());
+
+  // Make sure we understand the requirement we're dealing with.
+  if (!req.hasKnownKind())
+    return TypeLookupError("unknown kind");
+
+  // Resolve the subject generic parameter.
+  auto result = swift::getTypePackByMangledName(
+      req.getParam(), extraArguments.data(),
+      substGenericParam, substWitnessTable);
+  if (result.getError())
+    return *result.getError();
+  MetadataPackPointer subjectType = result.getType();
+  assert(subjectType.getLifetime() == PackLifetime::OnHeap);
+
+  // Check the requirement.
+  switch (req.getKind()) {
+  case GenericRequirementKind::Protocol: {
+    llvm::SmallVector<const WitnessTable *, 4> witnessTables;
+
+    // Look up the conformance of each pack element to the protocol.
+    for (size_t i = 0, e = subjectType.getNumElements(); i < e; ++i) {
+      const Metadata *elt = subjectType.getElements()[i];
+
       const WitnessTable *witnessTable = nullptr;
-      if (!_conformsToProtocol(nullptr, subjectType, req.getProtocol(),
+      if (!_conformsToProtocol(nullptr, elt, req.getProtocol(),
                                &witnessTable)) {
         const char *protoName =
             req.getProtocol() ? req.getProtocol().getName() : "<null>";
         return TYPE_LOOKUP_ERROR_FMT(
-            "subject type %.*s does not conform to protocol %s",
-            (int)req.getParam().size(), req.getParam().data(), protoName);
+            "subject type %.*s does not conform to protocol %s at pack index %zu",
+            (int)req.getParam().size(), req.getParam().data(), protoName, i);
       }
 
-      // If we need a witness table, add it.
-      if (req.getProtocol().needsWitnessTable()) {
-        assert(witnessTable);
-        extraArguments.push_back(witnessTable);
-      }
-
-      continue;
+      if (req.getProtocol().needsWitnessTable())
+        witnessTables.push_back(witnessTable);
     }
 
-    case GenericRequirementKind::SameType: {
-      // Demangle the second type under the given substitutions.
-      auto result = swift_getTypeByMangledName(
-          MetadataState::Abstract, req.getMangledTypeName(),
-          extraArguments.data(), substGenericParam, substWitnessTable);
-      if (result.getError())
-        return *result.getError();
-      auto otherType = result.getType().getMetadata();
+    // If we need a witness table, add it.
+    if (req.getProtocol().needsWitnessTable()) {
+      assert(witnessTables.size() == subjectType.getNumElements());
+      auto *pack = swift_allocateWitnessTablePack(witnessTables.data(),
+                                                  witnessTables.size());
+      extraArguments.push_back(pack);
+    }
 
-      assert(!req.getFlags().hasExtraArgument());
+    return std::nullopt;
+  }
 
-      // Check that the types are equivalent.
-      if (subjectType != otherType)
+  case GenericRequirementKind::SameType: {
+    // Resolve the constraint generic parameter.
+    auto result = swift::getTypePackByMangledName(
+        req.getMangledTypeName(), extraArguments.data(),
+        substGenericParam, substWitnessTable);
+    if (result.getError())
+      return *result.getError();
+    MetadataPackPointer constraintType = result.getType();
+    assert(constraintType.getLifetime() == PackLifetime::OnHeap);
+
+    if (subjectType.getNumElements() != constraintType.getNumElements()) {
+      return TYPE_LOOKUP_ERROR_FMT(
+            "mismatched pack lengths in same-type pack requirement %.*s: %zu vs %zu",
+            (int)req.getParam().size(), req.getParam().data(),
+            subjectType.getNumElements(), constraintType.getNumElements());
+    }
+
+    for (size_t i = 0, e = subjectType.getNumElements(); i < e; ++i) {
+      auto *subjectElt = subjectType.getElements()[i];
+      auto *constraintElt = constraintType.getElements()[i];
+
+      if (subjectElt != constraintElt) {
         return TYPE_LOOKUP_ERROR_FMT(
-            "subject type %.*s does not match %.*s", (int)req.getParam().size(),
+            "subject type %.*s does not match %.*s at pack index %zu",
+            (int)req.getParam().size(),
             req.getParam().data(), (int)req.getMangledTypeName().size(),
-            req.getMangledTypeName().data());
-
-      continue;
+            req.getMangledTypeName().data(), i);
+      }
     }
 
-    case GenericRequirementKind::Layout: {
-      switch (req.getLayout()) {
-      case GenericRequirementLayoutKind::Class:
-        if (!subjectType->satisfiesClassConstraint())
-          return TYPE_LOOKUP_ERROR_FMT(
-              "subject type %.*s does not satisfy class constraint",
-              (int)req.getParam().size(), req.getParam().data());
+    return std::nullopt;
+  }
+
+  case GenericRequirementKind::Layout: {
+    for (size_t i = 0, e = subjectType.getNumElements(); i < e; ++i) {
+      const Metadata *elt = subjectType.getElements()[i];
+      if (auto result = satisfiesLayoutConstraint(req, elt))
+        return result;
+    }
+
+    return std::nullopt;
+  }
+
+  case GenericRequirementKind::BaseClass: {
+    // Demangle the base type under the given substitutions.
+    auto result = swift_getTypeByMangledName(
+        MetadataState::Abstract, req.getMangledTypeName(),
+        extraArguments.data(), substGenericParam, substWitnessTable);
+    if (result.getError())
+      return *result.getError();
+    auto baseType = result.getType().getMetadata();
+
+    // Check that each pack element inherits from the base class.
+    for (size_t i = 0, e = subjectType.getNumElements(); i < e; ++i) {
+      const Metadata *elt = subjectType.getElements()[i];
+
+      if (!isSubclassOrExistential(elt, baseType))
+      return TYPE_LOOKUP_ERROR_FMT(
+          "%.*s is not subclass of %.*s at pack index %zu",
+          (int)req.getParam().size(),
+          req.getParam().data(), (int)req.getMangledTypeName().size(),
+          req.getMangledTypeName().data(), i);
+    }
+
+    return std::nullopt;
+  }
+
+  case GenericRequirementKind::SameConformance: {
+    // FIXME: Implement this check.
+    return std::nullopt;
+  }
+
+  case GenericRequirementKind::SameShape: {
+    auto result = swift::getTypePackByMangledName(
+        req.getMangledTypeName(), extraArguments.data(),
+        substGenericParam, substWitnessTable);
+    if (result.getError())
+      return *result.getError();
+    MetadataPackPointer otherType = result.getType();
+    assert(otherType.getLifetime() == PackLifetime::OnHeap);
+
+    if (subjectType.getNumElements() != otherType.getNumElements()) {
+      return TYPE_LOOKUP_ERROR_FMT("same-shape requirement unsatisfied; "
+                                   "%zu != %zu",
+                                   subjectType.getNumElements(),
+                                   otherType.getNumElements() );
+    }
+
+    return std::nullopt;
+  }
+
+  case GenericRequirementKind::InvertedProtocols: {
+    uint16_t index = req.getInvertedProtocolsGenericParamIndex();
+    if (index == 0xFFFF) {
+      // Check that each pack element meets the invertible requirements.
+      for (size_t i = 0, e = subjectType.getNumElements(); i < e; ++i) {
+        const Metadata *elt = subjectType.getElements()[i];
+
+        if (auto error = checkInvertibleRequirements(
+                elt, req.getInvertedProtocols()))
+          return error;
+      }
+
+      return std::nullopt;
+    }
+
+    // Expand the suppression set so we can record these protocols.
+    if (index >= suppressed.size()) {
+      suppressed.resize(index + 1, InvertibleProtocolSet());
+    }
+
+    // Record these suppressed protocols for this generic parameter.
+    suppressed[index] |= req.getInvertedProtocols();
+    return std::nullopt;
+  }
+  }
+
+  // Unknown generic requirement kind.
+  return TYPE_LOOKUP_ERROR_FMT("unknown generic requirement kind %u",
+                               (unsigned)req.getKind());
+}
+
+static std::optional<TypeLookupError>
+checkInvertibleRequirementsStructural(const Metadata *type,
+                                        InvertibleProtocolSet ignored) {
+  switch (type->getKind()) {
+  case MetadataKind::Class:
+  case MetadataKind::Struct:
+  case MetadataKind::Enum:
+  case MetadataKind::Optional:
+  case MetadataKind::ForeignClass:
+  case MetadataKind::ForeignReferenceType:
+  case MetadataKind::ObjCClassWrapper:
+    // All handled via context descriptor in the caller.
+    return std::nullopt;
+
+  case MetadataKind::HeapLocalVariable:
+  case MetadataKind::Opaque:
+  case MetadataKind::HeapGenericLocalVariable:
+  case MetadataKind::ErrorObject:
+  case MetadataKind::Task:
+  case MetadataKind::Job:
+    // Not part of the user-visible type system; assumed to handle all
+    // invertible requirements.
+    return std::nullopt;
+
+  case MetadataKind::Tuple: {
+    // Check every element type in the tuple.
+    auto tupleMetadata = cast<TupleTypeMetadata>(type);
+    for (unsigned i = 0, n = tupleMetadata->NumElements; i != n; ++i) {
+      if (auto error =
+              checkInvertibleRequirements(&*tupleMetadata->getElement(i).Type,
+                                            ignored))
+        return error;
+    }
+    return std::nullopt;
+  }
+
+  case MetadataKind::Function: {
+    auto functionMetadata = cast<FunctionTypeMetadata>(type);
+
+    // Determine the set of protocols that are suppressed by the function
+    // type.
+    InvertibleProtocolSet suppressed;
+    if (functionMetadata->hasExtendedFlags()) {
+      suppressed = functionMetadata->getExtendedFlags()
+          .getInvertedProtocols();
+    }
+
+    // Map the existing "noescape" bit as a suppressed protocol, when
+    // appropriate.
+    switch (functionMetadata->getConvention()) {
+    case FunctionMetadataConvention::Swift:
+      // Swift function types can be non-escaping, so honor the bit.
+      if (!functionMetadata->isEscaping())
+        suppressed.insert(InvertibleProtocolKind::Escapable);
+      break;
+
+    case FunctionMetadataConvention::Block:
+      // Objective-C block types don't encode non-escaping-ness in metadata,
+      // so we assume that they are always escaping.
+      break;
+
+    case FunctionMetadataConvention::Thin:
+    case FunctionMetadataConvention::CFunctionPointer:
+      // Thin and C function pointers have no captures, so whether they
+      // escape is irrelevant.
+      break;
+    }
+
+    auto missing = suppressed - ignored;
+    if (!missing.empty()) {
+      return TYPE_LOOKUP_ERROR_FMT(
+          "function type missing invertible protocols %x", missing.rawBits());
+    }
+
+    return std::nullopt;
+  }
+
+  case MetadataKind::ExtendedExistential: {
+    auto existential = cast<ExtendedExistentialTypeMetadata>(type);
+    auto &shape = *existential->Shape;
+    llvm::ArrayRef<GenericRequirementDescriptor> reqs(
+        shape.getReqSigRequirements(), shape.getNumReqSigRequirements());
+    // Look for any suppressed protocol requirements. If the existential
+    // has suppressed a protocol that is not ignored, then the existential
+    // does not meet the specified requirements.
+    for (const auto& req : reqs) {
+      if (req.getKind() != GenericRequirementKind::InvertedProtocols)
         continue;
-      }
 
-      // Unknown layout.
-      return TYPE_LOOKUP_ERROR_FMT("unknown layout kind %u", req.getLayout());
-    }
-
-    case GenericRequirementKind::BaseClass: {
-      // Demangle the base type under the given substitutions.
-      auto result = swift_getTypeByMangledName(
-          MetadataState::Abstract, req.getMangledTypeName(),
-          extraArguments.data(), substGenericParam, substWitnessTable);
-      if (result.getError())
-        return *result.getError();
-      auto baseType = result.getType().getMetadata();
-
-      // If the type which is constrained to a base class is an existential 
-      // type, and if that existential type includes a superclass constraint,
-      // just require that the superclass by which the existential is
-      // constrained is a subclass of the base class.
-      if (auto *existential = dyn_cast<ExistentialTypeMetadata>(subjectType)) {
-        if (auto *superclassConstraint = existential->getSuperclassConstraint())
-          subjectType = superclassConstraint;
-      }
-
-      if (!isSubclass(subjectType, baseType))
+      auto suppressed = req.getInvertedProtocols();
+      auto missing = suppressed - ignored;
+      if (!missing.empty()) {
         return TYPE_LOOKUP_ERROR_FMT(
-            "%.*s is not subclass of %.*s", (int)req.getParam().size(),
-            req.getParam().data(), (int)req.getMangledTypeName().size(),
-            req.getMangledTypeName().data());
+            "existential type missing invertible protocols %x",
+            missing.rawBits());
+      }
+    }
 
+    return std::nullopt;
+  }
+
+  case MetadataKind::Metatype:
+  case MetadataKind::ExistentialMetatype:
+    // Metatypes themselves can't have invertible protocols.
+    return std::nullopt;
+
+  case MetadataKind::Existential:
+    // The existential representation has no room for specifying any
+    // suppressed requirements, so it always succeeds.
+    return std::nullopt;
+
+  case MetadataKind::LastEnumerated:
+    break;
+  }
+
+  // Just accept any unknown types.
+  return std::nullopt;
+}
+
+/// Check that the given `type` meets all invertible protocol requirements
+/// that haven't been explicitly suppressed by `ignored`.
+std::optional<TypeLookupError>
+checkInvertibleRequirements(const Metadata *type, 
+                              InvertibleProtocolSet ignored) {
+  auto contextDescriptor = type->getTypeContextDescriptor();
+  if (!contextDescriptor)
+    return checkInvertibleRequirementsStructural(type, ignored);
+
+  // If no conformances are suppressed, then it conforms to everything.
+  if (!contextDescriptor->hasInvertibleProtocols()) {
+    return std::nullopt;
+  }
+
+  // If this type has suppressed conformances, but we can't find them...
+  // bail out.
+  auto InvertedProtocols = contextDescriptor->getInvertedProtocols();
+  if (!InvertedProtocols) {
+    return TYPE_LOOKUP_ERROR_FMT("unable to find suppressed protocols");
+  }
+
+  // Determine the set of invertible conformances that the type has
+  // suppressed but aren't being ignored. These are missing conformances
+  // based on the primary definition of the type.
+  InvertibleProtocolSet missingConformances = *InvertedProtocols - ignored;
+  if (missingConformances.empty())
+    return std::nullopt;
+
+  // If the context descriptor is not generic, there are no conditional
+  // conformances: fail.
+  if (!contextDescriptor->isGeneric()) {
+    return TYPE_LOOKUP_ERROR_FMT("type missing invertible conformances %x",
+                                 missingConformances.rawBits());
+  }
+
+  auto genericContext = contextDescriptor->getGenericContext();
+  if (!genericContext ||
+      !genericContext->hasConditionalInvertedProtocols()) {
+    return TYPE_LOOKUP_ERROR_FMT("type missing invertible conformances %x",
+                                 missingConformances.rawBits());
+  }
+
+  // If there are missing conformances that do not have corresponding
+  // conditional conformances, then the nominal type does not satisfy these
+  // suppressed conformances. We're done.
+  auto conditionalSuppressed =
+      genericContext->getConditionalInvertedProtocols();
+  auto alwaysMissingConformances = missingConformances - conditionalSuppressed;
+  if (!alwaysMissingConformances.empty()) {
+    return TYPE_LOOKUP_ERROR_FMT("type missing invertible conformances %x",
+                                 alwaysMissingConformances.rawBits());
+  }
+
+  // Now we need to check the conditional conformances for each of the
+  // missing conformances.
+  for (auto invertibleKind : missingConformances) {
+    // Get the conditional requirements.
+    // Note: This will end up being quadratic in the number of invertible
+    // protocols. That number is small (currently 2) and cannot be more than 16,
+    // but if it's a problem we can switch to a different strategy.
+    auto condReqs =
+        genericContext->getConditionalInvertibleProtocolRequirementsFor(
+                                                             invertibleKind);
+
+    // Check the conditional requirements.
+    llvm::ArrayRef<GenericRequirementDescriptor> requirements(
+        reinterpret_cast<const GenericRequirementDescriptor *>(condReqs.data()),
+        condReqs.size());
+    SubstGenericParametersFromMetadata substFn(type);
+    llvm::SmallVector<const void *, 1> extraArguments;
+    auto error = _checkGenericRequirements(
+        genericContext->getGenericParams(),
+        requirements, extraArguments,
+        [&substFn](unsigned depth, unsigned index) {
+          return substFn.getMetadata(depth, index).Ptr;
+        },
+        [&substFn](unsigned ordinal) {
+          return substFn.getMetadataOrdinal(ordinal).Ptr;
+        },
+        [&substFn](const Metadata *type, unsigned index) {
+          return substFn.getWitnessTable(type, index);
+        });
+    if (error)
+      return error;
+  }
+
+  return std::nullopt;
+}
+
+std::optional<TypeLookupError> swift::_checkGenericRequirements(
+    llvm::ArrayRef<GenericParamDescriptor> genericParams,
+    llvm::ArrayRef<GenericRequirementDescriptor> requirements,
+    llvm::SmallVectorImpl<const void *> &extraArguments,
+    SubstGenericParameterFn substGenericParam,
+    SubstGenericParameterOrdinalFn substGenericParamOrdinal,
+    SubstDependentWitnessTableFn substWitnessTable) {
+  // The suppressed conformances for each generic parameter.
+  llvm::SmallVector<InvertibleProtocolSet, 4> allSuppressed;
+
+  for (const auto &req : requirements) {
+    if (req.getFlags().isPackRequirement()) {
+      auto error = checkGenericPackRequirement(req, extraArguments,
+                                               substGenericParam,
+                                               substWitnessTable,
+                                               allSuppressed);
+      if (error)
+        return error;
+    } else {
+      auto error = checkGenericRequirement(req, extraArguments,
+                                           substGenericParam,
+                                           substWitnessTable,
+                                           allSuppressed);
+      if (error)
+        return error;
+    }
+  }
+
+  // Now, check all of the generic arguments for invertible protocols.
+  unsigned numGenericParams = genericParams.size();
+  for (unsigned index = 0; index != numGenericParams; ++index) {
+    // Non-key arguments don't need to be checked, because they are
+    // aliased to another type.
+    if (!genericParams[index].hasKeyArgument())
       continue;
+
+    InvertibleProtocolSet suppressed;
+    if (index < allSuppressed.size())
+      suppressed = allSuppressed[index];
+
+    MetadataOrPack metadataOrPack(substGenericParamOrdinal(index));
+    switch (genericParams[index].getKind()) {
+    case GenericParamKind::Type: {
+      if (!metadataOrPack || metadataOrPack.isMetadataPack()) {
+        return TYPE_LOOKUP_ERROR_FMT(
+            "unexpected pack for generic parameter %u", index);
+      }
+
+      auto metadata = metadataOrPack.getMetadata();
+      if (auto error = checkInvertibleRequirements(metadata, suppressed))
+        return error;
+
+      break;
     }
 
-    case GenericRequirementKind::SameConformance: {
-      // FIXME: Implement this check.
-      continue;
-    }
+    case GenericParamKind::TypePack: {
+      // NULL can be used to indicate an empty pack.
+      if (!metadataOrPack)
+        break;
+
+      if (metadataOrPack.isMetadata()) {
+        return TYPE_LOOKUP_ERROR_FMT(
+            "unexpected metadata for generic pack parameter %u", index);
+      }
+
+      auto pack = metadataOrPack.getMetadataPack();
+      if (pack.getElements() != 0) {
+        llvm::ArrayRef<const Metadata *> elements(
+            pack.getElements(), pack.getNumElements());
+        for (auto element : elements) {
+          if (auto error = checkInvertibleRequirements(element, suppressed))
+            return error;
+        }
+      }
+      break;
     }
 
-    // Unknown generic requirement kind.
-    return TYPE_LOOKUP_ERROR_FMT("unknown generic requirement kind %u",
-                                 (unsigned)req.getKind());
+    default:
+      return TYPE_LOOKUP_ERROR_FMT("unknown generic parameter kind %u",
+                                   index);
+    }
   }
 
   // Success!
-  return llvm::None;
+  return std::nullopt;
 }
 
 const Metadata *swift::findConformingSuperclass(

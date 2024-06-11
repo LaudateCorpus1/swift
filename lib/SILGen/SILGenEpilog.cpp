@@ -20,9 +20,9 @@
 using namespace swift;
 using namespace Lowering;
 
-void SILGenFunction::prepareEpilog(Optional<Type> directResultType,
-                                   bool isThrowing,
-                                   CleanupLocation CleanupL) {
+void SILGenFunction::prepareEpilog(
+    DeclContext *DC, std::optional<Type> directResultType,
+    std::optional<Type> errorType, CleanupLocation CleanupL) {
   auto *epilogBB = createBasicBlock();
 
   // If we have any direct results, receive them via BB arguments.
@@ -63,8 +63,14 @@ void SILGenFunction::prepareEpilog(Optional<Type> directResultType,
 
   ReturnDest = JumpDest(epilogBB, getCleanupsDepth(), CleanupL);
 
-  if (isThrowing) {
-    prepareRethrowEpilog(CleanupL);
+  if (errorType) {
+    auto genericSig = DC->getGenericSignatureOfContext();
+    AbstractionPattern origErrorType = TypeContext
+      ? *TypeContext->OrigType.getFunctionThrownErrorType()
+      : AbstractionPattern(genericSig.getCanonicalSignature(),
+                           (*errorType)->getCanonicalType());
+
+    prepareRethrowEpilog(DC, origErrorType, *errorType, CleanupL);
   }
 
   if (F.getLoweredFunctionType()->isCoroutine()) {
@@ -72,11 +78,18 @@ void SILGenFunction::prepareEpilog(Optional<Type> directResultType,
   }
 }
 
-void SILGenFunction::prepareRethrowEpilog(CleanupLocation cleanupLoc) {
-  auto exnType = SILType::getExceptionType(getASTContext());
+void SILGenFunction::prepareRethrowEpilog(
+    DeclContext *dc, AbstractionPattern origErrorType, Type errorType,
+    CleanupLocation cleanupLoc) {
+
   SILBasicBlock *rethrowBB = createBasicBlock(FunctionSection::Postmatter);
-  rethrowBB->createPhiArgument(exnType, OwnershipKind::Owned);
-  ThrowDest = JumpDest(rethrowBB, getCleanupsDepth(), cleanupLoc);
+  if (!IndirectErrorResult) {
+    SILType loweredErrorType = getLoweredType(origErrorType, errorType);
+    rethrowBB->createPhiArgument(loweredErrorType, OwnershipKind::Owned);
+  }
+
+  ThrowDest = JumpDest(rethrowBB, getCleanupsDepth(), cleanupLoc,
+                       ThrownErrorInfo(IndirectErrorResult));
 }
 
 void SILGenFunction::prepareCoroutineUnwindEpilog(CleanupLocation cleanupLoc) {
@@ -136,7 +149,7 @@ static SILValue buildReturnValue(SILGenFunction &SGF, SILLocation loc,
     // nested tuples.
     auto resultType = SGF.F.getLoweredType(SGF.F.mapTypeIntoContext(
         fnConv.getSILResultType(SGF.getTypeExpansionContext())));
-    SmallVector<Optional<SILValue>, 4> mutableDirectResult;
+    SmallVector<std::optional<SILValue>, 4> mutableDirectResult;
     for (auto result : directResults) {
       mutableDirectResult.push_back({result});
     }
@@ -170,7 +183,7 @@ static SILValue buildReturnValue(SILGenFunction &SGF, SILLocation loc,
   return SGF.B.createTuple(loc, resultType, directResults);
 }
 
-static Optional<SILLocation>
+static std::optional<SILLocation>
 prepareForEpilogBlockEmission(SILGenFunction &SGF, SILLocation topLevel,
                               SILBasicBlock *epilogBB,
                               SmallVectorImpl<SILValue> &directResults) {
@@ -191,7 +204,7 @@ prepareForEpilogBlockEmission(SILGenFunction &SGF, SILLocation topLevel,
 
     // If the current bb is terminated then the epilog is just unreachable.
     if (!SGF.B.hasValidInsertionPoint())
-      return None;
+      return std::nullopt;
 
     // We emit the epilog at the current insertion point.
     return implicitReturnFromTopLevel;
@@ -215,7 +228,7 @@ prepareForEpilogBlockEmission(SILGenFunction &SGF, SILLocation topLevel,
       epilogBB->getArgument(index)->replaceAllUsesWith(result);
     }
 
-    Optional<SILLocation> returnLoc;
+    std::optional<SILLocation> returnLoc;
     // If we are optimizing, we should use the return location from the single,
     // previously processed, return statement if any.
     if (predBranch->getLoc().is<ReturnLocation>()) {
@@ -258,7 +271,7 @@ prepareForEpilogBlockEmission(SILGenFunction &SGF, SILLocation topLevel,
   return cleanupLoc;
 }
 
-std::pair<Optional<SILValue>, SILLocation>
+std::pair<std::optional<SILValue>, SILLocation>
 SILGenFunction::emitEpilogBB(SILLocation topLevel) {
   assert(ReturnDest.getBlock() && "no epilog bb prepared?!");
   SILBasicBlock *epilogBB = ReturnDest.getBlock();
@@ -270,7 +283,7 @@ SILGenFunction::emitEpilogBB(SILLocation topLevel) {
   auto returnLoc =
       prepareForEpilogBlockEmission(*this, topLevel, epilogBB, directResults);
   if (!returnLoc.has_value()) {
-    return {None, topLevel};
+    return {std::nullopt, topLevel};
   }
 
   // Emit top-level cleanups into the epilog block.
@@ -290,7 +303,7 @@ SILGenFunction::emitEpilogBB(SILLocation topLevel) {
     assert(directResults.size() ==
            F.getConventions().getNumExpandedDirectSILResults(
                getTypeExpansionContext()));
-    returnValue = buildReturnValue(*this, topLevel, directResults);
+    returnValue = buildReturnValue(*this, cleanupLoc, directResults);
   }
 
   return {returnValue, *returnLoc};
@@ -298,7 +311,7 @@ SILGenFunction::emitEpilogBB(SILLocation topLevel) {
 
 SILLocation SILGenFunction::
 emitEpilog(SILLocation TopLevel, bool UsesCustomEpilog) {
-  Optional<SILValue> maybeReturnValue;
+  std::optional<SILValue> maybeReturnValue;
   SILLocation returnLoc(TopLevel);
   std::tie(maybeReturnValue, returnLoc) = emitEpilogBB(TopLevel);
 
@@ -389,12 +402,21 @@ static bool prepareExtraEpilog(SILGenFunction &SGF, JumpDest &dest,
 void SILGenFunction::emitRethrowEpilog(SILLocation topLevel) {
   SILValue exn;
   SILLocation throwLoc = topLevel;
-  if (!prepareExtraEpilog(*this, ThrowDest, throwLoc, &exn))
+
+  if (!prepareExtraEpilog(*this, ThrowDest, throwLoc,
+                          !IndirectErrorResult ? &exn : nullptr)) {
     return;
+  }
 
   Cleanups.emitCleanupsForReturn(ThrowDest.getCleanupLocation(), IsForUnwind);
 
-  B.createThrow(CleanupLocation(throwLoc), exn);
+  // FIXME: opaque values
+  if (!IndirectErrorResult) {
+    B.createThrow(CleanupLocation(throwLoc), exn);
+  } else {
+    assert(IndirectErrorResult);
+    B.createThrowAddr(CleanupLocation(throwLoc));
+  }
 
   ThrowDest = JumpDest::invalid();
 }

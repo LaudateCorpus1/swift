@@ -7,13 +7,13 @@
 # See http://swift.org/CONTRIBUTORS.txt for Swift project authors
 
 set(dependencies)
-list(APPEND dependencies Basic SIL Parse)
+list(APPEND dependencies Basic SIL)
 
 add_swift_compiler_module(Optimizer DEPENDS ${dependencies})
 
 add_subdirectory(Analysis)
 add_subdirectory(DataStructures)
-add_subdirectory(InstructionPasses)
+add_subdirectory(InstructionSimplification)
 add_subdirectory(PassManager)
 add_subdirectory(ModulePasses)
 add_subdirectory(FunctionPasses)

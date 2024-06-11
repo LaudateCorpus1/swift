@@ -203,7 +203,7 @@ bool SwiftLookupTable::contextRequiresName(ContextKind kind) {
 }
 
 /// Try to translate the given Clang declaration into a context.
-static Optional<SwiftLookupTable::StoredContext>
+static std::optional<SwiftLookupTable::StoredContext>
 translateDeclToContext(clang::NamedDecl *decl) {
   // Tag declaration.
   if (auto tag = dyn_cast<clang::TagDecl>(decl)) {
@@ -223,7 +223,7 @@ translateDeclToContext(clang::NamedDecl *decl) {
       }
     }
 
-    return None;
+    return std::nullopt;
   }
 
   // Namespace declaration.
@@ -231,7 +231,7 @@ translateDeclToContext(clang::NamedDecl *decl) {
     if (namespaceDecl->getIdentifier())
       return std::make_pair(SwiftLookupTable::ContextKind::Tag,
                             namespaceDecl->getName());
-    return None;
+    return std::nullopt;
   }
 
   // Objective-C class context.
@@ -256,11 +256,11 @@ translateDeclToContext(clang::NamedDecl *decl) {
                           typedefName->getName());
   }
 
-  return None;
+  return std::nullopt;
 }
 
 auto SwiftLookupTable::translateDeclContext(const clang::DeclContext *dc)
-    -> Optional<SwiftLookupTable::StoredContext> {
+    -> std::optional<SwiftLookupTable::StoredContext> {
   // Translation unit context.
   if (dc->isTranslationUnit())
     return std::make_pair(ContextKind::TranslationUnit, StringRef());
@@ -282,10 +282,10 @@ auto SwiftLookupTable::translateDeclContext(const clang::DeclContext *dc)
   if (auto objcProtocol = dyn_cast<clang::ObjCProtocolDecl>(dc))
     return std::make_pair(ContextKind::ObjCProtocol, objcProtocol->getName());
 
-  return None;
+  return std::nullopt;
 }
 
-Optional<SwiftLookupTable::StoredContext>
+std::optional<SwiftLookupTable::StoredContext>
 SwiftLookupTable::translateContext(EffectiveClangContext context) {
   switch (context.getKind()) {
   case EffectiveClangContext::DeclContext: {
@@ -301,7 +301,7 @@ SwiftLookupTable::translateContext(EffectiveClangContext context) {
     if (auto decl = resolveContext(context.getUnresolvedName()))
       return translateDeclToContext(decl);
 
-    return None;
+    return std::nullopt;
   }
 
   llvm_unreachable("Invalid EffectiveClangContext.");
@@ -599,7 +599,7 @@ SwiftLookupTable::findOrCreate(TableType &Table,
 
 SmallVector<SwiftLookupTable::SingleEntry, 4>
 SwiftLookupTable::lookup(SerializedSwiftName baseName,
-                         llvm::Optional<StoredContext> searchContext) {
+                         std::optional<StoredContext> searchContext) {
   SmallVector<SwiftLookupTable::SingleEntry, 4> result;
 
   // Find the lookup table entry for this base name.
@@ -626,8 +626,8 @@ SwiftLookupTable::lookup(SerializedSwiftName baseName,
 }
 
 SmallVector<SwiftLookupTable::SingleEntry, 4>
-SwiftLookupTable::lookupGlobalsAsMembersImpl(SerializedSwiftName baseName,
-                                             llvm::Optional<StoredContext> searchContext) {
+SwiftLookupTable::lookupGlobalsAsMembersImpl(
+    SerializedSwiftName baseName, std::optional<StoredContext> searchContext) {
   SmallVector<SwiftLookupTable::SingleEntry, 4> result;
 
   // Find entries for this base name.
@@ -684,13 +684,14 @@ SwiftLookupTable::allGlobalsAsMembersInContext(StoredContext context) {
 }
 
 SmallVector<SwiftLookupTable::SingleEntry, 4>
-SwiftLookupTable::lookupGlobalsAsMembers(SerializedSwiftName baseName,
-                                         Optional<EffectiveClangContext> searchContext) {
+SwiftLookupTable::lookupGlobalsAsMembers(
+    SerializedSwiftName baseName,
+    std::optional<EffectiveClangContext> searchContext) {
   // Propagate the null search context.
   if (!searchContext)
-    return lookupGlobalsAsMembersImpl(baseName, None);
+    return lookupGlobalsAsMembersImpl(baseName, std::nullopt);
 
-  Optional<StoredContext> storedContext = translateContext(*searchContext);
+  std::optional<StoredContext> storedContext = translateContext(*searchContext);
   if (!storedContext) return { };
 
   return lookupGlobalsAsMembersImpl(baseName, *storedContext);
@@ -700,7 +701,7 @@ SmallVector<SwiftLookupTable::SingleEntry, 4>
 SwiftLookupTable::allGlobalsAsMembersInContext(EffectiveClangContext context) {
   if (!context) return { };
 
-  Optional<StoredContext> storedContext = translateContext(context);
+  std::optional<StoredContext> storedContext = translateContext(context);
   if (!storedContext) return { };
 
   return allGlobalsAsMembersInContext(*storedContext);
@@ -731,24 +732,11 @@ SwiftLookupTable::allGlobalsAsMembers() {
   return results;
 }
 
-SmallVector<SerializedSwiftName, 4>
-SwiftLookupTable::allGlobalsAsMembersBaseNames() {
-  // If we have a reader, enumerate its base names.
-  if (Reader) return Reader->getGlobalsAsMembersBaseNames();
-
-  // Otherwise, walk the lookup table.
-  SmallVector<SerializedSwiftName, 4> result;
-  for (const auto &entry : GlobalsAsMembers) {
-    result.push_back(entry.first);
-  }
-  return result;
-}
-
 SmallVector<SwiftLookupTable::SingleEntry, 4>
 SwiftLookupTable::lookup(SerializedSwiftName baseName,
                          EffectiveClangContext searchContext) {
   // Translate context.
-  Optional<StoredContext> context;
+  std::optional<StoredContext> context;
   if (searchContext) {
     context = translateContext(searchContext);
     if (!context) return { };
@@ -905,11 +893,11 @@ void SwiftLookupTable::deserializeAll() {
   if (!Reader) return;
 
   for (auto baseName : Reader->getBaseNames()) {
-    (void)lookup(baseName, None);
+    (void)lookup(baseName, std::nullopt);
   }
 
   for (auto baseName : Reader->getGlobalsAsMembersBaseNames()) {
-    (void)lookupGlobalsAsMembersImpl(baseName, None);
+    (void)lookupGlobalsAsMembersImpl(baseName, std::nullopt);
   }
 
   (void)categories();
@@ -1731,7 +1719,7 @@ SwiftLookupTableReader::create(clang::ModuleFileExtension *extension,
         reinterpret_cast<const clang::serialization::DeclID *>(blobData.data());
       unsigned numElements
         = blobData.size() / sizeof(clang::serialization::DeclID);
-      categories = llvm::makeArrayRef(start, numElements);
+      categories = llvm::ArrayRef(start, numElements);
       break;
     }
 
@@ -1976,6 +1964,10 @@ void importer::addEntryToLookupTable(SwiftLookupTable &table,
       isa<clang::ObjCCategoryDecl>(named)) {
     clang::DeclContext *dc = cast<clang::DeclContext>(named);
     for (auto member : dc->decls()) {
+      if (auto friendDecl = dyn_cast<clang::FriendDecl>(member))
+        if (auto underlyingDecl = friendDecl->getFriendDecl())
+          member = underlyingDecl;
+
       if (auto namedMember = dyn_cast<clang::NamedDecl>(member))
         addEntryToLookupTable(table, namedMember, nameImporter);
     }
@@ -2000,6 +1992,12 @@ void importer::addEntryToLookupTable(SwiftLookupTable &table,
             namedMember = def;
         addEntryToLookupTable(table, namedMember, nameImporter);
       }
+    }
+  }
+  if (auto usingDecl = dyn_cast<clang::UsingDecl>(named)) {
+    for (auto usingShadowDecl : usingDecl->shadows()) {
+      if (isa<clang::CXXMethodDecl>(usingShadowDecl->getTargetDecl()))
+        addEntryToLookupTable(table, usingShadowDecl, nameImporter);
     }
   }
 }

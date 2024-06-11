@@ -63,8 +63,7 @@ static SILBasicBlock *insertPreheader(SILLoop *L, DominanceInfo *DT,
   // Then change all of the original predecessors to target Preheader instead of
   // header.
   for (auto *Pred : Preds) {
-    replaceBranchTarget(Pred->getTerminator(), Header, Preheader,
-                        true /*PreserveArgs*/);
+    Pred->getTerminator()->replaceBranchTarget(Header, Preheader);
   }
 
   // Update dominance info.
@@ -128,8 +127,9 @@ static SILBasicBlock *insertBackedgeBlock(SILLoop *L, DominanceInfo *DT,
   // the backedge block which correspond to any PHI nodes in the header block.
   SmallVector<SILValue, 6> BBArgs;
   for (auto *BBArg : Header->getArguments()) {
-    BBArgs.push_back(BEBlock->createPhiArgument(BBArg->getType(),
-                                                BBArg->getOwnershipKind()));
+    BBArgs.push_back(BEBlock->createPhiArgument(
+        BBArg->getType(), BBArg->getOwnershipKind(), /* decl */ nullptr,
+        BBArg->isReborrow(), BBArg->hasPointerEscape()));
   }
 
   // Arbitrarily pick one of the predecessor's branch locations.
@@ -251,7 +251,21 @@ bool swift::canDuplicateLoopInstruction(SILLoop *L, SILInstruction *I) {
 
     return alloc && L->contains(alloc);
   }
-
+  // In OSSA, partial_apply is not considered stack allocating. Nonetheless,
+  // prevent it from being cloned so OSSA lowering can directly convert it to a
+  // single allocation.
+  if (auto *PA = dyn_cast<PartialApplyInst>(I)) {
+    if (PA->isOnStack()) {
+      assert(PA->getFunction()->hasOwnership());
+      return false;
+    }
+  }
+  // Like partial_apply [onstack], mark_dependence [nonescaping] creates a
+  // borrow scope. We currently assume that a set of dominated scope-ending uses
+  // can be found.
+  if (auto *MD = dyn_cast<MarkDependenceInst>(I)) {
+    return !MD->isNonEscaping();
+  }
   // CodeGen can't build ssa for objc methods.
   if (auto *Method = dyn_cast<MethodInst>(I)) {
     if (Method->getMember().isForeign) {
@@ -275,7 +289,7 @@ bool swift::canDuplicateLoopInstruction(SILLoop *L, SILInstruction *I) {
     return true;
   }
 
-  if (isa<ThrowInst>(I))
+  if (isa<ThrowInst>(I) || isa<ThrowAddrInst>(I))
     return false;
 
   // The entire access must be within the loop.
@@ -293,11 +307,17 @@ bool swift::canDuplicateLoopInstruction(SILLoop *L, SILInstruction *I) {
   if (auto BAI = dyn_cast<BeginApplyInst>(I)) {
     for (auto UI : BAI->getTokenResult()->getUses()) {
       auto User = UI->getUser();
-      assert(isa<EndApplyInst>(User) || isa<AbortApplyInst>(User));
+      assert(isa<EndApplyInst>(User) || isa<AbortApplyInst>(User) ||
+             isa<EndBorrowInst>(User));
       if (!L->contains(User))
         return false;
     }
     return true;
+  }
+
+  if (auto *bi = dyn_cast<BuiltinInst>(I)) {
+    if (bi->getBuiltinInfo().ID == BuiltinValueKind::Once)
+      return false;
   }
 
   if (isa<DynamicMethodBranchInst>(I))

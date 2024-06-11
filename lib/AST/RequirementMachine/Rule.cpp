@@ -28,17 +28,17 @@ using namespace rewriting;
 /// Note that this is meant to be used with a simplified rewrite system,
 /// where the right hand sides of rules are canonical, since this also means
 /// that T is canonical.
-Optional<Symbol> Rule::isPropertyRule() const {
+std::optional<Symbol> Rule::isPropertyRule() const {
   auto property = LHS.back();
 
   if (!property.isProperty())
-    return None;
+    return std::nullopt;
 
   if (LHS.size() - 1 != RHS.size())
-    return None;
+    return std::nullopt;
 
   if (!std::equal(RHS.begin(), RHS.end(), LHS.begin()))
-    return None;
+    return std::nullopt;
 
   return property;
 }
@@ -161,13 +161,13 @@ bool Rule::isCircularConformanceRule() const {
 ///
 /// If this rule is a protocol typealias rule, returns its name. Otherwise
 /// returns None.
-Optional<Identifier> Rule::isProtocolTypeAliasRule() const {
+std::optional<Identifier> Rule::isProtocolTypeAliasRule() const {
   if (LHS.size() != 2 && LHS.size() != 3)
-    return None;
+    return std::nullopt;
 
   if (LHS[0].getKind() != Symbol::Kind::Protocol ||
       LHS[1].getKind() != Symbol::Kind::Name)
-    return None;
+    return std::nullopt;
 
   if (LHS.size() == 2) {
     // This is the case where the underlying type is a type parameter.
@@ -178,7 +178,7 @@ Optional<Identifier> Rule::isProtocolTypeAliasRule() const {
       if (RHS.size() != 2 ||
           RHS[0] != LHS[0] ||
           RHS[1].getKind() != Symbol::Kind::Name) {
-        return None;
+        return std::nullopt;
       }
     }
   } else {
@@ -187,7 +187,7 @@ Optional<Identifier> Rule::isProtocolTypeAliasRule() const {
 
     auto prop = isPropertyRule();
     if (!prop || prop->getKind() != Symbol::Kind::ConcreteType)
-      return None;
+      return std::nullopt;
   }
 
   return LHS[1].getName();
@@ -263,8 +263,8 @@ unsigned Rule::getNesting() const {
 }
 
 /// Linear order on rules; compares LHS followed by RHS.
-Optional<int> Rule::compare(const Rule &other, RewriteContext &ctx) const {
-  Optional<int> compare = LHS.compare(other.LHS, ctx);
+std::optional<int> Rule::compare(const Rule &other, RewriteContext &ctx) const {
+  std::optional<int> compare = LHS.compare(other.LHS, ctx);
   if (!compare.has_value() || *compare != 0)
     return compare;
 

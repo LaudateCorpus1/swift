@@ -24,11 +24,11 @@ class CMakeProduct(product.Product):
         return self.args.verbose_build
 
     def build_with_cmake(self, build_targets, build_type, build_args,
-                         prefer_just_built_toolchain=False):
+                         prefer_native_toolchain=False):
         assert self.toolchain.cmake is not None
         cmake_build = []
         _cmake = cmake.CMake(self.args, self.toolchain,
-                             prefer_just_built_toolchain)
+                             prefer_native_toolchain)
 
         if self.toolchain.distcc_pump:
             cmake_build.append(self.toolchain.distcc_pump)
@@ -70,7 +70,10 @@ class CMakeProduct(product.Product):
                            + self.args.extra_cmake_options + [self.source_dir],
                            env=env)
 
-        if not self.args.skip_build or self.product_name() == "llvm":
+        is_llvm = self.product_name() == "llvm"
+        if (not is_llvm and not self.args.skip_build) or (
+            is_llvm and self.args._build_llvm
+        ):
             cmake_opts = [self.build_dir, "--config", build_type]
 
             if self.args.cmake_generator == "Xcode":
@@ -195,10 +198,21 @@ class CMakeProduct(product.Product):
             swift_host_triple = 'armv7-unknown-linux-gnueabihf'
             llvm_target_arch = 'ARM'
 
+        elif host_target.startswith('linux-static'):
+
+            if host_target == 'linux-static-aarch64':
+                swift_host_triple = 'aarch64-swift-linux-musl'
+                llvm_target_arch = 'AArch64'
+            elif host_target == 'linux-static-x86_64':
+                swift_host_triple = 'x86_64-swift-linux-musl'
+                llvm_target_arch = 'X86'
+
         elif host_target.startswith('macosx') or \
                 host_target.startswith('iphone') or \
                 host_target.startswith('appletv') or \
-                host_target.startswith('watch'):
+                host_target.startswith('watch') or \
+                host_target.startswith('xros-') or \
+                host_target.startswith('xrsimulator-'):
 
             swift_cmake_options.define('Python3_EXECUTABLE',
                                        self.toolchain.find_tool('python3'))
@@ -326,6 +340,27 @@ class CMakeProduct(product.Product):
                 swift_host_variant_sdk = 'WATCHOS'
                 cmake_osx_deployment_target = None
 
+            elif host_target == 'xrsimulator-arm64':
+                swift_host_triple = 'arm64-apple-xros{}-simulator'.format(
+                    self.args.darwin_deployment_version_xros)
+                llvm_target_arch = 'AARCH64'
+                swift_host_variant_sdk = 'XROS_SIMULATOR'
+                cmake_osx_deployment_target = None
+
+            elif host_target == 'xros-arm64':
+                swift_host_triple = 'arm64-apple-xros{}'.format(
+                    self.args.darwin_deployment_version_xros)
+                llvm_target_arch = 'AARCH64'
+                swift_host_variant_sdk = 'XROS'
+                cmake_osx_deployment_target = None
+
+            elif host_target == 'xros-arm64e':
+                swift_host_triple = 'arm64e-apple-xros{}'.format(
+                    self.args.darwin_deployment_version_xros)
+                llvm_target_arch = 'AARCH64'
+                swift_host_variant_sdk = 'XROS'
+                cmake_osx_deployment_target = None
+
             darwin_sdk_deployment_targets = os.environ.get(
                 'DARWIN_SDK_DEPLOYMENT_TARGETS')
             if darwin_sdk_deployment_targets:
@@ -408,9 +443,9 @@ class CMakeProduct(product.Product):
         swift_cmake_options.define('SWIFT_HOST_VARIANT_ARCH', swift_host_variant_arch)
 
         llvm_cmake_options.define('LLVM_LIT_ARGS', '{} -j {}'.format(
-            self.args.lit_args, self.args.build_jobs))
+            self.args.lit_args, self.args.lit_jobs))
         swift_cmake_options.define('LLVM_LIT_ARGS', '{} -j {}'.format(
-            self.args.lit_args, self.args.build_jobs))
+            self.args.lit_args, self.args.lit_jobs))
 
         if self.args.clang_profile_instr_use:
             llvm_cmake_options.define('LLVM_PROFDATA_FILE',

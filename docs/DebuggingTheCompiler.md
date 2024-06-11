@@ -49,6 +49,7 @@ benefit of all Swift developers.
     - [Manually symbolication using LLDB](#manually-symbolication-using-lldb)
     - [Viewing allocation history, references, and page-level info](#viewing-allocation-history-references-and-page-level-info)
     - [Printing memory contents](#printing-memory-contents)
+    - [Windows Error Codes](#windows-error-codes)
 - [Debugging LLDB failures](#debugging-lldb-failures)
     - ["Types" Log](#types-log)
     - ["Expression" Log](#expression-log)
@@ -164,6 +165,7 @@ constraints and present the final type checked solution, e.g.:
 
 ```
 ---Constraint solving at [test.swift:3:1 - line:3:1]---
+
 ---Initial constraints for the given expression---
 (integer_literal_expr type='$T0' location=test.swift:3:1 range=[test.swift:3:1 - line:3:1] value=0 builtin_initializer=**NULL** initializer=**NULL**)
 
@@ -172,14 +174,14 @@ Type Variables:
    ($T0 [attributes: [literal: integer]] [with possible bindings: (default type of literal) Int]) @ locator@0x13e009800 [IntegerLiteral@test.swift:3:1]
 
 Inactive Constraints:
-  $T0 literal conforms to ExpressibleByIntegerLiteral [[locator@0x13e009800 [IntegerLiteral@test.swift:3:1]]];
+  $T0 literal conforms to ExpressibleByIntegerLiteral @ locator@0x13e009800 [IntegerLiteral@test.swift:3:1]
 
   (Potential Binding(s): 
     ($T0 [attributes: [literal: integer]] [with possible bindings: (default type of literal) Int])
   (attempting type variable $T0 := Int
-    (considering -> $T0 literal conforms to ExpressibleByIntegerLiteral [[locator@0x13e009800 [IntegerLiteral@test.swift:3:1]]];
+    (considering: $T0 literal conforms to ExpressibleByIntegerLiteral @ locator@0x13e009800 [IntegerLiteral@test.swift:3:1]
       (simplification result:
-        (removed constraint: $T0 literal conforms to ExpressibleByIntegerLiteral [[locator@0x13e009800 [IntegerLiteral@test.swift:3:1]]];)
+        (removed constraint: $T0 literal conforms to ExpressibleByIntegerLiteral @ locator@0x13e009800 [IntegerLiteral@test.swift:3:1])
       )
       (outcome: simplified)
     )
@@ -188,7 +190,7 @@ Inactive Constraints:
         > $T0 := Int
       )
       (Removed Constraint: 
-        > $T0 literal conforms to ExpressibleByIntegerLiteral [[locator@0x13e009800 [IntegerLiteral@test.swift:3:1]]];
+        > $T0 literal conforms to ExpressibleByIntegerLiteral @ locator@0x13e009800 [IntegerLiteral@test.swift:3:1]
       )
     )
     (found solution: <default 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0>)
@@ -258,7 +260,7 @@ If one builds swift using ninja and wants to dump the SIL of the
 stdlib using some of the SIL dumping options from the previous
 section, one can use the following one-liner:
 
-    ninja -t commands | grep swiftc | grep Swift.o | grep " -c "
+    ninja -t commands | grep swiftc | grep 'Swift\.o'
 
 This should give one a single command line that one can use for
 Swift.o, perfect for applying the previous sections options to.
@@ -299,6 +301,13 @@ swift/Basic/Debug.h includes macros to help contributors declare these methods
 with the proper attributes to ensure they'll be available in the debugger. In
 particular, if you see `SWIFT_DEBUG_DUMP` in a class declaration, that class
 has a `dump()` method you can call.
+
+### Pass statistics
+
+There are options to output a lot of different statistics, including about
+SIL passes. More information is available in
+[Compiler Performance](CompilerPerformance.md) for the unified statistics, and
+[Optimizer Counter Analysis](OptimizerCountersAnalysis.md) for pass counters.
 
 ## Debugging and Profiling on SIL level
 
@@ -737,6 +746,11 @@ it's quite easy to do this manually:
    the sub-pass number. The option `-Xllvm -sil-opt-pass-count=<n>.<m>`
    can be used for that, where `m` is the sub-pass number.
 
+For bisecting pass counts in large projects, the pass counts can be read from
+a configuration file using the `-Xllvm -sil-pass-count-config-file=<file>`
+option. For details see the comment for `SILPassCountConfigFile` in the pass
+manager sources.
+
 ### Using git-bisect in the presence of branch forwarding/feature branches
 
 `git-bisect` is a useful tool for finding where a regression was
@@ -1052,6 +1066,36 @@ The following specifiers are available:
 * w - word (32-bit value)
 * g - giant word (64-bit value)
 
+## Windows Error Codes
+
+When debugging programs on Windows, sometimes one will run into an error message with a mysterious error code. E.x.:
+
+```
+note: command had no output on stdout or stderr
+error: command failed with exit status: 0xc0000135
+```
+
+These on windows are called HRESULT values. In the case above, the HRESULT is telling me that a DLL was not found. I discovered this
+by running the Microsoft provided [System Error Code Lookup Tool](https://learn.microsoft.com/en-us/windows/win32/debug/system-error-code-lookup-tool). After running
+this tool with the relevant error code on a windows machine, I got back the following result:
+
+```
+# for hex 0xc0000135 / decimal -1073741515
+  STATUS_DLL_NOT_FOUND                                           ntstatus.h   
+# The code execution cannot proceed because %hs was not
+# found. Reinstalling the program may fix this problem.
+# as an HRESULT: Severity: FAILURE (1), FACILITY_NULL (0x0), Code 0x135
+# for hex 0x135 / decimal 309
+  ERROR_NOTIFICATION_GUID_ALREADY_DEFINED                        winerror.h   
+# The specified file already has a notification GUID
+# associated with it.
+```
+
+Some relevant Microsoft documentation:
+
+* https://learn.microsoft.com/en-us/windows/win32/seccrypto/common-hresult-values
+* https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-erref/0642cb2f-2075-4469-918c-4441e69c548a
+* https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499-
 
 # Debugging LLDB failures
 

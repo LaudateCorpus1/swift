@@ -15,6 +15,7 @@
 # ----------------------------------------------------------------------------
 
 
+import multiprocessing
 import os
 import platform
 import re
@@ -96,13 +97,16 @@ class CMakeOptions(object):
 
 class CMake(object):
 
-    def __init__(self, args, toolchain, prefer_just_built_toolchain=False):
-        """If prefer_just_built_toolchain is set to True, we set the clang, clang++,
-        and Swift compilers from the installed toolchain.
+    def __init__(self, args, toolchain, prefer_native_toolchain=False):
+        """If prefer_native_toolchain is set to True, we set the clang, clang++,
+        and Swift compilers from the toolchain explicitly specified by the
+        native-*-tools-path options or just installed toolchain if the options
+        are not specified. If prefer_native_toolchain is set to False, we use
+        system defaults.
         """
         self.args = args
         self.toolchain = toolchain
-        self.prefer_just_built_toolchain = prefer_just_built_toolchain
+        self.prefer_native_toolchain = prefer_native_toolchain
 
     def common_options(self, product=None):
         """Return options used for all products, including LLVM/Clang
@@ -145,8 +149,8 @@ class CMake(object):
         if args.cmake_cxx_launcher:
             define("CMAKE_CXX_COMPILER_LAUNCHER:PATH", args.cmake_cxx_launcher)
 
-        if self.prefer_just_built_toolchain and product:
-            toolchain_path = product.install_toolchain_path(args.host_target)
+        if self.prefer_native_toolchain and product:
+            toolchain_path = product.native_toolchain_path(args.host_target)
             cmake_swiftc_path = os.getenv('CMAKE_Swift_COMPILER',
                                           os.path.join(toolchain_path, 'bin', 'swiftc'))
             define("CMAKE_C_COMPILER:PATH", os.path.join(toolchain_path,
@@ -273,18 +277,20 @@ class CMake(object):
 
         cwd = os.getcwd()
         os.chdir(cmake_build_dir)
-        shell.call_without_sleeping([cmake_bootstrap, '--no-qt-gui', '--',
-                                    '-DCMAKE_USE_OPENSSL=OFF'], echo=True)
-        shell.call_without_sleeping(['make', '-j%s' % self.args.build_jobs],
+        build_jobs = self.args.build_jobs or multiprocessing.cpu_count()
+        shell.call_without_sleeping([cmake_bootstrap, '--no-qt-gui',
+                                     '--parallel=%s' % build_jobs, '--',
+                                     '-DCMAKE_USE_OPENSSL=OFF'], echo=True)
+        shell.call_without_sleeping(['make', '-j%s' % build_jobs],
                                     echo=True)
         os.chdir(cwd)
         return os.path.join(cmake_build_dir, 'bin', 'cmake')
 
-    # For Linux only, determine the version of the installed CMake compared to
-    # the source and build the source if necessary. Returns the path to the
-    # cmake binary.
+    # For Linux and FreeBSD only, determine the version of the installed
+    # CMake compared to the source and build the source if necessary.
+    # Returns the path to the cmake binary.
     def check_cmake_version(self, source_root, build_root):
-        if platform.system() != 'Linux':
+        if not platform.system() in ["Linux", "FreeBSD"]:
             return
 
         cmake_source_dir = os.path.join(source_root, 'cmake')

@@ -14,12 +14,15 @@
 #define SWIFT_AST_SEARCHPATHOPTIONS_H
 
 #include "swift/Basic/ArrayRefView.h"
+#include "swift/Basic/ExternalUnion.h"
 #include "swift/Basic/PathRemapper.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/VersionTuple.h"
 #include "llvm/Support/VirtualFileSystem.h"
+#include <optional>
 
 #include <string>
 #include <vector>
@@ -34,7 +37,15 @@ enum class ModuleSearchPathKind {
   Framework,
   DarwinImplicitFramework,
   RuntimeLibrary,
-  CompilerPlugin,
+};
+
+/// Specifies how to load modules when both a module interface and serialized
+/// AST are present, or whether to disallow one format or the other altogether.
+enum class ModuleLoadingMode {
+  PreferInterface,
+  PreferSerialized,
+  OnlyInterface,
+  OnlySerialized
 };
 
 /// A single module search path that can come from different sources, e.g.
@@ -174,6 +185,112 @@ public:
                             llvm::vfs::FileSystem *FS, bool IsOSDarwin);
 };
 
+/// Pair of a plugin path and the module name that the plugin provides.
+struct PluginExecutablePathAndModuleNames {
+  std::string ExecutablePath;
+  std::vector<std::string> ModuleNames;
+};
+
+/// Pair of a plugin search path and the corresponding plugin server executable
+/// path.
+struct ExternalPluginSearchPathAndServerPath {
+  std::string SearchPath;
+  std::string ServerPath;
+};
+
+class PluginSearchOption {
+public:
+  struct LoadPluginLibrary {
+    std::string LibraryPath;
+  };
+  struct LoadPluginExecutable {
+    std::string ExecutablePath;
+    std::vector<std::string> ModuleNames;
+  };
+  struct PluginPath {
+    std::string SearchPath;
+  };
+  struct ExternalPluginPath {
+    std::string SearchPath;
+    std::string ServerPath;
+  };
+
+  enum class Kind : uint8_t {
+    LoadPluginLibrary,
+    LoadPluginExecutable,
+    PluginPath,
+    ExternalPluginPath,
+  };
+
+private:
+  using Members = ExternalUnionMembers<LoadPluginLibrary, LoadPluginExecutable,
+                                       PluginPath, ExternalPluginPath>;
+  static Members::Index getIndexForKind(Kind kind) {
+    switch (kind) {
+    case Kind::LoadPluginLibrary:
+      return Members::indexOf<LoadPluginLibrary>();
+    case Kind::LoadPluginExecutable:
+      return Members::indexOf<LoadPluginExecutable>();
+    case Kind::PluginPath:
+      return Members::indexOf<PluginPath>();
+    case Kind::ExternalPluginPath:
+      return Members::indexOf<ExternalPluginPath>();
+    }
+  };
+  using Storage = ExternalUnion<Kind, Members, getIndexForKind>;
+
+  Kind kind;
+  Storage storage;
+
+public:
+  PluginSearchOption(const LoadPluginLibrary &v)
+      : kind(Kind::LoadPluginLibrary) {
+    storage.emplace<LoadPluginLibrary>(kind, v);
+  }
+  PluginSearchOption(const LoadPluginExecutable &v)
+      : kind(Kind::LoadPluginExecutable) {
+    storage.emplace<LoadPluginExecutable>(kind, v);
+  }
+  PluginSearchOption(const PluginPath &v) : kind(Kind::PluginPath) {
+    storage.emplace<PluginPath>(kind, v);
+  }
+  PluginSearchOption(const ExternalPluginPath &v)
+      : kind(Kind::ExternalPluginPath) {
+    storage.emplace<ExternalPluginPath>(kind, v);
+  }
+  PluginSearchOption(const PluginSearchOption &o) : kind(o.kind) {
+    storage.copyConstruct(o.kind, o.storage);
+  }
+  PluginSearchOption(PluginSearchOption &&o) : kind(o.kind) {
+    storage.moveConstruct(o.kind, std::move(o.storage));
+  }
+  ~PluginSearchOption() { storage.destruct(kind); }
+  PluginSearchOption &operator=(const PluginSearchOption &o) {
+    storage.copyAssign(kind, o.kind, o.storage);
+    kind = o.kind;
+    return *this;
+  }
+  PluginSearchOption &operator=(PluginSearchOption &&o) {
+    storage.moveAssign(kind, o.kind, std::move(o.storage));
+    kind = o.kind;
+    return *this;
+  }
+
+  Kind getKind() const { return kind; }
+
+  template <typename T>
+  const T *dyn_cast() const {
+    if (Members::indexOf<T>() != getIndexForKind(kind))
+      return nullptr;
+    return &storage.get<T>(kind);
+  }
+
+  template <typename T>
+  const T &get() const {
+    return storage.get<T>(kind);
+  }
+};
+
 /// Options for controlling search path behavior.
 class SearchPathOptions {
   /// To call \c addImportSearchPath and \c addFrameworkSearchPath from
@@ -234,6 +351,9 @@ private:
   /// Compiler plugin library search paths.
   std::vector<std::string> CompilerPluginLibraryPaths;
 
+  /// Compiler plugin executable paths and providing module names.
+  std::vector<PluginExecutablePathAndModuleNames> CompilerPluginExecutablePaths;
+
   /// Add a single import search path. Must only be called from
   /// \c ASTContext::addSearchPath.
   void addImportSearchPath(StringRef Path, llvm::vfs::FileSystem *FS) {
@@ -241,14 +361,6 @@ private:
     Lookup.searchPathAdded(FS, ImportSearchPaths.back(),
                            ModuleSearchPathKind::Import, /*isSystem=*/false,
                            ImportSearchPaths.size() - 1);
-  }
-
-  void addCompilerPluginLibraryPath(StringRef Path, llvm::vfs::FileSystem *FS) {
-    CompilerPluginLibraryPaths.push_back(Path.str());
-    Lookup.searchPathAdded(FS, CompilerPluginLibraryPaths.back(),
-                           ModuleSearchPathKind::CompilerPlugin,
-                           /*isSystem=*/false,
-                           CompilerPluginLibraryPaths.size() - 1);
   }
 
   /// Add a single framework search path. Must only be called from
@@ -260,6 +372,11 @@ private:
                            ModuleSearchPathKind::Framework, NewPath.IsSystem,
                            FrameworkSearchPaths.size() - 1);
   }
+
+  std::optional<std::string> WinSDKRoot = std::nullopt;
+  std::optional<std::string> WinSDKVersion = std::nullopt;
+  std::optional<std::string> VCToolsRoot = std::nullopt;
+  std::optional<std::string> VCToolsVersion = std::nullopt;
 
 public:
   StringRef getSDKPath() const { return SDKPath; }
@@ -277,6 +394,26 @@ public:
                                           frameworksScratch.str().str()};
 
     Lookup.searchPathsDidChange();
+  }
+
+  std::optional<StringRef> getWinSDKRoot() const { return WinSDKRoot; }
+  void setWinSDKRoot(StringRef root) {
+    WinSDKRoot = root;
+  }
+
+  std::optional<StringRef> getWinSDKVersion() const { return WinSDKVersion; }
+  void setWinSDKVersion(StringRef version) {
+    WinSDKVersion = version;
+  }
+
+  std::optional<StringRef> getVCToolsRoot() const { return VCToolsRoot; }
+  void setVCToolsRoot(StringRef root) {
+    VCToolsRoot = root;
+  }
+
+  std::optional<StringRef> getVCToolsVersion() const { return VCToolsVersion; }
+  void setVCToolsVersion(StringRef version) {
+    VCToolsVersion = version;
   }
 
   ArrayRef<std::string> getImportSearchPaths() const {
@@ -314,16 +451,6 @@ public:
     Lookup.searchPathsDidChange();
   }
 
-  void setCompilerPluginLibraryPaths(
-      std::vector<std::string> NewCompilerPluginLibraryPaths) {
-    CompilerPluginLibraryPaths = NewCompilerPluginLibraryPaths;
-    Lookup.searchPathsDidChange();
-  }
-
-  ArrayRef<std::string> getCompilerPluginLibraryPaths() const {
-    return CompilerPluginLibraryPaths;
-  }
-
   /// Path(s) to virtual filesystem overlay YAML files.
   std::vector<std::string> VFSOverlayFiles;
 
@@ -339,8 +466,14 @@ public:
   /// preference.
   std::vector<std::string> RuntimeLibraryPaths;
 
+  /// Plugin search path options.
+  std::vector<PluginSearchOption> PluginSearchOpts;
+
   /// Don't look in for compiler-provided modules.
   bool SkipRuntimeLibraryImportPaths = false;
+
+  /// Scanner Prefix Mapper.
+  std::vector<std::string> ScannerPrefixMapper;
 
   /// When set, don't validate module system dependencies.
   ///
@@ -353,7 +486,11 @@ public:
   std::vector<std::string> CandidateCompiledModules;
 
   /// A map of explicit Swift module information.
-  std::string ExplicitSwiftModuleMap;
+  std::string ExplicitSwiftModuleMapPath;
+
+  /// Module inputs specified with -swift-module-input,
+  /// <ModuleName, Path to .swiftmodule file>
+  std::vector<std::pair<std::string, std::string>> ExplicitSwiftModuleInputs;
 
   /// A map of placeholder Swift module dependency information.
   std::string PlaceholderDependencyModuleMap;
@@ -364,6 +501,26 @@ public:
   /// A file containing a list of protocols whose conformances require const value extraction.
   std::string ConstGatherProtocolListFilePath;
 
+  /// Path to the file that defines platform mapping for availability
+  /// version inheritance.
+  std::optional<std::string> PlatformAvailabilityInheritanceMapPath;
+
+  /// Cross import module information. Map from module name to the list of cross
+  /// import overlay files that associate with that module.
+  using CrossImportMap = llvm::StringMap<std::vector<std::string>>;
+  CrossImportMap CrossImportInfo;
+
+  /// CanImport information passed from scanning.
+  struct CanImportInfo {
+    std::string ModuleName;
+    llvm::VersionTuple Version;
+    llvm::VersionTuple UnderlyingVersion;
+  };
+  std::vector<CanImportInfo> CanImportModuleInfo;
+
+  /// Whether to search for cross import overlay on file system.
+  bool DisableCrossImportOverlaySearch = false;
+
   /// Debug path mappings to apply to serialized search paths. These are
   /// specified in LLDB from the target.source-map entries.
   PathRemapper SearchPathRemapper;
@@ -371,6 +528,12 @@ public:
   /// Recover the search paths deserialized from .swiftmodule files to their
   /// original form.
   PathObfuscator DeserializedPathRecoverer;
+
+  /// Specify the module loading behavior of the compilation.
+  ModuleLoadingMode ModuleLoadMode = ModuleLoadingMode::PreferSerialized;
+
+  /// Legacy scanner search behavior.
+  bool NoScannerModuleValidation = false;
 
   /// Return all module search paths that (non-recursively) contain a file whose
   /// name is in \p Filenames.
@@ -419,7 +582,9 @@ public:
                         RuntimeResourcePath,
                         hash_combine_range(RuntimeLibraryImportPaths.begin(),
                                            RuntimeLibraryImportPaths.end()),
-                        DisableModulesValidateSystemDependencies);
+                        DisableModulesValidateSystemDependencies,
+                        NoScannerModuleValidation,
+                        ModuleLoadMode);
   }
 
   /// Return a hash code of any components from these options that should
@@ -427,6 +592,8 @@ public:
   llvm::hash_code getModuleScanningHashComponents() const {
     return getPCHHashComponents();
   }
+
+  void dump(bool isDarwin) const;
 };
 }
 

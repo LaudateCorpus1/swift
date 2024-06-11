@@ -32,6 +32,7 @@ namespace swiftcall {
 namespace swift {
 namespace irgen {
   class EnumPayload;
+  class IRBuilder;
   using clang::CodeGen::swiftcall::SwiftAggLowering;
 
 struct LoadedRef {
@@ -58,22 +59,28 @@ protected:
   LoadableTypeInfo(llvm::Type *type, Size size,
                    const SpareBitVector &spareBits,
                    Alignment align,
-                   IsPOD_t pod, IsFixedSize_t alwaysFixedSize,
+                   IsTriviallyDestroyable_t pod,
+                   IsCopyable_t copy,
+                   IsFixedSize_t alwaysFixedSize,
                    SpecialTypeInfoKind stik = SpecialTypeInfoKind::Loadable)
       : FixedTypeInfo(type, size, spareBits, align, pod,
                       // All currently implemented loadable types are bitwise-takable.
-                      IsBitwiseTakable, alwaysFixedSize, stik) {
+                      IsBitwiseTakable,
+                      copy, alwaysFixedSize, stik) {
     assert(isLoadable());
   }
 
   LoadableTypeInfo(llvm::Type *type, Size size,
                    SpareBitVector &&spareBits,
                    Alignment align,
-                   IsPOD_t pod, IsFixedSize_t alwaysFixedSize,
+                   IsTriviallyDestroyable_t pod,
+                   IsCopyable_t copy,
+                   IsFixedSize_t alwaysFixedSize,
                    SpecialTypeInfoKind stik = SpecialTypeInfoKind::Loadable)
       : FixedTypeInfo(type, size, std::move(spareBits), align, pod,
                       // All currently implemented loadable types are bitwise-takable.
-                      IsBitwiseTakable, alwaysFixedSize, stik) {
+                      IsBitwiseTakable,
+                      copy, alwaysFixedSize, stik) {
     assert(isLoadable());
   }
 
@@ -97,7 +104,7 @@ public:
   /// Assign a set of exploded values into an address.  The values are
   /// consumed out of the explosion.
   virtual void assign(IRGenFunction &IGF, Explosion &explosion, Address addr,
-                      bool isOutlined) const = 0;
+                      bool isOutlined, SILType T) const = 0;
 
   /// Initialize an address by consuming values out of an explosion.
   virtual void initialize(IRGenFunction &IGF, Explosion &explosion,
@@ -111,7 +118,7 @@ public:
   /// level and produce them at another.
   ///
   /// Essentially, this is like take-initializing the new explosion.
-  virtual void reexplode(IRGenFunction &IGF, Explosion &sourceExplosion,
+  virtual void reexplode(Explosion &sourceExplosion,
                          Explosion &targetExplosion) const = 0;
 
   /// Shift values from the source explosion to the target explosion
@@ -121,14 +128,16 @@ public:
   
   /// Release reference counts or other resources owned by the explosion.
   virtual void consume(IRGenFunction &IGF, Explosion &explosion,
-                       Atomicity atomicity) const = 0;
+                       Atomicity atomicity,
+                       SILType T) const = 0;
 
   /// Fix the lifetime of the source explosion by creating opaque calls to
   /// swift_fixLifetime for all reference types in the explosion.
   virtual void fixLifetime(IRGenFunction &IGF, Explosion &explosion) const = 0;
   
   /// Pack the source explosion into an enum payload.
-  virtual void packIntoEnumPayload(IRGenFunction &IGF,
+  virtual void packIntoEnumPayload(IRGenModule &IGM,
+                                   IRBuilder &builder,
                                    EnumPayload &payload,
                                    Explosion &sourceExplosion,
                                    unsigned offset) const = 0;

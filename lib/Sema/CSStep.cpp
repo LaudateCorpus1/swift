@@ -147,7 +147,7 @@ void SplitterStep::computeFollowupSteps(
     // handles all combinations of incoming partial solutions.
     steps.push_back(std::make_unique<DependentComponentSplitterStep>(
         CS, &Components[i], solutionIndex, std::move(components[i]),
-        llvm::makeMutableArrayRef(PartialSolutions.get(), numComponents)));
+        llvm::MutableArrayRef(PartialSolutions.get(), numComponents)));
   }
 
   assert(CS.InactiveConstraints.empty() && "Missed a constraint");
@@ -280,7 +280,7 @@ StepResult DependentComponentSplitterStep::take(bool prevFailed) {
   // Produce all combinations of partial solutions for the inputs.
   SmallVector<std::unique_ptr<SolverStep>, 4> followup;
   SmallVector<unsigned, 2> indices(Component.getDependencies().size(), 0);
-  auto dependsOnSetsRef = llvm::makeArrayRef(dependsOnSets);
+  auto dependsOnSetsRef = llvm::ArrayRef(dependsOnSets);
   do {
     // Form the set of input partial solutions.
     SmallVector<const Solution *, 2> dependsOnSolutions;
@@ -398,7 +398,7 @@ StepResult ComponentStep::take(bool prevFailed) {
 
   enum class StepKind { Binding, Disjunction, Conjunction };
 
-  auto chooseStep = [&]() -> Optional<StepKind> {
+  auto chooseStep = [&]() -> std::optional<StepKind> {
     // Bindings usually happen first, but sometimes we want to prioritize a
     // disjunction or conjunction.
     if (bestBindings) {
@@ -416,7 +416,7 @@ StepResult ComponentStep::take(bool prevFailed) {
     if (conjunction)
       return StepKind::Conjunction;
 
-    return None;
+    return std::nullopt;
   };
 
   if (auto step = chooseStep()) {
@@ -438,6 +438,20 @@ StepResult ComponentStep::take(bool prevFailed) {
     // If there are no disjunctions or type variables to bind
     // we can't solve this system unless we have free type variables
     // allowed in the solution.
+    if (CS.isDebugMode()) {
+      PrintOptions PO;
+      PO.PrintTypesForDebugging = true;
+
+      auto &log = getDebugLogger();
+      log << "(failed due to free variables:";
+      for (auto *typeVar : CS.getTypeVariables()) {
+        if (!typeVar->getImpl().hasRepresentativeOrFixed()) {
+          log << " " << typeVar->getString(PO);
+        }
+      }
+      log << ")\n";
+    }
+
     return finalize(/*isSuccess=*/false);
   }
 
@@ -645,10 +659,12 @@ bool IsDeclRefinementOfRequest::evaluate(Evaluator &evaluator,
   // same structural position in the first type.
   TypeSubstitutionMap substMap;
   substTypeB = substTypeB->substituteBindingsTo(substTypeA,
-      [&](ArchetypeType *origType, CanType substType,
-          ArchetypeType *, ArrayRef<ProtocolConformanceRef>) -> CanType {
+      [&](ArchetypeType *origType, CanType substType) -> CanType {
     auto interfaceTy =
         origType->getInterfaceType()->getCanonicalType()->getAs<SubstitutableType>();
+
+    if (!interfaceTy)
+      return CanType();
 
     // Make sure any duplicate bindings are equal to the one already recorded.
     // Otherwise, the substitution has conflicting generic arguments.
@@ -663,12 +679,12 @@ bool IsDeclRefinementOfRequest::evaluate(Evaluator &evaluator,
   if (!substTypeB)
     return false;
 
-  auto result = TypeChecker::checkGenericArguments(
+  auto result = checkRequirements(
       declA->getDeclContext()->getParentModule(),
       genericSignatureB.getRequirements(),
       QueryTypeSubstitutionMap{ substMap });
 
-  if (result != CheckGenericArgumentsResult::Success)
+  if (result != CheckRequirementsResult::Success)
     return false;
 
   return substTypeA->isEqual(substTypeB);
@@ -785,7 +801,7 @@ bool swift::isSIMDOperator(ValueDecl *value) {
   if (nominal->getName().empty())
     return false;
 
-  return nominal->getName().str().startswith_insensitive("simd");
+  return nominal->getName().str().starts_with_insensitive("simd");
 }
 
 bool DisjunctionStep::shortCircuitDisjunctionAt(
@@ -838,7 +854,7 @@ bool DisjunctionStep::attempt(const DisjunctionChoice &choice) {
           kind == ConstraintLocator::DynamicLookupResult) {
         assert(index == 0 || index == 1);
         if (index == 1)
-          CS.increaseScore(SK_ForceUnchecked);
+          CS.increaseScore(SK_ForceUnchecked, disjunctionLocator);
       }
     }
   }
@@ -945,7 +961,7 @@ StepResult ConjunctionStep::resume(bool prevFailed) {
 
       if (Solutions.size() == 1) {
         auto score = Solutions.front().getFixedScore();
-        if (score.Data[SK_Fix] > 0)
+        if (score.Data[SK_Fix] > 0 && !CS.isForCodeCompletion())
           Producer.markExhausted();
       }
     } else if (Solutions.size() != 1) {
@@ -1023,7 +1039,7 @@ StepResult ConjunctionStep::resume(bool prevFailed) {
                 ++numHoles;
               }
             }
-            CS.increaseScore(SK_Hole, numHoles);
+            CS.increaseScore(SK_Hole, Conjunction->getLocator(), numHoles);
           }
 
           if (CS.worseThanBestSolution())
@@ -1075,5 +1091,35 @@ void ConjunctionStep::restoreOuterState(const Score &solutionScore) const {
                                 CS.InactiveConstraints);
     for (auto &constraint : CS.ActiveConstraints)
       constraint.setActive(true);
+  }
+}
+
+void ConjunctionStep::SolverSnapshot::applySolution(const Solution &solution) {
+  CS.applySolution(solution);
+
+  if (!CS.shouldAttemptFixes())
+    return;
+
+  // If inference succeeded, we are done.
+  auto score = solution.getFixedScore();
+  if (score.Data[SK_Fix] == 0)
+    return;
+
+  // If this conjunction represents a closure and inference
+  // has failed, let's bind all of unresolved type variables
+  // in its interface type to holes to avoid extraneous
+  // fixes produced by outer context.
+  auto locator = Conjunction->getLocator();
+  if (locator->directlyAt<ClosureExpr>()) {
+    auto closureTy =
+        CS.getClosureType(castToExpr<ClosureExpr>(locator->getAnchor()));
+    CS.recordTypeVariablesAsHoles(closureTy);
+  }
+
+  // Same for a SingleValueStmtExpr, turn any unresolved type variables present
+  // in its type into holes.
+  if (locator->isForSingleValueStmtConjunction()) {
+    auto *SVE = castToExpr<SingleValueStmtExpr>(locator->getAnchor());
+    CS.recordTypeVariablesAsHoles(CS.getType(SVE));
   }
 }

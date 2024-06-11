@@ -13,6 +13,7 @@
 #ifndef SWIFT_SIL_INSTRUCTIONUTILS_H
 #define SWIFT_SIL_INSTRUCTIONUTILS_H
 
+#include "swift/SIL/InstWrappers.h"
 #include "swift/SIL/RuntimeEffect.h"
 #include "swift/SIL/SILInstruction.h"
 
@@ -39,6 +40,12 @@ SILValue stripCastsWithoutMarkDependence(SILValue V);
 /// Return the underlying SILValue after looking through all copy_value and
 /// begin_borrow instructions.
 SILValue lookThroughOwnershipInsts(SILValue v);
+
+/// Reverse of lookThroughOwnershipInsts.
+///
+/// Return true if \p visitor returned true for all uses.
+bool visitNonOwnershipUses(SILValue value,
+                           function_ref<bool(Operand *)> visitor);
 
 /// Return the underlying SILValue after looking through all copy_value
 /// instructions.
@@ -88,8 +95,8 @@ SILValue stripBorrow(SILValue V);
 //===----------------------------------------------------------------------===//
 
 /// Return a non-null SingleValueInstruction if the given instruction merely
-/// copies the value of its first operand, possibly changing its type or
-/// ownership state, but otherwise having no effect.
+/// copies or moves the value of its first operand, possibly changing its type
+/// or ownership state, but otherwise having no effect.
 ///
 /// The returned instruction may have additional "incidental" operands;
 /// mark_dependence for example.
@@ -100,8 +107,16 @@ SILValue stripBorrow(SILValue V);
 /// type may be changed by a cast.
 SingleValueInstruction *getSingleValueCopyOrCast(SILInstruction *I);
 
+// Return true if this instruction begins a SIL-level scope. If so, it must have
+// a single result. That result must have an isEndOfScopeMarker direct use on
+// all reachable paths. This instruction along with its scope-ending
+// instructions are considered a single operation. They must be inserted and
+// deleted together.
+bool isBeginScopeMarker(SILInstruction *user);
+
 /// Return true if this instruction terminates a SIL-level scope. Scope end
-/// instructions do not produce a result.
+/// instructions do not produce a result. Their single operand must be an
+/// isBeginScopeMarker and cannot be 'undef'.
 bool isEndOfScopeMarker(SILInstruction *user);
 
 /// Return true if the given instruction has no effect on it's operand values
@@ -138,6 +153,10 @@ SILValue isPartialApplyOfReabstractionThunk(PartialApplyInst *PAI);
 /// Returns true if \p PAI is only used by an assign_by_wrapper instruction as
 /// init or set function.
 bool onlyUsedByAssignByWrapper(PartialApplyInst *PAI);
+
+/// Returns true if \p PAI is only used by an \c assign_or_init
+/// instruction as init or set function.
+bool onlyUsedByAssignOrInit(PartialApplyInst *PAI);
 
 /// Returns the runtime effects of \p inst.
 ///
@@ -194,6 +213,22 @@ private:
 /// polymorphic builtin or does not have any available overload for these types,
 /// return SILValue().
 SILValue getStaticOverloadForSpecializedPolymorphicBuiltin(BuiltinInst *bi);
+
+/// Visit the exploded leaf elements of a tuple type that contains potentially
+/// a tree of tuples.
+///
+/// If visitor returns false, we stop processing early. We return true if we
+/// visited all of the tuple elements without the visitor returing false.
+bool visitExplodedTupleType(SILType type,
+                            llvm::function_ref<bool(SILType)> callback);
+
+/// Visit the exploded leaf elements of a tuple type that contains potentially
+/// a tree of tuples.
+///
+/// If visitor returns false, we stop processing early. We return true if we
+/// visited all of the tuple elements without the visitor returing false.
+bool visitExplodedTupleValue(SILValue value,
+                             llvm::function_ref<SILValue(SILValue, std::optional<unsigned>)> callback);
 
 } // end namespace swift
 

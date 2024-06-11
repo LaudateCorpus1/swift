@@ -26,6 +26,7 @@
 #include "swift/Basic/Defer.h"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/OwnershipUtils.h"
+#include "swift/SIL/Test.h"
 #include "swift/SILOptimizer/Utils/CFGOptUtils.h"
 #include "swift/SILOptimizer/Utils/CanonicalizeOSSALifetime.h"
 #include "swift/SILOptimizer/Utils/DebugOptUtils.h"
@@ -44,16 +45,24 @@ static bool hasValueOwnership(SILValue value) {
          value->getOwnershipKind() == OwnershipKind::Owned;
 }
 
-/// Delete a chain of unused copies leading to \p v.
-static void deleteCopyChain(SILValue v, InstructionDeleter &deleter) {
-  while (auto *copy = dyn_cast<CopyValueInst>(v)) {
-    if (!onlyHaveDebugUses(copy))
+static SingleValueInstruction *asCopyOrMove(SILValue v) {
+  if (auto *copy = dyn_cast<CopyValueInst>(v))
+    return copy;
+  if (auto *move = dyn_cast<MoveValueInst>(v))
+    return move;
+  return nullptr;
+}
+
+/// Delete a chain of unused copies and moves leading to \p v.
+static void deleteCopyAndMoveChain(SILValue v, InstructionDeleter &deleter) {
+  while (auto *inst = asCopyOrMove(v)) {
+    if (!onlyHaveDebugUses(inst))
       break;
 
-    v = copy->getOperand();
-    LLVM_DEBUG(llvm::dbgs() << "  Deleting " << *copy);
-    ++NumCopiesEliminated;
-    deleter.forceDelete(copy);
+    v = inst->getOperand(CopyLikeInstruction::Src);
+    LLVM_DEBUG(llvm::dbgs() << "  Deleting " << *inst);
+    ++NumCopiesAndMovesEliminated;
+    deleter.forceDelete(inst);
   }
 }
 
@@ -70,14 +79,12 @@ static void deleteCopyChain(SILValue v, InstructionDeleter &deleter) {
 ///   OwnershipForwardingConversionInst (all kinds of ref casts)
 ///   OwnershipForwardingMultipleValueInstruction
 ///     (DestructureStruct, DestructureTuple)
-///   AllArgOwnershipForwardingSingleValueInst
-///     (Struct, Tuple)
 ///   FirstArgOwnershipForwardingSingleValueInst
-///     (Object, Enum, UncheckedEnumData, SelectValue, Open/InitExistentialRef,
+///     (Object, Enum, UncheckedEnumData, Open/InitExistentialRef,
 ///      MarkDependence)
 ///
 /// TODO:
-///   Enum, SelectValue, InitExistential, MarkDependence
+///   Enum, InitExistential, MarkDependence
 ///   Struct, Tuple
 ///   SelectEnum, SwitchEnum, CheckCastBranch
 bool CanonicalizeBorrowScope::isRewritableOSSAForward(SILInstruction *inst) {
@@ -88,10 +95,8 @@ bool CanonicalizeBorrowScope::isRewritableOSSAForward(SILInstruction *inst) {
   if (inst->getNumOperands() != 1)
     return false;
 
-  if (isa<OwnershipForwardingConversionInst>(inst)
-      || isa<OwnershipForwardingMultipleValueInstruction>(inst)
-      || isa<AllArgOwnershipForwardingSingleValueInst>(inst)
-      || isa<FirstArgOwnershipForwardingSingleValueInst>(inst)) {
+  if (isa<OwnershipForwardingSingleValueInstruction>(inst) ||
+      isa<OwnershipForwardingMultipleValueInstruction>(inst)) {
     Operand *forwardedOper = &inst->getOperandRef(0);
     // Trivial conversions do not need to be hoisted out of a borrow scope.
     auto operOwnership = forwardedOper->getOperandOwnership();
@@ -135,6 +140,7 @@ SILValue CanonicalizeBorrowScope::getCanonicalBorrowedDef(SILValue def) {
 
       case BorrowedValueKind::LoadBorrow:
       case BorrowedValueKind::Phi:
+      case BorrowedValueKind::BeginApplyToken:
         break;
       }
     }
@@ -165,6 +171,7 @@ bool CanonicalizeBorrowScope::computeBorrowLiveness() {
     // can handle persistentCopies.
     return false;
   case BorrowedValueKind::BeginBorrow:
+  case BorrowedValueKind::BeginApplyToken:
     break;
   }
   // Note that there is no need to look through any reborrows. The reborrowed
@@ -172,7 +179,7 @@ bool CanonicalizeBorrowScope::computeBorrowLiveness() {
   // the reborrowed value will not be rewritten when canonicalizing the current
   // borrow scope because they are "hidden" behind the reborrow.
   borrowedValue.visitLocalScopeEndingUses([this](Operand *use) {
-    liveness.updateForUse(use->getUser(), /*lifetimeEnding*/ true);
+    liveness->updateForUse(use->getUser(), /*lifetimeEnding*/ true);
     return true;
   });
   return true;
@@ -182,23 +189,24 @@ bool CanonicalizeBorrowScope::computeBorrowLiveness() {
 /// equivalent to the logic in visitBorrowScopeUses that recurses through
 /// copies. The use-def and def-use logic must be consistent.
 SILValue CanonicalizeBorrowScope::findDefInBorrowScope(SILValue value) {
-  while (auto *copy = dyn_cast<CopyValueInst>(value)) {
-    if (isPersistentCopy(copy))
+  while (auto *inst = asCopyOrMove(value)) {
+    auto *copy = dyn_cast<CopyValueInst>(inst);
+    if (copy && isPersistentCopy(copy))
       return copy;
 
-    value = copy->getOperand();
+    value = inst->getOperand(0);
   }
   return value;
 }
 
-/// Visit all extended uses within the borrow scope, looking through copies.
-/// Call visitUse for uses which could potentially be outside the borrow scope.
-/// Call visitForwardingUse for hoistable forwarding operations which could
-/// potentially be inside the borrow scope.
+/// Visit all extended uses within the borrow scope, looking through copies and
+/// moves. Call visitUse for uses which could potentially be outside the borrow
+/// scope. Call visitForwardingUse for hoistable forwarding operations which
+/// could potentially be inside the borrow scope.
 ///
 /// The visitor may or may not be able to determine which uses are outside the
 /// scope, but it can filter uses that are definitely within the scope. For
-/// example, guaranteed uses and uses in live-out blocks must be both be within
+/// example, guaranteed uses and uses in live-out blocks must both be within
 /// the scope.
 ///
 /// This def-use traversal is similar to findExtendedTransitiveGuaranteedUses(),
@@ -224,8 +232,9 @@ bool CanonicalizeBorrowScope::visitBorrowScopeUses(SILValue innerValue,
     // Gather the uses before updating any of them.
     // 'value' may be deleted in this loop after rewriting its last use.
     // 'use' may become invalid after processing its user.
+
     SmallVector<Operand *, 4> uses(value->getUses());
-    for (Operand *use : uses) {
+    for (auto *use : uses) {
       auto *user = use->getUser();
       // Incidental uses, such as debug_value may be deleted before they can be
       // processed. Their user will now be nullptr. This means that value
@@ -233,10 +242,15 @@ bool CanonicalizeBorrowScope::visitBorrowScopeUses(SILValue innerValue,
       if (!user)
         break;
 
-      // Recurse through copies.
+      // Recurse through copies and moves.
       if (auto *copy = dyn_cast<CopyValueInst>(user)) {
         if (!isPersistentCopy(copy)) {
           defUseWorklist.insert(copy);
+          continue;
+        }
+      } else if (auto *move = dyn_cast<MoveValueInst>(user)) {
+        if (!move->isLexical() || innerValue->isLexical()) {
+          defUseWorklist.insert(move);
           continue;
         }
       }
@@ -319,10 +333,10 @@ class FindBorrowScopeUses {
 public:
   FindBorrowScopeUses(CanonicalizeBorrowScope &scope) : scope(scope) {}
 
-  Optional<OuterUsers> findUses() && {
+  std::optional<OuterUsers> findUses() && {
     scope.beginVisitBorrowScopeUses();
     if (!scope.visitBorrowScopeUses(scope.getBorrowedValue().value, *this))
-      return None;
+      return std::nullopt;
 
     return std::move(useInsts);
   }
@@ -340,9 +354,6 @@ public:
       // For borrows, record the scope-ending instructions to outer use
       // points. Note: The logic in filterOuterBorrowUseInsts that checks
       // whether a borrow scope is an outer use must visit the same set of uses.
-      //
-      // FIXME: visitExtendedScopeEndingUses can't return false here once dead
-      // borrows are disallowed.
       if (!borrowingOper.visitExtendedScopeEndingUses([&](Operand *endBorrow) {
         auto *endInst = endBorrow->getUser();
         if (!isUserInLiveOutBlock(endInst)) {
@@ -350,7 +361,8 @@ public:
         }
         return true;
       })) {
-        useInsts.insert(user);
+        // Bail out on dead borrow scopes and scopes with unknown uses.
+        return false;
       }
     }
     return true;
@@ -433,7 +445,7 @@ public:
     // destroys are never needed within a borrow scope.
     if (isa<DestroyValueInst>(user)) {
       scope.getDeleter().forceDelete(user);
-      deleteCopyChain(value, scope.getDeleter());
+      deleteCopyAndMoveChain(value, scope.getDeleter());
       return true;
     }
     SILValue def = scope.findDefInBorrowScope(value);
@@ -447,12 +459,12 @@ public:
         use->set(def);
         copyLiveUse(use, scope.getCallbacks());
       }
-      deleteCopyChain(value, scope.getDeleter());
+      deleteCopyAndMoveChain(value, scope.getDeleter());
       return true;
     }
     // Non-consuming use.
     use->set(def);
-    deleteCopyChain(value, scope.getDeleter());
+    deleteCopyAndMoveChain(value, scope.getDeleter());
     return true;
   }
 
@@ -474,7 +486,7 @@ public:
     use->set(scope.findDefInBorrowScope(value));
     ForwardingOperand(use).setForwardingOwnershipKind(
         OwnershipKind::Guaranteed);
-    deleteCopyChain(value, scope.getDeleter());
+    deleteCopyAndMoveChain(value, scope.getDeleter());
     return true;
   }
 };
@@ -586,14 +598,14 @@ public:
     }
     // If it's not already dead, update this operand bypassing any copies.
     SILValue innerValue = use->get();
-    if (scope.getDeleter().deleteIfDead(user)) {
+    if (scope.getDeleter().deleteIfDead(user, /*fixLifetime=*/false)) {
       LLVM_DEBUG(llvm::dbgs() << "  Deleted " << *user);
     } else {
       use->set(scope.findDefInBorrowScope(use->get()));
       ForwardingOperand(use).setForwardingOwnershipKind(
           OwnershipKind::Guaranteed);
     }
-    deleteCopyChain(innerValue, scope.getDeleter());
+    deleteCopyAndMoveChain(innerValue, scope.getDeleter());
     return true;
   }
 
@@ -623,7 +635,9 @@ protected:
     assert(succeed && "should be filtered by FindBorrowScopeUses");
 
     auto iter = innerToOuterMap.find(innerValue);
-    assert(iter != innerToOuterMap.end());
+    if (iter == innerToOuterMap.end()) {
+      return SILValue();
+    }
     SILValue outerValue = iter->second;
     cleanupOuterValue(outerValue);
     return outerValue;
@@ -644,7 +658,7 @@ protected:
 
     use->set(outerValue);
 
-    deleteCopyChain(innerValue, scope.getDeleter());
+    deleteCopyAndMoveChain(innerValue, scope.getDeleter());
 
     recordOuterUse(use);
   };
@@ -675,7 +689,7 @@ SILValue RewriteOuterBorrowUses::createOuterValues(SILValue innerValue) {
 
   auto incomingOuterVal = createOuterValues(incomingInnerVal);
 
-  auto *insertPt = incomingOuterVal->getNextInstruction();
+  auto *insertPt = innerValue->getDefiningInsertionPoint();
   auto *clone = innerInst->clone(insertPt);
   scope.getCallbacks().createdNewInst(clone);
   Operand *use = &clone->getOperandRef(0);
@@ -767,7 +781,8 @@ bool CanonicalizeBorrowScope::consolidateBorrowScope() {
 
     // Gather all potential outer uses before rewriting any to avoid scanning
     // any basic block more than once.
-    Optional<OuterUsers> outerUsers = FindBorrowScopeUses(*this).findUses();
+    std::optional<OuterUsers> outerUsers =
+        FindBorrowScopeUses(*this).findUses();
     if (!outerUsers)
       return false;
 
@@ -807,8 +822,6 @@ bool CanonicalizeBorrowScope::canonicalizeFunctionArgument(
 
   LLVM_DEBUG(llvm::dbgs() << "*** Canonicalize Borrow: " << borrowedValue);
 
-  SWIFT_DEFER { liveness.clear(); };
-
   RewriteInnerBorrowUses innerRewriter(*this);
   beginVisitBorrowScopeUses(); // reset the def/use worklist
 
@@ -822,11 +835,12 @@ bool CanonicalizeBorrowScope::canonicalizeFunctionArgument(
 /// forwarding operations.
 bool CanonicalizeBorrowScope::
 canonicalizeBorrowScope(BorrowedValue borrowedValue) {
+  BitfieldRef<SSAPrunedLiveness>::StackState livenessBitfieldContainer(
+      liveness, function);
+
   LLVM_DEBUG(llvm::dbgs() << "*** Canonicalize Borrow: " << borrowedValue);
 
   initBorrow(borrowedValue);
-
-  SWIFT_DEFER { liveness.clear(); };
 
   if (!computeBorrowLiveness())
     return false;
@@ -838,3 +852,21 @@ canonicalizeBorrowScope(BorrowedValue borrowedValue) {
 
   return true;
 }
+
+namespace swift::test {
+// Arguments:
+// - SILValue: value to canonicalize
+// Dumps:
+// - function after value canonicalization
+static FunctionTest CanonicalizeBorrowScopeTest(
+    "canonicalize-borrow-scope",
+    [](auto &function, auto &arguments, auto &test) {
+      auto value = arguments.takeValue();
+      auto borrowedValue = BorrowedValue(value);
+      assert(borrowedValue && "specified value isn't a BorrowedValue!?");
+      InstructionDeleter deleter;
+      CanonicalizeBorrowScope canonicalizer(value->getFunction(), deleter);
+      canonicalizer.canonicalizeBorrowScope(borrowedValue);
+      function.print(llvm::outs());
+    });
+} // end namespace swift::test

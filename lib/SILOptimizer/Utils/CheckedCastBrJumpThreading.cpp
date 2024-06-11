@@ -50,6 +50,8 @@ class CheckedCastBrJumpThreading {
   // need to be recomputed each time tryCheckedCastBrJumpThreading is called.
   DeadEndBlocks *deBlocks;
 
+  SILPassManager *pm;
+
   // Enable non-trivial terminator rewriting in OSSA.
   bool EnableOSSARewriteTerminator;
 
@@ -141,10 +143,10 @@ class CheckedCastBrJumpThreading {
 
 public:
   CheckedCastBrJumpThreading(
-      SILFunction *Fn, DominanceInfo *DT, DeadEndBlocks *deBlocks,
+      SILFunction *Fn, SILPassManager *pm, DominanceInfo *DT, DeadEndBlocks *deBlocks,
       SmallVectorImpl<SILBasicBlock *> &BlocksForWorklist,
       bool EnableOSSARewriteTerminator)
-      : Fn(Fn), DT(DT), deBlocks(deBlocks),
+      : Fn(Fn), DT(DT), deBlocks(deBlocks), pm(pm),
         EnableOSSARewriteTerminator(EnableOSSARewriteTerminator),
         rauwContext(callbacks, *deBlocks),
         BlocksForWorklist(BlocksForWorklist), BlocksToEdit(Fn),
@@ -318,10 +320,9 @@ void CheckedCastBrJumpThreading::Edit::modifyCFGForFailurePreds(
   for (auto *Pred : FailurePreds) {
     TermInst *TI = Pred->getTerminator();
     // Replace branch to BB by branch to TargetFailureBB.
-    replaceBranchTarget(TI, CCBBlock, TargetFailureBB,
-    /*PreserveArgs=*/true);
+    TI->replaceBranchTarget(CCBBlock, TargetFailureBB);
   }
-  Cloner.updateOSSAAfterCloning();
+  Cloner.updateSSAAfterCloning();
 }
 
 /// Create a copy of the BB or reuse BB as a landing basic block for all
@@ -370,8 +371,7 @@ void CheckedCastBrJumpThreading::Edit::modifyCFGForSuccessPreds(
   for (auto *Pred : SuccessPreds) {
     TermInst *TI = Pred->getTerminator();
     // Replace branch to BB by branch to TargetSuccessBB.
-    replaceBranchTarget(TI, CCBBlock, clonedCCBBlock,
-                        /*PreserveArgs=*/true);
+    TI->replaceBranchTarget(CCBBlock, clonedCCBBlock);
   }
   // Remove the unreachable checked_cast_br target.
   auto *clonedCCBI =
@@ -383,7 +383,7 @@ void CheckedCastBrJumpThreading::Edit::modifyCFGForSuccessPreds(
     SILBuilderWithScope Builder(clonedCCBI);
     Builder.createBranch(clonedCCBI->getLoc(), successBB, {SuccessArg});
     clonedCCBI->eraseFromParent();
-    Cloner.updateOSSAAfterCloning();
+    Cloner.updateSSAAfterCloning();
     return;
   }
   // Remove all uses from the failure path so RAUW can erase the
@@ -395,7 +395,7 @@ void CheckedCastBrJumpThreading::Edit::modifyCFGForSuccessPreds(
   // Create nested borrow scopes for new phis either created for the
   // checked_cast's results or during SSA update. This puts the SIL in
   // valid OSSA form before calling OwnershipRAUWHelper.
-  Cloner.updateOSSAAfterCloning();
+  Cloner.updateSSAAfterCloning();
 
   auto *clonedSuccessArg = successBB->getArgument(0);
   OwnershipRAUWHelper rauwUtil(rauwContext, clonedSuccessArg, SuccessArg);
@@ -774,7 +774,7 @@ void CheckedCastBrJumpThreading::optimizeFunction() {
     if (edit->SuccessArg->isErased())
       continue;
 
-    BasicBlockCloner Cloner(edit->CCBBlock, deBlocks);
+    BasicBlockCloner Cloner(edit->CCBBlock, pm, deBlocks);
     if (!Cloner.canCloneBlock())
       continue;
 
@@ -789,7 +789,7 @@ void CheckedCastBrJumpThreading::optimizeFunction() {
     edit->modifyCFGForSuccessPreds(Cloner, rauwContext);
 
     if (Cloner.wasCloned()) {
-      Cloner.updateOSSAAfterCloning();
+      Cloner.updateSSAAfterCloning();
 
       if (!Cloner.getNewBB()->pred_empty())
         BlocksForWorklist.push_back(Cloner.getNewBB());
@@ -802,11 +802,16 @@ void CheckedCastBrJumpThreading::optimizeFunction() {
 namespace swift {
 
 bool tryCheckedCastBrJumpThreading(
-    SILFunction *Fn, DominanceInfo *DT, DeadEndBlocks *deBlocks,
+    SILFunction *Fn, SILPassManager *pm, DominanceInfo *DT, DeadEndBlocks *deBlocks,
     SmallVectorImpl<SILBasicBlock *> &BlocksForWorklist,
     bool EnableOSSARewriteTerminator) {
 
-  CheckedCastBrJumpThreading CCBJumpThreading(Fn, DT, deBlocks,
+  // TODO: Disable for OSSA temporarily
+  if (Fn->hasOwnership()) {
+    return false;
+  }
+
+  CheckedCastBrJumpThreading CCBJumpThreading(Fn, pm, DT, deBlocks,
                                               BlocksForWorklist,
                                               EnableOSSARewriteTerminator);
   CCBJumpThreading.optimizeFunction();

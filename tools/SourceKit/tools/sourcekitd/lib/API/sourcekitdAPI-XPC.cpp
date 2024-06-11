@@ -283,32 +283,33 @@ ResponseBuilder::Dictionary ResponseBuilder::Array::appendDictionary() {
   return Dictionary(dict);
 }
 
-sourcekitd_uid_t RequestDict::getUID(UIdent Key) {
+sourcekitd_uid_t RequestDict::getUID(UIdent Key) const {
   return sourcekitd_uid_t(xpc_dictionary_get_uint64(Dict, Key.c_str()));
 }
 
-Optional<StringRef> RequestDict::getString(UIdent Key) {
+std::optional<StringRef> RequestDict::getString(UIdent Key) const {
   xpc_object_t xobj = xpc_dictionary_get_value(Dict, Key.c_str());
   if (!xobj)
-    return None;
+    return std::nullopt;
   if (xpc_get_type(xobj) != XPC_TYPE_STRING)
-    return None;
+    return std::nullopt;
   return StringRef(xpc_string_get_string_ptr(xobj),
                    xpc_string_get_length(xobj));
 }
 
-Optional<RequestDict> RequestDict::getDictionary(SourceKit::UIdent Key) {
+std::optional<RequestDict>
+RequestDict::getDictionary(SourceKit::UIdent Key) const {
   xpc_object_t xobj = xpc_dictionary_get_value(Dict, Key.c_str());
   if (!xobj)
-    return None;
+    return std::nullopt;
   if (xpc_get_type(xobj) != XPC_TYPE_DICTIONARY)
-    return None;
+    return std::nullopt;
   return RequestDict(xobj);
 }
 
 bool RequestDict::getStringArray(SourceKit::UIdent Key,
                                  llvm::SmallVectorImpl<const char *> &Arr,
-                                 bool isOptional) {
+                                 bool isOptional) const {
   xpc_object_t xarr = xpc_dictionary_get_value(Dict, Key.c_str());
   if (!xarr)
     return !isOptional;
@@ -327,7 +328,7 @@ bool RequestDict::getStringArray(SourceKit::UIdent Key,
 
 bool RequestDict::getUIDArray(SourceKit::UIdent Key,
                               llvm::SmallVectorImpl<sourcekitd_uid_t> &Arr,
-                              bool isOptional) {
+                              bool isOptional) const {
   xpc_object_t xarr = xpc_dictionary_get_value(Dict, Key.c_str());
   if (!xarr)
     return !isOptional;
@@ -345,7 +346,8 @@ bool RequestDict::getUIDArray(SourceKit::UIdent Key,
 }
 
 bool RequestDict::dictionaryArrayApply(
-    SourceKit::UIdent key, llvm::function_ref<bool(RequestDict)> applier) {
+    SourceKit::UIdent key,
+    llvm::function_ref<bool(RequestDict)> applier) const {
   xpc_object_t xarr = xpc_dictionary_get_value(Dict, key.c_str());
   if (!xarr || xpc_get_type(xarr) != XPC_TYPE_ARRAY)
     return true;
@@ -361,7 +363,7 @@ bool RequestDict::dictionaryArrayApply(
 }
 
 bool RequestDict::getInt64(SourceKit::UIdent Key, int64_t &Val,
-                           bool isOptional) {
+                           bool isOptional) const {
   xpc_object_t xobj = xpc_dictionary_get_value(Dict, Key.c_str());
   if (!xobj)
     return !isOptional;
@@ -369,10 +371,11 @@ bool RequestDict::getInt64(SourceKit::UIdent Key, int64_t &Val,
   return false;
 }
 
-Optional<int64_t> RequestDict::getOptionalInt64(SourceKit::UIdent Key) {
+std::optional<int64_t>
+RequestDict::getOptionalInt64(SourceKit::UIdent Key) const {
   xpc_object_t xobj = xpc_dictionary_get_value(Dict, Key.c_str());
   if (!xobj)
-    return None;
+    return std::nullopt;
   return xpc_int64_get_value(xobj);
 }
 

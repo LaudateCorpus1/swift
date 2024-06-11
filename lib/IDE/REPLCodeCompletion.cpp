@@ -174,7 +174,7 @@ static void toDisplayString(CodeCompletionResult *Result,
 }
 
 namespace swift {
-class REPLCodeCompletionConsumer : public SimpleCachingCodeCompletionConsumer {
+class REPLCodeCompletionConsumer : public CodeCompletionConsumer {
   REPLCompletions &Completions;
 
 public:
@@ -186,7 +186,7 @@ public:
         context.getResultSink().Results);
     for (auto Result : SortedResults) {
       std::string InsertableString = toInsertableString(Result);
-      if (StringRef(InsertableString).startswith(Completions.Prefix)) {
+      if (StringRef(InsertableString).starts_with(Completions.Prefix)) {
         llvm::SmallString<128> PrintedResult;
         {
           llvm::raw_svector_ostream OS(PrintedResult);
@@ -315,12 +315,17 @@ StringRef REPLCompletions::getRoot() const {
 
   std::string RootStr = CookedResults[0].InsertableString.str();
   for (auto R : CookedResults) {
+    if (RootStr.empty())
+      break;
+
     if (R.NumBytesToErase != 0) {
       RootStr.resize(0);
       break;
     }
-    auto MismatchPlace = std::mismatch(RootStr.begin(), RootStr.end(),
-                                       R.InsertableString.begin());
+
+    auto MismatchPlace =
+        std::mismatch(RootStr.begin(), RootStr.end(),
+                      R.InsertableString.begin(), R.InsertableString.end());
     RootStr.resize(MismatchPlace.first - RootStr.begin());
   }
   Root = RootStr;

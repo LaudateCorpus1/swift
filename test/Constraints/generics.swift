@@ -508,11 +508,12 @@ public struct S5 {
 
 // rdar://problem/24329052 - QoI: call argument archetypes not lining up leads to ambiguity errors
 
-struct S_24329052<T> { // expected-note {{generic parameter 'T' of generic struct 'S_24329052' declared here}}
+struct S_24329052<T> { // expected-note {{generic parameter 'T' of generic struct 'S_24329052' declared here}} expected-note {{'T' previously declared here}}
   var foo: (T) -> Void
   // expected-note@+1 {{generic parameter 'T' of instance method 'bar(_:)' declared here}}
   func bar<T>(_ v: T) { foo(v) }
   // expected-error@-1 {{cannot convert value of type 'T' (generic parameter of instance method 'bar(_:)') to expected argument type 'T' (generic parameter of generic struct 'S_24329052')}}
+  // expected-warning@-2 {{generic parameter 'T' shadows generic parameter from outer scope with the same name; this is an error in the Swift 6 language mode}}
 }
 
 extension Sequence {
@@ -943,7 +944,7 @@ do {
   struct Outer<T: P_eaf0300ff7a> {
     struct Inner<U> {}
 
-    func container<T>() -> Inner<T> {
+    func container<V>() -> Inner<V> {
       return Inner()
     }
   }
@@ -995,4 +996,64 @@ do {
   // expected-error@-2 {{type 'Array<String>.Type' cannot conform to 'Sequence'}}
   // expected-error@-3 {{local function 'foo' requires the types 'Set<Int>.Type.Element' and 'Array<String>.Type.Element' be equivalent}}
   // expected-note@-4 2 {{only concrete types such as structs, enums and classes can conform to protocols}}
+}
+
+// https://github.com/apple/swift/issues/56173
+protocol P_56173 {
+  associatedtype Element
+}
+protocol Q_56173 {
+  associatedtype Element
+}
+
+func test_requirement_failures_in_ambiguous_context() {
+  struct A : P_56173 {
+    typealias Element = String
+  }
+  struct B : Q_56173 {
+    typealias Element = Int
+  }
+
+  func f1<T: Equatable>(_: T, _: T) {} // expected-note {{where 'T' = 'A'}}
+
+  f1(A(), B()) // expected-error {{local function 'f1' requires that 'A' conform to 'Equatable'}}
+  // expected-error@-1 {{cannot convert value of type 'B' to expected argument type 'A'}}
+
+  func f2<T: P_56173, U: P_56173>(_: T, _: U) {}
+  // expected-note@-1 {{candidate requires that 'B' conform to 'P_56173' (requirement specified as 'U' : 'P_56173')}}
+  func f2<T: Q_56173, U: Q_56173>(_: T, _: U) {}
+  // expected-note@-1 {{candidate requires that 'A' conform to 'Q_56173' (requirement specified as 'T' : 'Q_56173')}}
+
+  f2(A(), B()) // expected-error {{no exact matches in call to local function 'f2'}}
+
+  func f3<T: P_56173>(_: T) where T.Element == Int {}
+  // expected-note@-1 {{candidate requires that the types 'A.Element' (aka 'String') and 'Int' be equivalent (requirement specified as 'T.Element' == 'Int')}}
+  func f3<U: Q_56173>(_: U) where U.Element == String {}
+  // expected-note@-1 {{candidate requires that 'A' conform to 'Q_56173' (requirement specified as 'U' : 'Q_56173')}}
+
+  f3(A()) // expected-error {{no exact matches in call to local function 'f3'}}
+}
+
+// rdar://106054263 - failed to produce a diagnostic upon generic argument mismatch
+func test_mismatches_with_dependent_member_generic_arguments() {
+  struct Binding<T, U> {}
+  // expected-note@-1 {{arguments to generic parameter 'T' ('Double?' and 'Data.SomeAssociated') are expected to be equal}}
+  // expected-note@-2 {{arguments to generic parameter 'U' ('Int' and 'Data.SomeAssociated') are expected to be equal}}
+
+  struct Data : SomeProtocol {
+    typealias SomeAssociated = String
+  }
+
+  func test1<T: SomeProtocol>(_: Binding<T.SomeAssociated, T.SomeAssociated>, _: T) where T.SomeAssociated == String {
+  }
+
+  func test2<T: SomeProtocol>(_: Optional<T.SomeAssociated>, _: T) where T.SomeAssociated == String {
+  }
+
+  test1(Binding<Double?, Int>(), Data())
+  // expected-error@-1 {{cannot convert value of type 'Binding<Double?, Int>' to expected argument type 'Binding<Data.SomeAssociated, Data.SomeAssociated>'}}
+
+  test2(Optional<Int>(nil), Data())
+  // expected-error@-1 {{cannot convert value of type 'Optional<Int>' to expected argument type 'Optional<Data.SomeAssociated>'}}
+  // expected-note@-2 {{arguments to generic parameter 'Wrapped' ('Int' and 'Data.SomeAssociated') are expected to be equal}}
 }

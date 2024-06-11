@@ -13,9 +13,9 @@
 #include "swift/StaticMirror/ObjectFileContext.h"
 #include "swift/Basic/Unreachable.h"
 #include "swift/Demangling/Demangler.h"
-#include "swift/Reflection/ReflectionContext.h"
-#include "swift/Reflection/TypeLowering.h"
-#include "swift/Reflection/TypeRefBuilder.h"
+#include "swift/RemoteInspection/ReflectionContext.h"
+#include "swift/RemoteInspection/TypeLowering.h"
+#include "swift/RemoteInspection/TypeRefBuilder.h"
 #include "swift/Remote/CMemoryReader.h"
 
 #include "llvm/ADT/StringSet.h"
@@ -90,7 +90,7 @@ void Image::scanMachO(const llvm::object::MachOObjectFile *O) {
     }
 
     // The offset from the symbol is stored at the target address.
-    uint64_t Offset;
+    uint64_t Offset = 0;
     auto OffsetContent =
         getContentsAtAddress(bind.address(), O->getBytesInAddress());
     if (OffsetContent.empty())
@@ -431,6 +431,8 @@ bool ObjectMemoryReader::queryDataLayout(DataLayoutQueryType type,
     }
     return true;
   }
+  case DLQ_GetObjCInteropIsEnabled:
+    break;
   }
 
   return false;

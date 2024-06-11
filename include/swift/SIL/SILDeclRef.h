@@ -46,13 +46,14 @@ namespace swift {
   class EffectsAttr;
   class FileUnit;
   class SILFunctionType;
-  enum IsSerialized_t : unsigned char;
+  enum SerializedKind_t : uint8_t;
   enum class SubclassScope : unsigned char;
   class SILModule;
   class SILLocation;
   enum class SILLinkage : uint8_t;
   class AnyFunctionRef;
   class GenericSignature;
+  class CustomAttr;
 
 /// How a method is dispatched.
 enum class MethodDispatch {
@@ -182,20 +183,25 @@ struct SILDeclRef {
   /// The AST node represented by this SILDeclRef.
   Loc loc;
   /// The Kind of this SILDeclRef.
-  Kind kind : 4;
+  Kind kind : 5;
   /// True if this references a foreign entry point for the referenced decl.
   unsigned isForeign : 1;
   /// True if this references a distributed function.
   unsigned isDistributed : 1;
   /// True if this references a distributed function, but it is known to be local
   unsigned isKnownToBeLocal : 1;
+  /// True is this reference to function that could be looked up via a special
+  /// runtime API.
+  unsigned isRuntimeAccessible : 1;
   /// The BackDeploymentKind of this SILDeclRef.
   BackDeploymentKind backDeploymentKind : 2;
   /// The default argument index for a default argument getter.
   unsigned defaultArgIndex : 10;
+  /// Set if this is for an async let closure.
+  unsigned isAsyncLetClosure : 1;
 
   PointerUnion<AutoDiffDerivativeFunctionIdentifier *,
-               const GenericSignatureImpl *>
+               const GenericSignatureImpl *, CustomAttr *>
       pointer;
 
   /// Returns the type of AST node location being stored by the SILDeclRef.
@@ -225,9 +231,10 @@ struct SILDeclRef {
 
   /// Produces a null SILDeclRef.
   SILDeclRef()
-      : loc(), kind(Kind::Func), isForeign(0), 
-        isDistributed(0), isKnownToBeLocal(0),
-        backDeploymentKind(BackDeploymentKind::None), defaultArgIndex(0) {}
+      : loc(), kind(Kind::Func), isForeign(0), isDistributed(0),
+        isKnownToBeLocal(0), isRuntimeAccessible(0),
+        backDeploymentKind(BackDeploymentKind::None), defaultArgIndex(0),
+        isAsyncLetClosure(0) {}
 
   /// Produces a SILDeclRef of the given kind for the given decl.
   explicit SILDeclRef(
@@ -235,6 +242,7 @@ struct SILDeclRef {
       bool isForeign = false,
       bool isDistributed = false,
       bool isDistributedKnownToBeLocal = false,
+      bool isRuntimeAccessible = false,
       BackDeploymentKind backDeploymentKind = BackDeploymentKind::None,
       AutoDiffDerivativeFunctionIdentifier *derivativeId = nullptr);
 
@@ -282,7 +290,7 @@ struct SILDeclRef {
   bool hasAutoClosureExpr() const;
   bool hasFuncDecl() const;
 
-  ValueDecl *getDecl() const { return loc.get<ValueDecl *>(); }
+  ValueDecl *getDecl() const { return loc.dyn_cast<ValueDecl *>(); }
   AbstractClosureExpr *getAbstractClosureExpr() const {
     return loc.dyn_cast<AbstractClosureExpr *>();
   }
@@ -305,7 +313,7 @@ struct SILDeclRef {
   /// context) or its parent context.
   DeclContext *getInnermostDeclContext() const;
 
-  llvm::Optional<AnyFunctionRef> getAnyFunctionRef() const;
+  std::optional<AnyFunctionRef> getAnyFunctionRef() const;
 
   SILLocation getAsRegularLocation() const;
 
@@ -370,15 +378,22 @@ struct SILDeclRef {
     return kind == Kind::Initializer || kind == Kind::Destroyer;
   }
 
+  /// True if the SILDeclRef references an init accessor declaration.
+  bool isInitAccessor() const;
+
   /// True if the function should be treated as transparent.
   bool isTransparent() const;
   /// True if the function should have its body serialized.
-  IsSerialized_t isSerialized() const;
+  bool isSerialized() const;
+  /// True if this function is neither [serialized] or [serialized_for_package].
+  bool isNotSerialized() const;
+  /// Returns IsNotSerialized, IsSerializedForPackage, or IsSerialized.
+  SerializedKind_t getSerializedKind() const;
   /// True if the function has noinline attribute.
   bool isNoinline() const;
   /// True if the function has __always inline attribute.
   bool isAlwaysInline() const;
-  /// True if the function has the @_backDeploy attribute.
+  /// True if the function has the @backDeployed attribute.
   bool isBackDeployed() const;
 
   /// Return the expected linkage for a definition of this declaration.
@@ -389,10 +404,9 @@ struct SILDeclRef {
 
   /// Return the hash code for the SIL declaration.
   friend llvm::hash_code hash_value(const SILDeclRef &ref) {
-    return llvm::hash_combine(ref.loc.getOpaqueValue(),
-                              static_cast<int>(ref.kind),
-                              ref.isForeign, ref.isDistributed,
-                              ref.defaultArgIndex);
+    return llvm::hash_combine(
+        ref.loc.getOpaqueValue(), static_cast<int>(ref.kind), ref.isForeign,
+        ref.isDistributed, ref.defaultArgIndex, ref.isAsyncLetClosure);
   }
 
   bool operator==(SILDeclRef rhs) const {
@@ -400,8 +414,8 @@ struct SILDeclRef {
            kind == rhs.kind && isForeign == rhs.isForeign &&
            isDistributed == rhs.isDistributed &&
            backDeploymentKind == rhs.backDeploymentKind &&
-           defaultArgIndex == rhs.defaultArgIndex &&
-           pointer == rhs.pointer;
+           defaultArgIndex == rhs.defaultArgIndex && pointer == rhs.pointer &&
+           isAsyncLetClosure == rhs.isAsyncLetClosure;
   }
   bool operator!=(SILDeclRef rhs) const {
     return !(*this == rhs);
@@ -419,8 +433,8 @@ struct SILDeclRef {
                       /*foreign=*/foreign,
                       /*distributed=*/false,
                       /*knownToBeLocal=*/false,
-                      backDeploymentKind,
-                      defaultArgIndex,
+                      /*runtimeAccessible=*/false, backDeploymentKind,
+                      defaultArgIndex, isAsyncLetClosure,
                       pointer.get<AutoDiffDerivativeFunctionIdentifier *>());
   }
   /// Returns the distributed entry point corresponding to the same decl.
@@ -428,9 +442,8 @@ struct SILDeclRef {
     return SILDeclRef(loc.getOpaqueValue(), kind,
                       /*foreign=*/false,
                       /*distributed=*/distributed,
-                      /*knownToBeLocal=*/false,
-                      backDeploymentKind,
-                      defaultArgIndex,
+                      /*knownToBeLocal=*/false, isRuntimeAccessible,
+                      backDeploymentKind, defaultArgIndex, isAsyncLetClosure,
                       pointer.get<AutoDiffDerivativeFunctionIdentifier *>());
   }
 
@@ -441,19 +454,23 @@ struct SILDeclRef {
                       /*foreign=*/false,
                       /*distributed=*/false,
                       /*distributedKnownToBeLocal=*/isLocal,
-                      backDeploymentKind,
-                      defaultArgIndex,
+                      isRuntimeAccessible, backDeploymentKind, defaultArgIndex,
+                      isAsyncLetClosure,
                       pointer.get<AutoDiffDerivativeFunctionIdentifier *>());
+  }
+
+  /// Returns the runtime accessible entry point corresponding to the same decl.
+  SILDeclRef asRuntimeAccessible(bool accessible = true) const {
+    SILDeclRef newRef = *this;
+    newRef.isRuntimeAccessible = accessible;
+    return newRef;
   }
 
   /// Returns a copy of the decl with the given back deployment kind.
   SILDeclRef asBackDeploymentKind(BackDeploymentKind backDeploymentKind) const {
-    return SILDeclRef(loc.getOpaqueValue(), kind,
-                      isForeign,
-                      isDistributed,
-                      isKnownToBeLocal,
-                      backDeploymentKind,
-                      defaultArgIndex,
+    return SILDeclRef(loc.getOpaqueValue(), kind, isForeign, isDistributed,
+                      isKnownToBeLocal, isRuntimeAccessible, backDeploymentKind,
+                      defaultArgIndex, isAsyncLetClosure,
                       pointer.get<AutoDiffDerivativeFunctionIdentifier *>());
   }
 
@@ -534,7 +551,7 @@ struct SILDeclRef {
                                                     AbstractFunctionDecl *func);
 
   /// Returns the availability of the decl for computing linkage.
-  Optional<AvailabilityContext> getAvailabilityForLinkage() const;
+  std::optional<AvailabilityContext> getAvailabilityForLinkage() const;
 
   /// True if the referenced entity is some kind of thunk.
   bool isThunk() const;
@@ -587,19 +604,18 @@ struct SILDeclRef {
 private:
   friend struct llvm::DenseMapInfo<swift::SILDeclRef>;
   /// Produces a SILDeclRef from an opaque value.
-  explicit SILDeclRef(void *opaqueLoc, Kind kind,
-                      bool isForeign,
-                      bool isDistributed,
-                      bool isKnownToBeLocal,
+  explicit SILDeclRef(void *opaqueLoc, Kind kind, bool isForeign,
+                      bool isDistributed, bool isKnownToBeLocal,
+                      bool isRuntimeAccessible,
                       BackDeploymentKind backDeploymentKind,
-                      unsigned defaultArgIndex,
+                      unsigned defaultArgIndex, bool isAsyncLetClosure,
                       AutoDiffDerivativeFunctionIdentifier *derivativeId)
       : loc(Loc::getFromOpaqueValue(opaqueLoc)), kind(kind),
-        isForeign(isForeign),
-        isDistributed(isDistributed),
+        isForeign(isForeign), isDistributed(isDistributed),
         isKnownToBeLocal(isKnownToBeLocal),
+        isRuntimeAccessible(isRuntimeAccessible),
         backDeploymentKind(backDeploymentKind),
-        defaultArgIndex(defaultArgIndex),
+        defaultArgIndex(defaultArgIndex), isAsyncLetClosure(isAsyncLetClosure),
         pointer(derivativeId) {}
 };
 
@@ -623,11 +639,13 @@ template<> struct DenseMapInfo<swift::SILDeclRef> {
 
   static SILDeclRef getEmptyKey() {
     return SILDeclRef(PointerInfo::getEmptyKey(), Kind::Func, false, false,
-                      false, BackDeploymentKind::None, 0, nullptr);
+                      false, false, BackDeploymentKind::None, 0, false,
+                      nullptr);
   }
   static SILDeclRef getTombstoneKey() {
     return SILDeclRef(PointerInfo::getTombstoneKey(), Kind::Func, false, false,
-                      false, BackDeploymentKind::None, 0, nullptr);
+                      false, false, BackDeploymentKind::None, 0, false,
+                      nullptr);
   }
   static unsigned getHashValue(swift::SILDeclRef Val) {
     unsigned h1 = PointerInfo::getHashValue(Val.loc.getOpaqueValue());
@@ -640,8 +658,9 @@ template<> struct DenseMapInfo<swift::SILDeclRef> {
     unsigned h6 = UnsignedInfo::getHashValue(Val.isDistributed);
     unsigned h7 = UnsignedInfo::getHashValue(unsigned(Val.backDeploymentKind));
     unsigned h8 = UnsignedInfo::getHashValue(Val.isKnownToBeLocal);
+    unsigned h9 = UnsignedInfo::getHashValue(Val.isRuntimeAccessible);
     return h1 ^ (h2 << 4) ^ (h3 << 9) ^ (h4 << 7) ^ (h5 << 11) ^ (h6 << 8) ^
-           (h7 << 10) ^ (h8 << 13);
+      (h7 << 10) ^ (h8 << 13) ^ (h9 << 15);
   }
   static bool isEqual(swift::SILDeclRef const &LHS,
                       swift::SILDeclRef const &RHS) {

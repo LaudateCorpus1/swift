@@ -10,24 +10,24 @@
 // CHECK: SWIFT_EXTERN void $s9Functions24inoutTypeWithNullabilityyySVzF(void const * _Nonnull * _Nonnull x) SWIFT_NOEXCEPT SWIFT_CALL; // inoutTypeWithNullability(_:)
 // CHECK: SWIFT_EXTERN void $s9Functions25inoutUnsafeGenericPointeryySPys5Int32VGzF(int32_t const * _Nonnull * _Nonnull x) SWIFT_NOEXCEPT SWIFT_CALL; // inoutUnsafeGenericPointer(_:)
 
-// CHECK:      inline void inOutInt(swift::Int & x) noexcept {
-// CHECK-NEXT:   return _impl::$s9Functions8inOutIntyySizF(&x);
+// CHECK:      SWIFT_INLINE_THUNK void inOutInt(swift::Int & x) noexcept SWIFT_SYMBOL({{.*}}) {
+// CHECK-NEXT:   _impl::$s9Functions8inOutIntyySizF(&x);
 // CHECK-NEXT: }
 
-// CHECK:      inline void inOutTwoInt(swift::Int & x, swift::Int & y) noexcept {
-// CHECK-NEXT:   return _impl::$s9Functions11inOutTwoIntyySiz_SiztF(&x, &y);
+// CHECK:      SWIFT_INLINE_THUNK void inOutTwoInt(swift::Int & x, swift::Int & y) noexcept SWIFT_SYMBOL({{.*}}) {
+// CHECK-NEXT:   _impl::$s9Functions11inOutTwoIntyySiz_SiztF(&x, &y);
 // CHECK-NEXT: }
 
-// CHECK:      inline void inOutTwoParam(bool & x, double & y) noexcept {
-// CHECK-NEXT:   return _impl::$s9Functions13inOutTwoParamyySbz_SdztF(&x, &y);
+// CHECK:      SWIFT_INLINE_THUNK void inOutTwoParam(bool & x, double & y) noexcept SWIFT_SYMBOL({{.*}}) {
+// CHECK-NEXT:   _impl::$s9Functions13inOutTwoParamyySbz_SdztF(&x, &y);
 // CHECK-NEXT: }
 
-// CHECK:      inline void inoutTypeWithNullability(void const * _Nonnull & x) noexcept {
-// CHECK-NEXT:   return _impl::$s9Functions24inoutTypeWithNullabilityyySVzF(&x);
+// CHECK:      SWIFT_INLINE_THUNK void inoutTypeWithNullability(void const * _Nonnull & x) noexcept SWIFT_SYMBOL({{.*}}) {
+// CHECK-NEXT:   _impl::$s9Functions24inoutTypeWithNullabilityyySVzF(&x);
 // CHECK-NEXT: }
 
-// CHECK:      inline void inoutUnsafeGenericPointer(int32_t const * _Nonnull & x) noexcept {
-// CHECK-NEXT:   return _impl::$s9Functions25inoutUnsafeGenericPointeryySPys5Int32VGzF(&x);
+// CHECK:      SWIFT_INLINE_THUNK void inoutUnsafeGenericPointer(int32_t const * _Nonnull & x) noexcept SWIFT_SYMBOL({{.*}}) {
+// CHECK-NEXT:   _impl::$s9Functions25inoutUnsafeGenericPointeryySPys5Int32VGzF(&x);
 // CHECK-NEXT: }
 
 public func inOutInt(_ x: inout Int) { x = Int() }

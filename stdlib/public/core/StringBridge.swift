@@ -313,7 +313,7 @@ internal enum _KnownCocoaString {
   case storage
   case shared
   case cocoa
-#if !(arch(i386) || arch(arm) || arch(arm64_32) || arch(wasm32))
+#if _pointerBitWidth(_64)
   case tagged
 #endif
 #if arch(arm64)
@@ -323,7 +323,7 @@ internal enum _KnownCocoaString {
   @inline(__always)
   init(_ str: _CocoaString) {
 
-#if !(arch(i386) || arch(arm) || arch(arm64_32))
+#if _pointerBitWidth(_64)
     if _isObjCTaggedPointer(str) {
 #if arch(arm64)
       if let _ = getConstantTaggedCocoaContents(str) {
@@ -349,8 +349,7 @@ internal enum _KnownCocoaString {
   }
 }
 
-#if !(arch(i386) || arch(arm) || arch(arm64_32))
-
+#if _pointerBitWidth(_64)
 // Resiliently write a tagged _CocoaString's contents into a buffer.
 // The Foundation overlay takes care of bridging tagged pointer strings before
 // they reach us, but this may still be called by older code, or by strings
@@ -393,7 +392,7 @@ private func _withCocoaASCIIPointer<R>(
   requireStableAddress: Bool,
   work: (UnsafePointer<UInt8>) -> R?
 ) -> R? {
-  #if !(arch(i386) || arch(arm) || arch(arm64_32))
+  #if _pointerBitWidth(_64)
   if _isObjCTaggedPointer(str) {
     if let ptr = getConstantTaggedCocoaContents(str)?.asciiContentsPointer {
       return work(ptr)
@@ -421,7 +420,7 @@ private func _withCocoaUTF8Pointer<R>(
   requireStableAddress: Bool,
   work: (UnsafePointer<UInt8>) -> R?
 ) -> R? {
-  #if !(arch(i386) || arch(arm) || arch(arm64_32))
+  #if _pointerBitWidth(_64)
   if _isObjCTaggedPointer(str) {
     if let ptr = getConstantTaggedCocoaContents(str)?.asciiContentsPointer {
       return work(ptr)
@@ -567,6 +566,7 @@ private func getConstantTaggedCocoaContents(_ cocoaString: _CocoaString) ->
 #endif
 }
 
+#if !$Embedded
 @usableFromInline
 @_effects(releasenone) // @opaque
 internal func _bridgeCocoaString(_ cocoaString: _CocoaString) -> _StringGuts {
@@ -577,7 +577,7 @@ internal func _bridgeCocoaString(_ cocoaString: _CocoaString) -> _StringGuts {
   case .shared:
     return _unsafeUncheckedDowncast(
       cocoaString, to: __SharedStringStorage.self).asString._guts
-#if !(arch(i386) || arch(arm) || arch(arm64_32))
+#if _pointerBitWidth(_64)
   case .tagged:
     // Foundation should be taking care of tagged pointer strings before they
     // reach here, so the only ones reaching this point should be back deployed,
@@ -608,7 +608,7 @@ internal func _bridgeCocoaString(_ cocoaString: _CocoaString) -> _StringGuts {
     let immutableCopy
       = _stdlib_binary_CFStringCreateCopy(cocoaString)
 
-#if !(arch(i386) || arch(arm) || arch(arm64_32))
+#if _pointerBitWidth(_64)
     if _isObjCTaggedPointer(immutableCopy) {
       // Copying a tagged pointer can produce a tagged pointer, but only if it's
       // small enough to definitely fit in a _SmallString
@@ -640,6 +640,7 @@ extension String {
     self._guts = _bridgeCocoaString(_cocoaString)
   }
 }
+#endif
 
 @_effects(releasenone)
 private func _createNSString(
@@ -665,6 +666,7 @@ private func _createCFString(
   )
 }
 
+#if !$Embedded
 extension String {
   @_effects(releasenone)
   public // SPI(Foundation)
@@ -747,6 +749,9 @@ internal func _SwiftCreateBridgedString_DoNotCall(
   deinit {}
 }
 
+@available(*, unavailable)
+extension __SwiftNativeNSString: Sendable {}
+
 // Called by the SwiftObject implementation to get the description of a value
 // as an NSString.
 @_silgen_name("swift_stdlib_getDescription")
@@ -764,6 +769,7 @@ internal func _NSStringFromUTF8(_ s: UnsafePointer<UInt8>, _ len: Int)
     as: UTF8.self
   )._bridgeToObjectiveCImpl()
 }
+#endif
 
 #else // !_runtime(_ObjC)
 
@@ -791,23 +797,33 @@ extension StringProtocol {
     return self.utf16.index(self.utf16.startIndex, offsetBy: offset)
   }
 
-  @_specialize(where Self == String)
-  @_specialize(where Self == Substring)
   public // SPI(Foundation)
   func _toUTF16Offsets(_ indices: Range<Index>) -> Range<Int> {
-    let lowerbound = _toUTF16Offset(indices.lowerBound)
-    let length = self.utf16.distance(
-      from: indices.lowerBound, to: indices.upperBound)
-    return Range(
-      uncheckedBounds: (lower: lowerbound, upper: lowerbound + length))
+    if Self.self == String.self {
+      let s = unsafeBitCast(self, to: String.self)
+      return s.utf16._offsetRange(for: indices, from: s.startIndex)
+    }
+    if Self.self == Substring.self {
+      let s = unsafeBitCast(self, to: Substring.self)
+      return s._slice._base.utf16._offsetRange(for: indices, from: s.startIndex)
+    }
+    let startOffset = _toUTF16Offset(indices.lowerBound)
+    let endOffset = _toUTF16Offset(indices.upperBound)
+    return Range(uncheckedBounds: (lower: startOffset, upper: endOffset))
   }
 
-  @_specialize(where Self == String)
-  @_specialize(where Self == Substring)
   public // SPI(Foundation)
   func _toUTF16Indices(_ range: Range<Int>) -> Range<Index> {
+    if Self.self == String.self {
+      let s = unsafeBitCast(self, to: String.self)
+      return s.utf16._indexRange(for: range, from: s.startIndex)
+    }
+    if Self.self == Substring.self {
+      let s = unsafeBitCast(self, to: Substring.self)
+      return s._slice._base.utf16._indexRange(for: range, from: s.startIndex)
+    }
     let lowerbound = _toUTF16Index(range.lowerBound)
-    let upperbound = _toUTF16Index(range.lowerBound + range.count)
+    let upperbound = _toUTF16Index(range.upperBound)
     return Range(uncheckedBounds: (lower: lowerbound, upper: upperbound))
   }
 }

@@ -2,7 +2,7 @@
 // RUN: not %target-swift-frontend -target %target-cpu-apple-macosx10.50 -disable-objc-attr-requires-foundation-module -typecheck %s 2>&1 | %FileCheck %s '--implicit-check-not=<unknown>:0'
 
 // Make sure we do not emit availability errors or warnings when -disable-availability-checking is passed
-// RUN: not %target-swift-frontend -target %target-cpu-apple-macosx10.50 -typecheck -disable-objc-attr-requires-foundation-module -disable-availability-checking %s 2>&1 | %FileCheck %s '--implicit-check-not=error:' '--implicit-check-not=warning:'
+// RUN: not %target-swift-frontend -target %target-cpu-apple-macosx10.50 -typecheck -disable-objc-attr-requires-foundation-module -disable-availability-checking %s -diagnostic-style llvm 2>&1 | %FileCheck %s '--implicit-check-not=error:' '--implicit-check-not=warning:'
 
 // REQUIRES: OS=macosx
 
@@ -56,11 +56,6 @@ func functionAvailableOn10_51() {
   let _: Int = globalFuncAvailableOn10_52() // expected-error {{'globalFuncAvailableOn10_52()' is only available in macOS 10.52 or newer}}
       // expected-note@-1 {{add 'if #available' version check}}
 }
-
-// Don't allow script-mode globals to marked potentially unavailable. Their
-// initializers are eagerly executed.
-@available(OSX, introduced: 10.51) // expected-error {{global variable cannot be marked potentially unavailable with '@available' in script mode}}
-var potentiallyUnavailableGlobalInScriptMode: Int = globalFuncAvailableOn10_51()
 
 // Still allow other availability annotations on script-mode globals
 @available(OSX, deprecated: 10.51)
@@ -1426,7 +1421,7 @@ class ClassForFixit {
       let _ = 6
     }
         // expected-error@-4 {{'globalFuncAvailableOn10_51()' is only available in macOS 10.51 or newer}}
-        // expected-note@-5 {{add 'if #available' version check}} {{5-6=if #available(macOS 10.51, *) {\n        if (globalFuncAvailableOn10_51() > 1066) {\n          let _ = 5\n          let _ = 6\n        }\n    } else {\n        // Fallback on earlier versions\n    }}}
+        // expected-note@-5 {{add 'if #available' version check}} {{5-+3:6=if #available(macOS 10.51, *) {\n        if (globalFuncAvailableOn10_51() > 1066) {\n          let _ = 5\n          let _ = 6\n        }\n    } else {\n        // Fallback on earlier versions\n    }}}
   }
 }
 
@@ -1731,12 +1726,11 @@ struct HasUnavailableExtension {
 
 @available(OSX, unavailable)
 extension HasUnavailableExtension {
-    // expected-note@-1 {{enclosing scope has been explicitly marked unavailable here}}
 
   public func inheritsUnavailable() { }
       // expected-note@-1 {{'inheritsUnavailable()' has been explicitly marked unavailable here}}
 
-  @available(OSX 10.9, *) // expected-warning {{instance method cannot be more available than unavailable enclosing scope}}
+  @available(OSX 10.9, *)
   public func moreAvailableButStillUnavailable() { }
       // expected-note@-1 {{'moreAvailableButStillUnavailable()' has been explicitly marked unavailable here}}
 }
@@ -1746,4 +1740,26 @@ func useHasUnavailableExtension(_ s: HasUnavailableExtension) {
   s.directlyUnavailable() // expected-error {{'directlyUnavailable()' is unavailable}}
   s.inheritsUnavailable() // expected-error {{'inheritsUnavailable()' is unavailable in macOS}}
   s.moreAvailableButStillUnavailable() // expected-error {{'moreAvailableButStillUnavailable()' is unavailable in macOS}}
+}
+
+@available(macOS 10.15, *)
+func f() -> Int { 17 }
+
+class StoredPropertiesWithAvailabilityInClosures {
+  private static let value: Int = {
+    if #available(macOS 10.15, *) {
+      return f()
+    }
+
+    return 0
+  }()
+
+  @available(macOS 10.14, *)
+  private static let otherValue: Int = {
+    if #available(macOS 10.15, *) {
+      return f()
+    }
+
+    return 0
+  }()
 }

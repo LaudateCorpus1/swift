@@ -6,7 +6,8 @@ let explicit = ExplicitDefaultConstructor()
 
 let implicit = ImplicitDefaultConstructor()
 
-let deletedImplicitly = ConstructorWithParam() // expected-error {{missing argument for parameter #1 in call}}
+let deletedImplicitly = ConstructorWithParam() // expected-warning {{'init()' is deprecated}}
+let onlyCopyAndMove = CopyAndMoveConstructor() // expected-warning {{'init()' is deprecated}}
 
 let deletedExplicitly = DefaultConstructorDeleted() // expected-error {{missing argument for parameter 'a' in call}}
 

@@ -17,6 +17,7 @@
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsFrontend.h"
 #include "swift/AST/Module.h"
+#include "swift/AST/PluginLoader.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/Basic/Defer.h"
@@ -239,9 +240,10 @@ bool IDEInspectionInstance::performCachedOperationIfPossible(
   DiagnosticEngine tmpDiags(tmpSM);
   ClangImporterOptions clangOpts;
   symbolgraphgen::SymbolGraphOptions symbolOpts;
+  CASOptions casOpts;
   std::unique_ptr<ASTContext> tmpCtx(
       ASTContext::get(langOpts, typeckOpts, silOpts, searchPathOpts, clangOpts,
-                      symbolOpts, tmpSM, tmpDiags));
+                      symbolOpts, casOpts, tmpSM, tmpDiags));
   tmpCtx->CancellationFlag = CancellationFlag;
   registerParseRequestFunctions(tmpCtx->evaluator);
   registerIDERequestFunctions(tmpCtx->evaluator);
@@ -346,10 +348,11 @@ bool IDEInspectionInstance::performCachedOperationIfPossible(
         newBufferID,
         GeneratedSourceInfo{
           GeneratedSourceInfo::ReplacedFunctionBody,
-          *AFD->getParentSourceFile()->getBufferID(),
-          AFD->getOriginalBodySourceRange(),
-          newBodyRange,
-          AFD
+          Lexer::getCharSourceRangeFromSourceRange(
+              SM, AFD->getOriginalBodySourceRange()),
+          Lexer::getCharSourceRangeFromSourceRange(SM, newBodyRange),
+          AFD,
+          nullptr
         }
     );
 
@@ -442,7 +445,8 @@ bool IDEInspectionInstance::performCachedOperationIfPossible(
 }
 
 void IDEInspectionInstance::performNewOperation(
-    Optional<llvm::hash_code> ArgsHash, swift::CompilerInvocation &Invocation,
+    std::optional<llvm::hash_code> ArgsHash,
+    swift::CompilerInvocation &Invocation,
     llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FileSystem,
     llvm::MemoryBuffer *ideInspectionTargetBuffer, unsigned int Offset,
     DiagnosticConsumer *DiagC,
@@ -452,7 +456,7 @@ void IDEInspectionInstance::performNewOperation(
   llvm::PrettyStackTraceString trace("While performing new IDE inspection");
 
   // If ArgsHash is None we shouldn't cache the compiler instance.
-  bool ShouldCacheCompilerInstance = ArgsHash.hasValue();
+  bool ShouldCacheCompilerInstance = ArgsHash.has_value();
 
   auto CI = std::make_shared<CompilerInstance>();
 
@@ -481,6 +485,7 @@ void IDEInspectionInstance::performNewOperation(
           InstanceSetupError));
       return;
     }
+    CI->getASTContext().getPluginLoader().setRegistry(Plugins.get());
     CI->getASTContext().CancellationFlag = CancellationFlag;
     registerIDERequestFunctions(CI->getASTContext().evaluator);
 
@@ -551,7 +556,7 @@ void swift::ide::IDEInspectionInstance::performOperation(
     swift::CompilerInvocation &Invocation, llvm::ArrayRef<const char *> Args,
     llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FileSystem,
     llvm::MemoryBuffer *ideInspectionTargetBuffer, unsigned int Offset,
-    DiagnosticConsumer *DiagC, bool IgnoreSwiftSourceInfo,
+    DiagnosticConsumer *DiagC,
     std::shared_ptr<std::atomic<bool>> CancellationFlag,
     llvm::function_ref<void(CancellableResult<IDEInspectionInstanceResult>)>
         Callback) {
@@ -573,8 +578,6 @@ void swift::ide::IDEInspectionInstance::performOperation(
     return;
   }
 
-  Invocation.getFrontendOptions().IgnoreSwiftSourceInfo = IgnoreSwiftSourceInfo;
-
   // We don't need token list.
   Invocation.getLangOptions().CollectParsedToken = false;
 
@@ -592,8 +595,7 @@ void swift::ide::IDEInspectionInstance::codeComplete(
     llvm::function_ref<void(CancellableResult<CodeCompleteResult>)> Callback) {
   using ResultType = CancellableResult<CodeCompleteResult>;
 
-  struct ConsumerToCallbackAdapter
-      : public SimpleCachingCodeCompletionConsumer {
+  struct ConsumerToCallbackAdapter : public CodeCompletionConsumer {
     SwiftCompletionInfo SwiftContext;
     ImportDepth ImportDep;
     std::shared_ptr<std::atomic<bool>> CancellationFlag;
@@ -630,7 +632,7 @@ void swift::ide::IDEInspectionInstance::codeComplete(
   // they're somewhat heavy operations and aren't needed for completion.
   performOperation(
       Invocation, Args, FileSystem, ideInspectionTargetBuffer, Offset, DiagC,
-      /*IgnoreSwiftSourceInfo=*/true, CancellationFlag,
+      CancellationFlag,
       [&](CancellableResult<IDEInspectionInstanceResult> CIResult) {
         CIResult.mapAsync<CodeCompleteResult>(
             [&CompletionContext, &CancellationFlag](auto &Result,
@@ -707,7 +709,7 @@ void swift::ide::IDEInspectionInstance::typeContextInfo(
 
   performOperation(
       Invocation, Args, FileSystem, ideInspectionTargetBuffer, Offset, DiagC,
-      /*IgnoreSwiftSourceInfo=*/true, CancellationFlag,
+      CancellationFlag,
       [&](CancellableResult<IDEInspectionInstanceResult> CIResult) {
         CIResult.mapAsync<TypeContextInfoResult>(
             [&CancellationFlag](auto &Result, auto DeliverTransformed) {
@@ -775,7 +777,7 @@ void swift::ide::IDEInspectionInstance::conformingMethodList(
 
   performOperation(
       Invocation, Args, FileSystem, ideInspectionTargetBuffer, Offset, DiagC,
-      /*IgnoreSwiftSourceInfo=*/true, CancellationFlag,
+      CancellationFlag,
       [&](CancellableResult<IDEInspectionInstanceResult> CIResult) {
         CIResult.mapAsync<ConformingMethodListResults>(
             [&ExpectedTypeNames, &CancellationFlag](auto &Result,
@@ -828,34 +830,33 @@ void swift::ide::IDEInspectionInstance::cursorInfo(
         : ReusingASTContext(ReusingASTContext),
           CancellationFlag(CancellationFlag), Callback(Callback) {}
 
-    void handleResults(const ResolvedCursorInfo &result) override {
+    void handleResults(std::vector<ResolvedCursorInfoPtr> result) override {
       HandleResultsCalled = true;
       if (CancellationFlag &&
           CancellationFlag->load(std::memory_order_relaxed)) {
         Callback(ResultType::cancelled());
       } else {
-        Callback(ResultType::success({&result, ReusingASTContext}));
+        Callback(ResultType::success({result, ReusingASTContext}));
       }
     }
   };
 
   performOperation(
       Invocation, Args, FileSystem, ideInspectionTargetBuffer, Offset, DiagC,
-      /*IgnoreSwiftSourceInfo=*/false, CancellationFlag,
+      CancellationFlag,
       [&](CancellableResult<IDEInspectionInstanceResult> CIResult) {
         CIResult.mapAsync<CursorInfoResults>(
-            [&CancellationFlag, Offset](auto &Result, auto DeliverTransformed) {
+            [&CancellationFlag](auto &Result, auto DeliverTransformed) {
               auto &Mgr = Result.CI->getSourceMgr();
-              auto RequestedLoc = Mgr.getLocForOffset(
-                  Mgr.getIDEInspectionTargetBufferID(), Offset);
+              auto RequestedLoc = Mgr.getIDEInspectionTargetLoc();
               ConsumerToCallbackAdapter Consumer(
                   Result.DidReuseAST, CancellationFlag, DeliverTransformed);
               std::unique_ptr<IDEInspectionCallbacksFactory> callbacksFactory(
                   ide::makeCursorInfoCallbacksFactory(Consumer, RequestedLoc));
 
               if (!Result.DidFindIDEInspectionTarget) {
-                return DeliverTransformed(ResultType::success(
-                    {/*Results=*/nullptr, Result.DidReuseAST}));
+                return DeliverTransformed(
+                    ResultType::success({/*Results=*/{}, Result.DidReuseAST}));
               }
 
               performIDEInspectionSecondPass(
@@ -865,8 +866,8 @@ void swift::ide::IDEInspectionInstance::cursorInfo(
                 // pass, we didn't receive any results. To make sure Callback
                 // gets called exactly once, call it manually with no results
                 // here.
-                DeliverTransformed(ResultType::success(
-                    {/*Results=*/nullptr, Result.DidReuseAST}));
+                DeliverTransformed(
+                    ResultType::success({/*Results=*/{}, Result.DidReuseAST}));
               }
             },
             Callback);

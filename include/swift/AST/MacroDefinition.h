@@ -18,75 +18,181 @@
 #ifndef SWIFT_AST_MACRO_DEFINITION_H
 #define SWIFT_AST_MACRO_DEFINITION_H
 
+#include "swift/Basic/StringExtras.h"
 #include "llvm/ADT/PointerUnion.h"
 
 namespace swift {
 
+class ASTContext;
+
+/// A reference to an external macro definition that is understood by ASTGen.
+struct ExternalMacroDefinition {
+  enum class PluginKind : int8_t {
+    InProcess = 0,
+    Executable = 1,
+    Error = -1,
+  };
+  PluginKind kind;
+  /// ASTGen's notion of an macro definition, which is opaque to the C++ part
+  /// of the compiler. If 'kind' is 'PluginKind::Error', this is a C-string to
+  /// the error message
+  const void *opaqueHandle = nullptr;
+
+  static ExternalMacroDefinition error(NullTerminatedStringRef message) {
+    return ExternalMacroDefinition{PluginKind::Error,
+                                   static_cast<const void *>(message.data())};
+  }
+  bool isError() const { return kind == PluginKind::Error; }
+  NullTerminatedStringRef getErrorMessage() const {
+    return static_cast<const char *>(opaqueHandle);
+  }
+};
+
+/// A reference to an external macro.
+struct ExternalMacroReference {
+  Identifier moduleName;
+  Identifier macroTypeName;
+};
+
+/// Describes the known kinds of builtin macros.
+enum class BuiltinMacroKind: uint8_t {
+  /// #externalMacro, which references an external macro.
+  ExternalMacro,
+  /// #isolation, which produces the isolation of the current context
+  IsolationMacro,
+};
+
+/// A single replacement
+struct ExpandedMacroReplacement {
+  unsigned startOffset, endOffset;
+  unsigned parameterIndex;
+};
+
+/// An expansion of another macro.
+class ExpandedMacroDefinition {
+  friend class MacroDefinition;
+
+  /// The expansion text, ASTContext-allocated.
+  StringRef expansionText;
+
+  /// The macro replacements, ASTContext-allocated.
+  ArrayRef<ExpandedMacroReplacement> replacements;
+
+  /// Same as above but for generic argument replacements
+  ArrayRef<ExpandedMacroReplacement> genericReplacements;
+
+  ExpandedMacroDefinition(
+    StringRef expansionText,
+    ArrayRef<ExpandedMacroReplacement> replacements,
+    ArrayRef<ExpandedMacroReplacement> genericReplacements
+  ) : expansionText(expansionText),
+          replacements(replacements),
+          genericReplacements(genericReplacements) { }
+
+public:
+  StringRef getExpansionText() const { return expansionText; }
+
+  ArrayRef<ExpandedMacroReplacement> getReplacements() const {
+    return replacements;
+  }
+  ArrayRef<ExpandedMacroReplacement> getGenericReplacements() const {
+    return genericReplacements;
+  }
+};
+
 /// Provides the definition of a macro.
 class MacroDefinition {
 public:
-  /// The kind of macro, which determines how it can be used in source code.
-  enum Kind: uint8_t {
-    /// An expression macro.
-    Expression,
-  };
-
-  /// Describes a missing macro definition.
-  struct MissingDefinition {
-    Identifier externalModuleName;
-    Identifier externalMacroTypeName;
-  };
-
     /// Describes how the macro is implemented.
-  enum class ImplementationKind: uint8_t {
+  enum class Kind: uint8_t {
+    /// The macro has a definition, but it is invalid, so the macro cannot be
+    /// expanded.
+    Invalid,
+
     /// The macro has no definition.
     Undefined,
 
-    /// The macro has a definition, but it could not be found.
-    Missing,
+    /// An externally-provided macro definition.
+    External,
 
-    /// The macro is in the same process as the compiler, whether built-in or
-    /// loaded via a compiler plugin.
-    InProcess,
+    /// A builtin macro definition, which has a separate builtin kind.
+    Builtin,
+
+    /// A macro that is defined as an expansion of another macro.
+    Expanded,
   };
 
   Kind kind;
-  ImplementationKind implKind;
 
 private:
-  void *opaqueHandle;
+  union Data {
+    ExternalMacroReference external;
+    BuiltinMacroKind builtin;
+    ExpandedMacroDefinition expanded;
 
-  MacroDefinition(Kind kind, ImplementationKind implKind, void *opaqueHandle)
-    : kind(kind), implKind(implKind), opaqueHandle(opaqueHandle) { }
+    Data() : builtin(BuiltinMacroKind::ExternalMacro) { }
+  } data;
+
+  MacroDefinition(Kind kind) : kind(kind) { }
+
+  MacroDefinition(ExternalMacroReference external) : kind(Kind::External) {
+    data.external = external;
+  }
+
+  MacroDefinition(BuiltinMacroKind builtinKind) : kind(Kind::Builtin) {
+    data.builtin = builtinKind;
+  }
+
+  MacroDefinition(ExpandedMacroDefinition expanded) : kind(Kind::Expanded) {
+    data.expanded = expanded;
+  }
 
 public:
-  static MacroDefinition forUndefined() {
-    return MacroDefinition{
-      Kind::Expression, ImplementationKind::Undefined, nullptr
-    };
+  static MacroDefinition forInvalid() {
+    return MacroDefinition(Kind::Invalid);
   }
 
-  static MacroDefinition forMissing(
+  static MacroDefinition forUndefined() {
+    return MacroDefinition(Kind::Undefined);
+  }
+
+  static MacroDefinition forExternal(
+      Identifier moduleName,
+      Identifier macroTypeName
+   ) {
+    return MacroDefinition(ExternalMacroReference{moduleName, macroTypeName});
+  }
+
+  static MacroDefinition forBuiltin(BuiltinMacroKind builtinKind) {
+    return MacroDefinition(builtinKind);
+  }
+
+  /// Create a representation of an expanded macro definition.
+  static MacroDefinition forExpanded(
       ASTContext &ctx,
-      Identifier externalModuleName,
-      Identifier externalMacroTypeName
+      StringRef expansionText,
+      ArrayRef<ExpandedMacroReplacement> replacements,
+      ArrayRef<ExpandedMacroReplacement> genericReplacements
   );
 
-  static MacroDefinition forInProcess(Kind kind, void *opaqueHandle) {
-    return MacroDefinition{kind, ImplementationKind::InProcess, opaqueHandle};
+  /// Retrieve the external macro being referenced.
+  ExternalMacroReference getExternalMacro() const {
+    assert(kind == Kind::External);
+    return data.external;
   }
 
-  /// Return the opaque handle for an in-process macro definition.
-  void *getInProcessOpaqueHandle() const {
-    assert(implKind == ImplementationKind::InProcess);
-    return opaqueHandle;
+  /// Retrieve the builtin kind.
+  BuiltinMacroKind getBuiltinKind() const {
+    assert(kind == Kind::Builtin);
+    return data.builtin;
   }
 
-  /// Return more information about a missing macro definition.
-  MissingDefinition *getMissingDefinition() const {
-    assert(implKind == ImplementationKind::Missing);
-    return static_cast<MissingDefinition *>(opaqueHandle);
+  ExpandedMacroDefinition getExpanded() const {
+    assert(kind == Kind::Expanded);
+    return data.expanded;
   }
+
+  operator Kind() const { return kind; }
 };
 
 }

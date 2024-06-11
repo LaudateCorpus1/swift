@@ -22,13 +22,15 @@ struct LoadableIntWrapper {
     return value + x * y;
   }
 
+  operator int() const { return value; }
+
   LoadableIntWrapper &operator++() {
     value++;
     return *this;
   }
 
   // Friend functions
-  friend bool operator==(const LoadableIntWrapper lhs,
+  friend bool operator==(const LoadableIntWrapper &lhs,
                          const LoadableIntWrapper &rhs) {
     return lhs.value == rhs.value;
   }
@@ -43,11 +45,22 @@ struct LoadableIntWrapper {
   }
 };
 
+namespace NS {
+struct IntWrapperInNamespace {
+  int value;
+  friend bool operator==(const IntWrapperInNamespace &lhs,
+                         const IntWrapperInNamespace &rhs) {
+    return lhs.value == rhs.value;
+  }
+};
+} // namespace NS
+
 struct LoadableBoolWrapper {
   bool value;
   LoadableBoolWrapper operator!() {
     return LoadableBoolWrapper{.value = !value};
   }
+  operator bool() const { return value; }
 };
 
 template<class T>
@@ -373,6 +386,16 @@ struct DerivedFromReadWriteIntArray : ReadWriteIntArray {};
 
 struct DerivedFromNonTrivialArrayByVal : NonTrivialArrayByVal {};
 
+struct SubscriptUnnamedParameter {
+  int operator[](int) const { return 123; }
+};
+
+struct SubscriptUnnamedParameterReadWrite {
+  int value = 0;
+  const int &operator[](int) const { return value; }
+  int &operator[](int) { return value; }
+};
+
 struct Iterator {
 private:
   int value = 123;
@@ -392,6 +415,66 @@ private:
   int value = 456;
 public:
   int operator*() const { return value; }
+};
+
+struct AmbiguousOperatorStar {
+private:
+  int value = 567;
+public:
+  int &operator*() { return value; }
+  const int &operator*() const { return value; }
+};
+
+struct AmbiguousOperatorStar2 {
+private:
+  int value = 678;
+public:
+  int &operator*() & { return value; }
+  const int &operator*() const & { return value; }
+  const int &&operator*() const && { return static_cast<const int &&>(value); }
+};
+
+struct DerivedFromConstIterator : public ConstIterator {};
+
+struct DerivedFromConstIteratorPrivately : private ConstIterator {};
+
+class SubscriptSetterConst {
+public:
+  using T = int;
+
+  SubscriptSetterConst() : p(new T[10]) {}
+
+  T& operator[](int i) const {
+    return p[i];
+  }
+private:
+  T *p;
+};
+
+struct DerivedFromConstIteratorPrivatelyWithUsingDecl : private ConstIterator {
+  using ConstIterator::operator*;
+};
+
+struct DerivedFromAmbiguousOperatorStarPrivatelyWithUsingDecl
+    : private AmbiguousOperatorStar {
+  using AmbiguousOperatorStar::operator*;
+};
+
+struct DerivedFromLoadableIntWrapperWithUsingDecl : private LoadableIntWrapper {
+  using LoadableIntWrapper::operator-;
+  using LoadableIntWrapper::operator+=;
+
+  int getValue() const {
+    return value;
+  }
+  void setValue(int v) {
+    this->value = v;
+  }
+};
+
+struct HasOperatorCallWithDefaultArg {
+  int value;
+  int operator()(int x = 0) const { return value + x; }
 };
 
 #endif

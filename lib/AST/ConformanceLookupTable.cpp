@@ -25,6 +25,7 @@
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/ProtocolConformanceRef.h"
+#include "swift/AST/TypeCheckRequests.h"
 #include "llvm/Support/SaveAndRestore.h"
 
 using namespace swift;
@@ -42,6 +43,9 @@ DeclContext *ConformanceLookupTable::ConformanceSource::getDeclContext() const {
 
   case ConformanceEntryKind::Synthesized:
     return getSynthesizedDeclContext();
+
+  case ConformanceEntryKind::PreMacroExpansion:
+    return getMacroGeneratedDeclContext();
   }
 
   llvm_unreachable("Unhandled ConformanceEntryKind in switch.");
@@ -103,6 +107,10 @@ void ConformanceLookupTable::ConformanceEntry::dump(raw_ostream &os,
   case ConformanceEntryKind::Synthesized:
     os << " synthesized";
     break;
+
+  case ConformanceEntryKind::PreMacroExpansion:
+    os << " unexpanded macro";
+    break;
   }
 
   if (auto conf = getConformance()) {
@@ -129,15 +137,19 @@ void ConformanceLookupTable::destroy() {
 
 namespace {
   struct ConformanceConstructionInfo : public Located<ProtocolDecl *> {
-    /// The location of the "unchecked" attribute, if this
+    /// The location of the "unchecked" attribute, if present.
     const SourceLoc uncheckedLoc;
+
+    /// The location of the "preconcurrency" attribute if present.
+    const SourceLoc preconcurrencyLoc;
 
     ConformanceConstructionInfo() { }
 
-    ConformanceConstructionInfo(
-      ProtocolDecl *item, SourceLoc loc,
-      SourceLoc uncheckedLoc
-    ) : Located(item, loc), uncheckedLoc(uncheckedLoc) { }
+    ConformanceConstructionInfo(ProtocolDecl *item, SourceLoc loc,
+                                SourceLoc uncheckedLoc,
+                                SourceLoc preconcurrencyLoc)
+        : Located(item, loc), uncheckedLoc(uncheckedLoc),
+          preconcurrencyLoc(preconcurrencyLoc) {}
   };
 }
 
@@ -162,7 +174,7 @@ void ConformanceLookupTable::forEachInStage(ConformanceStage stage,
     if (loader.first) {
       SmallVector<ProtocolConformance *, 2> conformances;
       loader.first->loadAllConformances(nominal, loader.second, conformances);
-      loadAllConformances(nominal, conformances);
+      registerProtocolConformances(nominal, conformances);
     }
 
     nominalFunc(nominal);
@@ -190,16 +202,20 @@ void ConformanceLookupTable::forEachInStage(ConformanceStage stage,
     if (loader.first) {
       SmallVector<ProtocolConformance *, 2> conformances;
       loader.first->loadAllConformances(next, loader.second, conformances);
-      loadAllConformances(next, conformances);
+      registerProtocolConformances(next, conformances);
       for (auto conf : conformances) {
-        protocols.push_back({conf->getProtocol(), SourceLoc(), SourceLoc()});
+        protocols.push_back(
+            {conf->getProtocol(), SourceLoc(), SourceLoc(), SourceLoc()});
       }
-    } else if (next->getParentSourceFile()) {
+    } else if (next->getParentSourceFile() ||
+               next->getParentModule()->isBuiltinModule()) {
+      InvertibleProtocolSet inverses;
       bool anyObject = false;
       for (const auto &found :
-               getDirectlyInheritedNominalTypeDecls(next, anyObject)) {
+               getDirectlyInheritedNominalTypeDecls(next, inverses, anyObject)) {
         if (auto proto = dyn_cast<ProtocolDecl>(found.Item))
-          protocols.push_back({proto, found.Loc, found.uncheckedLoc});
+          protocols.push_back(
+              {proto, found.Loc, found.uncheckedLoc, found.preconcurrencyLoc});
       }
     }
 
@@ -217,16 +233,17 @@ void ConformanceLookupTable::inheritConformances(ClassDecl *classDecl,
     if (superclassLoc.isValid())
       return superclassLoc;
 
-    for (const auto &inherited : classDecl->getInherited()) {
-      if (auto inheritedType = inherited.getType()) {
+    auto inheritedTypes = classDecl->getInherited();
+    for (unsigned i : inheritedTypes.getIndices()) {
+      if (auto inheritedType = inheritedTypes.getEntry(i).getType()) {
         if (inheritedType->getClassOrBoundGenericClass()) {
-          superclassLoc = inherited.getSourceRange().Start;
+          superclassLoc = inheritedTypes.getEntry(i).getSourceRange().Start;
           return superclassLoc;
         }
         if (inheritedType->isExistentialType()) {
           auto layout = inheritedType->getExistentialLayout();
           if (layout.explicitSuperclass) {
-            superclassLoc = inherited.getSourceRange().Start;
+            superclassLoc = inheritedTypes.getEntry(i).getSourceRange().Start;
             return superclassLoc;
           }
         }
@@ -278,18 +295,39 @@ void ConformanceLookupTable::updateLookupTable(NominalTypeDecl *nominal,
     forEachInStage(
         stage, nominal,
         [&](NominalTypeDecl *nominal) {
-          addInheritedProtocols(nominal,
-                                ConformanceSource::forExplicit(nominal));
+          auto source = ConformanceSource::forExplicit(nominal);
+
+          // Get all of the protocols in the inheritance clause.
+          InvertibleProtocolSet inverses;
+          bool anyObject = false;
+          for (const auto &found :
+                  getDirectlyInheritedNominalTypeDecls(nominal, inverses, anyObject)) {
+            auto proto = dyn_cast<ProtocolDecl>(found.Item);
+            if (!proto)
+              continue;
+            auto kp = proto->getKnownProtocolKind();
+           assert(!found.isSuppressed ||
+                  kp.has_value() &&
+                      "suppressed conformance for non-known protocol!?");
+            if (!found.isSuppressed) {
+              addProtocol(proto, found.Loc,
+                          source.withUncheckedLoc(found.uncheckedLoc)
+                                .withPreconcurrencyLoc(found.preconcurrencyLoc));
+            }
+          }
+
+          addMacroGeneratedProtocols(
+              nominal, ConformanceSource::forUnexpandedMacro(nominal));
         },
-        [&](ExtensionDecl *ext,
-            ArrayRef<ConformanceConstructionInfo> protos) {
+        [&](ExtensionDecl *ext, ArrayRef<ConformanceConstructionInfo> protos) {
           // The extension decl may not be validated, so we can't use
           // its inherited protocols directly.
           auto source = ConformanceSource::forExplicit(ext);
           for (auto locAndProto : protos)
             addProtocol(
-              locAndProto.Item, locAndProto.Loc,
-              source.withUncheckedLoc(locAndProto.uncheckedLoc));
+                locAndProto.Item, locAndProto.Loc,
+                source.withUncheckedLoc(locAndProto.uncheckedLoc)
+                      .withPreconcurrencyLoc(locAndProto.preconcurrencyLoc));
         });
     break;
 
@@ -402,17 +440,17 @@ void ConformanceLookupTable::updateLookupTable(NominalTypeDecl *nominal,
   }
 }
 
-void ConformanceLookupTable::loadAllConformances(
+void ConformanceLookupTable::registerProtocolConformances(
        DeclContext *dc,
        ArrayRef<ProtocolConformance*> conformances) {
   // If this declaration context came from source, there's nothing to
   // do here.
-  if (dc->getParentSourceFile())
-    return;
+  assert(!dc->getParentSourceFile() &&
+         !dc->getParentModule()->isBuiltinModule());
 
   // Add entries for each loaded conformance.
   for (auto conformance : conformances) {
-    registerProtocolConformance(conformance);
+    registerProtocolConformance(dc, conformance);
   }
 }
 
@@ -435,6 +473,7 @@ bool ConformanceLookupTable::addProtocol(ProtocolDecl *protocol, SourceLoc loc,
       switch (existingEntry->getKind()) {
       case ConformanceEntryKind::Explicit:
       case ConformanceEntryKind::Inherited:
+      case ConformanceEntryKind::PreMacroExpansion:
         return false;
 
       case ConformanceEntryKind::Implied:
@@ -471,22 +510,25 @@ bool ConformanceLookupTable::addProtocol(ProtocolDecl *protocol, SourceLoc loc,
   return true;
 }
 
-void ConformanceLookupTable::addInheritedProtocols(
-    llvm::PointerUnion<const TypeDecl *, const ExtensionDecl *> decl,
-    ConformanceSource source) {
-  // Find all of the protocols in the inheritance list.
-  bool anyObject = false;
-  for (const auto &found :
-          getDirectlyInheritedNominalTypeDecls(decl, anyObject)) {
-    if (auto proto = dyn_cast<ProtocolDecl>(found.Item)) {
-      addProtocol(
-        proto, found.Loc, source.withUncheckedLoc(found.uncheckedLoc));
-    }
-  }
+void ConformanceLookupTable::addMacroGeneratedProtocols(
+    NominalTypeDecl *nominal, ConformanceSource source) {
+  nominal->forEachAttachedMacro(
+      MacroRole::Extension,
+      [&](CustomAttr *attr, MacroDecl *macro) {
+        SmallVector<ProtocolDecl *, 2> conformances;
+        macro->getIntroducedConformances(
+            nominal, MacroRole::Extension, conformances);
+
+        for (auto *protocol : conformances) {
+          addProtocol(protocol, attr->getLocation(), source);
+        }
+      });
 }
 
 void ConformanceLookupTable::expandImpliedConformances(NominalTypeDecl *nominal,
                                                        DeclContext *dc) {
+  ASTContext &ctx = nominal->getASTContext();
+
   // Note: recursive type-checking implies that AllConformances
   // may be reallocated during this traversal, so pay the lookup cost
   // during each iteration.
@@ -506,7 +548,6 @@ void ConformanceLookupTable::expandImpliedConformances(NominalTypeDecl *nominal,
         isa<EnumDecl>(nominal) && nominal->isObjC() &&
         cast<EnumDecl>(nominal)->hasCases() &&
         cast<EnumDecl>(nominal)->hasOnlyCasesWithoutAssociatedValues()) {
-      ASTContext &ctx = nominal->getASTContext();
       if (auto bridgedNSError
             = ctx.getProtocol(KnownProtocolKind::BridgedNSError)) {
         addProtocol(bridgedNSError, SourceLoc(),
@@ -514,8 +555,15 @@ void ConformanceLookupTable::expandImpliedConformances(NominalTypeDecl *nominal,
       }
     }
 
-    addInheritedProtocols(conformingProtocol,
-                          ConformanceSource::forImplied(conformanceEntry));
+    auto source = ConformanceSource::forImplied(conformanceEntry);
+    for (auto *inherited : conformingProtocol->getInheritedProtocols()) {
+      // Conforming a ~Copyable nominal to a protocol that inherits Copyable
+      // should not imply a Copyable conformance on the nominal.
+      if (inherited->getInvertibleProtocolKind())
+        continue;
+
+      addProtocol(inherited, SourceLoc(), source);
+    }
   }
 }
 
@@ -524,6 +572,7 @@ static bool isReplaceable(ConformanceEntryKind kind) {
   switch (kind) {
   case ConformanceEntryKind::Implied:
   case ConformanceEntryKind::Synthesized:
+  case ConformanceEntryKind::PreMacroExpansion:
     return true;
 
   case ConformanceEntryKind::Explicit:
@@ -538,6 +587,23 @@ ConformanceLookupTable::Ordering ConformanceLookupTable::compareConformances(
                                    ConformanceEntry *lhs,
                                    ConformanceEntry *rhs,
                                    bool &diagnoseSuperseded) {
+  ConformanceEntryKind lhsKind = lhs->getRankingKind();
+  ConformanceEntryKind rhsKind = rhs->getRankingKind();
+
+  // Pre-expanded macro conformances are always superseded by
+  // conformances written in source. If the conformance is not
+  // written in the original source, the pre-expanded conformance
+  // will be superseded by the conformance in the macro expansion
+  // buffer.
+  if (lhsKind == ConformanceEntryKind::PreMacroExpansion ||
+      rhsKind == ConformanceEntryKind::PreMacroExpansion) {
+    if (lhsKind != rhsKind) {
+      return (lhs->getKind() < rhs->getKind()
+              ? Ordering::Before
+              : Ordering::After);
+    }
+  }
+
   // If only one of the conformances is unconditionally available on the
   // current deployment target, pick that one.
   //
@@ -573,9 +639,6 @@ ConformanceLookupTable::Ordering ConformanceLookupTable::compareConformances(
       
     return lhs->isFixed() ? Ordering::Before : Ordering::After;
   }
-
-  ConformanceEntryKind lhsKind = lhs->getRankingKind();
-  ConformanceEntryKind rhsKind = rhs->getRankingKind();
 
   if (lhsKind != ConformanceEntryKind::Implied ||
       rhsKind != ConformanceEntryKind::Implied) {
@@ -802,7 +865,8 @@ DeclContext *ConformanceLookupTable::getConformingContext(
     const auto &superclassConformances =
         superclassDecl->ConformanceTable->Conformances[protocol];
     if (superclassConformances.empty()) {
-      assert(protocol->isSpecificProtocol(KnownProtocolKind::Sendable));
+      assert(protocol->isSpecificProtocol(KnownProtocolKind::Sendable) ||
+             protocol->isSpecificProtocol(KnownProtocolKind::Copyable));
 
       // Go dig for a superclass that does conform to Sendable.
       // FIXME: This is a hack because the inherited conformances aren't
@@ -848,12 +912,37 @@ ConformanceLookupTable::getConformance(NominalTypeDecl *nominal,
   if (!conformingDC)
     return nullptr;
 
+  // Never produce a conformance for a pre-macro-expansion conformance. They
+  // are placeholders that will be superseded.
+  if (entry->getKind() == ConformanceEntryKind::PreMacroExpansion) {
+    if (auto supersedingEntry = entry->SupersededBy) {
+      return getConformance(nominal, supersedingEntry);
+    }
+
+    return nullptr;
+  }
+
   auto *conformingNominal = conformingDC->getSelfNominalTypeDecl();
 
   // Form the conformance.
   Type type = entry->getDeclContext()->getDeclaredInterfaceType();
   ASTContext &ctx = nominal->getASTContext();
-  if (entry->getKind() == ConformanceEntryKind::Inherited) {
+
+  if (protocol->getInvertibleProtocolKind() &&
+      entry->getDeclContext() == nominal &&
+      (entry->getKind() == ConformanceEntryKind::Synthesized ||
+       entry->getKind() == ConformanceEntryKind::Inherited)) {
+    // Unconditional conformances to Copyable and Escapable are represented as
+    // builtin conformances, which do not need to store a substitution map.
+    //
+    // This avoids an exponential blowup when constructing the context
+    // substitution map for a type like G<G<G<G<...>>>>.
+    Type conformingType = nominal->getSelfInterfaceType();
+
+    entry->Conformance = ctx.getBuiltinConformance(
+        conformingType, protocol, BuiltinConformanceKind::Synthesized);
+
+  } else if (entry->getKind() == ConformanceEntryKind::Inherited) {
     // For an inherited conformance, the conforming nominal type will
     // be different from the nominal type.
     assert(conformingNominal != nominal && "Broken inherited conformance");
@@ -880,27 +969,34 @@ ConformanceLookupTable::getConformance(NominalTypeDecl *nominal,
     assert(!isa<ProtocolDecl>(conformingDC->getSelfNominalTypeDecl()));
     Type conformingType = conformingDC->getSelfInterfaceType();
 
-    SourceLoc conformanceLoc
-      = conformingNominal == conformingDC
-          ? conformingNominal->getLoc()
-          : cast<ExtensionDecl>(conformingDC)->getLoc();
+    SourceLoc conformanceLoc =
+      entry->getLoc().isValid() ? entry->getLoc()
+        : (conformingNominal == conformingDC
+             ? conformingNominal->getLoc()
+             : cast<ExtensionDecl>(conformingDC)->getLoc());
+
+    NormalProtocolConformance *implyingConf = nullptr;
+    if (entry->Source.getKind() == ConformanceEntryKind::Implied) {
+      auto implyingEntry = entry->Source.getImpliedSource();
+      auto origImplyingConf = getConformance(conformingNominal, implyingEntry);
+      if (!origImplyingConf)
+        return nullptr;
+
+      implyingConf = origImplyingConf->getRootNormalConformance();
+    }
 
     // Create or find the normal conformance.
-    auto normalConf =
-        ctx.getConformance(conformingType, protocol, conformanceLoc,
-                           conformingDC, ProtocolConformanceState::Incomplete,
-                           entry->Source.getUncheckedLoc().isValid());
+    auto normalConf = ctx.getNormalConformance(
+        conformingType, protocol, conformanceLoc, conformingDC,
+        ProtocolConformanceState::Incomplete,
+        entry->Source.getUncheckedLoc().isValid(),
+        entry->Source.getPreconcurrencyLoc().isValid(),
+        entry->Source.getPreconcurrencyLoc());
     // Invalid code may cause the getConformance call below to loop, so break
     // the infinite recursion by setting this eagerly to shortcircuit with the
     // early return at the start of this function.
     entry->Conformance = normalConf;
 
-    NormalProtocolConformance *implyingConf = nullptr;
-    if (entry->Source.getKind() == ConformanceEntryKind::Implied) {
-      auto implyingEntry = entry->Source.getImpliedSource();
-      implyingConf = getConformance(conformingNominal, implyingEntry)
-                         ->getRootNormalConformance();
-    }
     normalConf->setSourceKindAndImplyingConformance(entry->Source.getKind(),
                                                     implyingConf);
 
@@ -944,10 +1040,9 @@ void ConformanceLookupTable::addSynthesizedConformance(
 }
 
 void ConformanceLookupTable::registerProtocolConformance(
-       ProtocolConformance *conformance,
+       DeclContext *dc, ProtocolConformance *conformance,
        bool synthesized) {
   auto protocol = conformance->getProtocol();
-  auto dc = conformance->getDeclContext();
   auto nominal = dc->getSelfNominalTypeDecl();
 
   // If there is an entry to update, do so.

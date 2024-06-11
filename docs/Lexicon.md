@@ -100,7 +100,7 @@ Apple term for "the person assigned to watch CI this week".
 
 ## canonical SIL
 
-SIL after the
+[SIL](#sil) after the
 [mandatory passes](#mandatory-passes--mandatory-optimizations) have run.
 This can be used as input to IRGen to generate LLVM IR or object files.
 
@@ -179,7 +179,7 @@ The other half is provided by corresponding
 ## DI (definite initialization / definitive initialization)
 
 The feature that no uninitialized variables, constants, or properties will
-be read by a program, or the analysis pass that operates on SIL to
+be read by a program, or the analysis pass that operates on [SIL](#sil) to
 guarantee this. This was 
 [discussed on Apple's Swift blog](https://developer.apple.com/swift/blog/?id=28).
 
@@ -187,6 +187,12 @@ guarantee this. This was
 
 "Do not merge". Placed in PR titles where discussion or analysis is still
 ongoing.
+
+## DSO
+
+Dynamic shared object, a shared library file (.so/.dylib/.dll, the extension of
+which depends on the platform) to be used by multiple applications while they
+are executing.
 
 ## dup
 
@@ -250,6 +256,18 @@ A representation of all generic parameters and their requirements. Like
 types, generic signatures can be [canonicalized](#canonical-type) to be
 compared directly.
 
+## GOT
+
+[Global offset table](https://en.wikipedia.org/wiki/Global_Offset_Table),
+a section in an executable or a shared library, which enables code to run
+independently of the memory address where it is loaded at runtime. Entries
+in GOT directly point to absolute addresses of symbols. The format of GOT
+is platform-dependent. Loaders update GOT relocations either on
+startup or on symbol access.
+
+Additionally, IRGen makes heavy usage of "GOT" as in "GOT-equivalent variable"
+to describe the way it forms references to global objects that may or may not be external references. 
+
 ## iff
 
 ["if and only if"](https://en.wikipedia.org/wiki/If_and_only_if). This term comes from mathematics.
@@ -283,6 +301,8 @@ perform structural modification, e.x.:
 1. `case _:`.
 2. `case let x:`.
 3. `case (_, _):`.
+
+Contrast with [refutable pattern](#refutable-pattern)
 
 ## IR
 
@@ -327,7 +347,7 @@ The module for the file or files currently being compiled.
 
 ## mandatory passes / mandatory optimizations
 
-Transformations over SIL that run immediately after SIL generation. Once
+Transformations over [SIL](#sil) that run immediately after SIL generation. Once
 all mandatory passes have run (and if no errors are found), the SIL is
 considered [canonical](#canonical-SIL).
 
@@ -359,7 +379,7 @@ Has *many* uses in the Swift world. We may want to rename some of them.
 2. A compilation unit; that is, source files that are compiled together.
    These files may contain cross-references. Represented as "the main
    module" (a specific ModuleDecl).
-3. (as "SIL module") A container for SIL to be compiled together, along
+3. (as "[SIL](#sil) module") A container for SIL to be compiled together, along
    with various context for the compilation.
 4. (as "LLVM module") A collection of LLVM IR to be compiled together.
    Always created in an LLVMContext.
@@ -455,6 +475,12 @@ only to accelerate the process of reading C/C++/Objective-C headers, such as
 the bridging headers read in by the `-import-objc-header` command-line
 flag to swiftc.
 
+## PLT
+
+Procedure linkage table, which is used to call external functions that don't
+have their addresses known at link time. These addresses are then resolved
+by a loader at run time.
+
 ## PR
 
 1. "Problem Report": An issue reported in [LLVM's bug tracker](https://llvm.org/bugs/).
@@ -491,7 +517,7 @@ on that system.
 
 ## raw SIL
 
-SIL just after being generated, not yet in a form that can be used for
+[SIL](#sil) just after being generated, not yet in a form that can be used for
 IR generation.
 See [mandatory passes](#mandatory-passes--mandatory-optimizations).
 
@@ -539,6 +565,8 @@ A pattern that may not always match. These include patterns such as:
 1. Isa check, e.g. `case let x as String:`.
 2. Enum case check: e.g. `case .none:`.
 3. Expr pattern: e.g. `case foo():`.
+
+Contrast with [irrefutable pattern](#irrefutable-pattern)
 
 ## resilient
 
@@ -656,7 +684,7 @@ The value or type that satisfies a protocol requirement.
 
 ## witness table
 
-The SIL (and runtime) representation of a [conformance](#conformance); essentially a
+The [SIL](#sil) (and runtime) representation of a [conformance](#conformance); essentially a
 [vtable](#vtable-virtual-dispatch-table) but for a protocol instead of
 a class.
 

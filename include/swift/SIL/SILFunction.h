@@ -38,6 +38,9 @@ class SILFunctionBuilder;
 class SILProfiler;
 class BasicBlockBitfield;
 class NodeBitfield;
+class OperandBitfield;
+class CalleeCache;
+class SILUndef;
 
 namespace Lowering {
 class TypeLowering;
@@ -65,11 +68,28 @@ enum IsDistributed_t {
   IsNotDistributed,
   IsDistributed,
 };
+enum IsRuntimeAccessible_t {
+  IsNotRuntimeAccessible,
+  IsRuntimeAccessible
+};
+
+enum ForceEnableLexicalLifetimes_t {
+  DoNotForceEnableLexicalLifetimes,
+  DoForceEnableLexicalLifetimes
+};
+
+enum UseStackForPackMetadata_t {
+  DoNotUseStackForPackMetadata,
+  DoUseStackForPackMetadata,
+};
 
 enum class PerformanceConstraints : uint8_t {
   None = 0,
   NoAllocation = 1,
   NoLocks = 2,
+  NoRuntime = 3,
+  NoExistentials = 4,
+  NoObjCBridging = 5
 };
 
 class SILSpecializeAttr final {
@@ -79,6 +99,9 @@ public:
     Full,
     Partial
   };
+
+  static GenericSignature buildTypeErasedSignature(
+      GenericSignature sig, ArrayRef<Type> typeErasedParams);
 
   static SILSpecializeAttr *create(SILModule &M,
                                    GenericSignature specializedSignature,
@@ -188,6 +211,8 @@ private:
   template <class, class> friend class SILBitfield;
   friend class BasicBlockBitfield;
   friend class NodeBitfield;
+  friend class OperandBitfield;
+  friend SILUndef;
 
   /// Module - The SIL module that the function belongs to.
   SILModule &Module;
@@ -211,6 +236,9 @@ private:
 
   /// The context archetypes of the function.
   GenericEnvironment *GenericEnv = nullptr;
+
+  /// Captured local generic environments.
+  ArrayRef<GenericEnvironment *> CapturedEnvs;
 
   /// The information about specialization.
   /// Only set if this function is a specialization of another function.
@@ -244,6 +272,9 @@ private:
   /// @_dynamicReplacement(for:) function.
   SILFunction *ReplacedFunction = nullptr;
 
+  /// The SILDeclRef that this function was created for by SILGen if one exists.
+  SILDeclRef DeclRef = SILDeclRef();
+
   /// This SILFunction REFerences an ad-hoc protocol requirement witness in
   /// order to keep it alive, such that it main be obtained in IRGen. Without
   /// this explicit reference, the witness would seem not-used, and not be
@@ -263,10 +294,13 @@ private:
   /// The head of a single-linked list of currently alive NodeBitfield.
   NodeBitfield *newestAliveNodeBitfield = nullptr;
 
+  /// The head of a single-linked list of currently alive OperandBitfields.
+  OperandBitfield *newestAliveOperandBitfield = nullptr;
+
   /// A monotonically increasing ID which is incremented whenever a
-  /// BasicBlockBitfield or NodeBitfield is constructed.
-  /// For details see SILBitfield::bitfieldID;
-  int64_t currentBitfieldID = 1;
+  /// BasicBlockBitfield, NodeBitfield, or OperandBitfield is constructed.  For
+  /// details see SILBitfield::bitfieldID;
+  uint64_t currentBitfieldID = 1;
 
   /// Unique identifier for vector indexing and deterministic sorting.
   /// May be reused when zombie functions are recovered.
@@ -281,6 +315,16 @@ private:
   /// The function's remaining set of specialize attributes.
   std::vector<SILSpecializeAttr*> SpecializeAttrSet;
 
+  /// Name of a section if @_section attribute was used, otherwise empty.
+  StringRef Section;
+
+  /// Name of a Wasm export if @_expose(wasm) attribute was used, otherwise
+  /// empty.
+  StringRef WasmExportName;
+
+  /// Name of a Wasm import module and field if @_extern(wasm) attribute
+  std::optional<std::pair<StringRef, StringRef>> WasmImportModuleAndField;
+
   /// Has value if there's a profile for this function
   /// Contains Function Entry Count
   ProfileCounter EntryCount;
@@ -293,6 +337,13 @@ private:
 
   PerformanceConstraints perfConstraints = PerformanceConstraints::None;
 
+  /// This is the set of undef values we've created, for uniquing purposes.
+  ///
+  /// We use a SmallDenseMap since in most functions, we will have only one type
+  /// of undef if we have any at all. In that case, by staying small we avoid
+  /// needing a heap allocation.
+  llvm::SmallDenseMap<SILType, SILUndef *, 1> undefValues;
+
   /// This is the number of uses of this SILFunction inside the SIL.
   /// It does not include references from debug scopes.
   unsigned RefCount = 0;
@@ -302,6 +353,9 @@ private:
   /// block indices.
   unsigned BlockListChangeIdx = 0;
 
+  /// The isolation of this function.
+  ActorIsolation actorIsolation = ActorIsolation::forUnspecified();
+
   /// The function's bare attribute. Bare means that the function is SIL-only
   /// and does not require debug info.
   unsigned Bare : 1;
@@ -310,7 +364,7 @@ private:
   unsigned Transparent : 1;
 
   /// The function's serialized attribute.
-  bool Serialized : 1;
+  unsigned SerializedKind : 2;
 
   /// Specifies if this function is a thunk or a reabstraction thunk.
   ///
@@ -336,6 +390,9 @@ private:
   /// would indicate.
   unsigned HasCReferences : 1;
 
+  /// Whether attribute @_used was present
+  unsigned MarkedAsUsed : 1;
+
   /// Whether cross-module references to this function should always use weak
   /// linking.
   unsigned IsAlwaysWeakImported : 1;
@@ -349,6 +406,9 @@ private:
 
   /// Check whether this is a distributed method.
   unsigned IsDistributed : 1;
+
+  /// Check whether this function could be looked up at runtime via special API.
+  unsigned IsRuntimeAccessible : 1;
 
   unsigned stackProtection : 1;
 
@@ -393,8 +453,24 @@ private:
   /// The function's effects attribute.
   unsigned EffectsKindAttr : NumEffectsKindBits;
 
-  /// The function is in a statically linked module.
-  unsigned IsStaticallyLinked : 1;
+  /// If true, the function has lexical lifetimes even if the module does not.
+  unsigned ForceEnableLexicalLifetimes : 1;
+
+  /// If true, the function contains an instruction that prevents stack nesting
+  /// from running with pack metadata markers in place.
+  unsigned UseStackForPackMetadata : 1;
+
+  /// If true, the function returns a non-escapable value without any
+  /// lifetime-dependence on an argument.
+  unsigned HasUnsafeNonEscapableResult : 1;
+
+  /// True, if this function or a caller (transitively) has a performance
+  /// constraint.
+  /// If true, optimizations must not introduce new runtime calls or metadata
+  /// creation, which are not there after SILGen.
+  /// Note that this flag is not serialized, because it's computed locally
+  /// within a module by the MandatoryOptimizations pass.
+  unsigned IsPerformanceConstraint : 1;
 
   static void
   validateSubclassScope(SubclassScope scope, IsThunk_t isThunk,
@@ -426,23 +502,24 @@ private:
   SILFunction(SILModule &module, SILLinkage linkage, StringRef mangledName,
               CanSILFunctionType loweredType, GenericEnvironment *genericEnv,
               IsBare_t isBareSILFunction, IsTransparent_t isTrans,
-              IsSerialized_t isSerialized, ProfileCounter entryCount,
+              SerializedKind_t serializedKind, ProfileCounter entryCount,
               IsThunk_t isThunk, SubclassScope classSubclassScope,
               Inline_t inlineStrategy, EffectsKind E,
               const SILDebugScope *debugScope,
               IsDynamicallyReplaceable_t isDynamic,
               IsExactSelfClass_t isExactSelfClass,
-              IsDistributed_t isDistributed);
+              IsDistributed_t isDistributed,
+              IsRuntimeAccessible_t isRuntimeAccessible);
 
   static SILFunction *
   create(SILModule &M, SILLinkage linkage, StringRef name,
          CanSILFunctionType loweredType, GenericEnvironment *genericEnv,
-         Optional<SILLocation> loc, IsBare_t isBareSILFunction,
-         IsTransparent_t isTrans, IsSerialized_t isSerialized,
+         std::optional<SILLocation> loc, IsBare_t isBareSILFunction,
+         IsTransparent_t isTrans, SerializedKind_t serializedKind,
          ProfileCounter entryCount, IsDynamicallyReplaceable_t isDynamic,
          IsDistributed_t isDistributed,
-         IsExactSelfClass_t isExactSelfClass,
-         IsThunk_t isThunk = IsNotThunk,
+         IsRuntimeAccessible_t isRuntimeAccessible,
+         IsExactSelfClass_t isExactSelfClass, IsThunk_t isThunk = IsNotThunk,
          SubclassScope classSubclassScope = SubclassScope::NotApplicable,
          Inline_t inlineStrategy = InlineDefault,
          EffectsKind EffectsKindAttr = EffectsKind::Unspecified,
@@ -451,12 +528,13 @@ private:
 
   void init(SILLinkage Linkage, StringRef Name, CanSILFunctionType LoweredType,
             GenericEnvironment *genericEnv, IsBare_t isBareSILFunction,
-            IsTransparent_t isTrans, IsSerialized_t isSerialized,
+            IsTransparent_t isTrans, SerializedKind_t serializedKind,
             ProfileCounter entryCount, IsThunk_t isThunk,
             SubclassScope classSubclassScope, Inline_t inlineStrategy,
             EffectsKind E, const SILDebugScope *DebugScope,
             IsDynamicallyReplaceable_t isDynamic,
-            IsExactSelfClass_t isExactSelfClass, IsDistributed_t isDistributed);
+            IsExactSelfClass_t isExactSelfClass, IsDistributed_t isDistributed,
+            IsRuntimeAccessible_t isRuntimeAccessible);
 
   /// Set has ownership to the given value. True means that the function has
   /// ownership, false means it does not.
@@ -654,10 +732,28 @@ public:
     WasDeserializedCanonical = val;
   }
 
-  bool isStaticallyLinked() const { return IsStaticallyLinked; }
+  ForceEnableLexicalLifetimes_t forceEnableLexicalLifetimes() const {
+    return ForceEnableLexicalLifetimes_t(ForceEnableLexicalLifetimes);
+  }
 
-  void setIsStaticallyLinked(bool value) {
-    IsStaticallyLinked = value;
+  void setForceEnableLexicalLifetimes(ForceEnableLexicalLifetimes_t value) {
+    ForceEnableLexicalLifetimes = value;
+  }
+
+  UseStackForPackMetadata_t useStackForPackMetadata() const {
+    return UseStackForPackMetadata_t(UseStackForPackMetadata);
+  }
+
+  void setUseStackForPackMetadata(UseStackForPackMetadata_t value) {
+    UseStackForPackMetadata = value;
+  }
+
+  bool hasUnsafeNonEscapableResult() const {
+    return HasUnsafeNonEscapableResult;
+  }
+
+  void setHasUnsafeNonEscapableResult(bool value) {
+    HasUnsafeNonEscapableResult = value;
   }
 
   /// Returns true if this is a reabstraction thunk of escaping function type
@@ -679,11 +775,7 @@ public:
     return getLoweredFunctionType()->getRepresentation();
   }
 
-  ResilienceExpansion getResilienceExpansion() const {
-    return (isSerialized()
-            ? ResilienceExpansion::Minimal
-            : ResilienceExpansion::Maximal);
-  }
+  ResilienceExpansion getResilienceExpansion() const;
 
   // Returns the type expansion context to be used inside this function.
   TypeExpansionContext getTypeExpansionContext() const {
@@ -698,6 +790,10 @@ public:
   SILType getLoweredType(Lowering::AbstractionPattern orig, Type subst) const;
 
   SILType getLoweredType(Type t) const;
+
+  CanType getLoweredRValueType(Lowering::AbstractionPattern orig, Type subst) const;
+
+  CanType getLoweredRValueType(Type t) const;
 
   SILType getLoweredLoadableType(Type t) const;
 
@@ -726,6 +822,12 @@ public:
   // Returns true if the function has indirect out parameters.
   bool hasIndirectFormalResults() const {
     return getLoweredFunctionType()->hasIndirectFormalResults();
+  }
+
+  // Returns true if the function has any generic arguments.
+  bool isGeneric() const {
+    auto s = getLoweredFunctionType()->getInvocationGenericSignature();
+    return s && !s->areAllParamsConcrete();
   }
 
   /// Returns true if this function ie either a class method, or a
@@ -764,13 +866,32 @@ public:
   /// Set the function's linkage attribute.
   void setLinkage(SILLinkage linkage) { Linkage = unsigned(linkage); }
 
-  /// Returns true if this function can be inlined into a fragile function
-  /// body.
-  bool hasValidLinkageForFragileInline() const { return isSerialized(); }
+///   Checks if this (callee) function body can be inlined into the caller
+///   by comparing their `SerializedKind_t` values.
+///
+///   If both callee and caller are `not_serialized`, the callee can be inlined
+///   into the caller during SIL inlining passes even if it (and the caller)
+///   might contain private symbols. If this callee is `serialized_for_pkg`,
+///   it can only be referenced by a serialized caller but not inlined into
+///   it.
+///
+///  ```
+///   canInlineInto:                                 Caller
+///                              | not_serialized | serialized_for_pkg | serialized
+///          not_serialized      |      ok        |       no           |    no
+///  Callee  serialized_for_pkg  |      ok        |       ok           |    no
+///          serialized          |      ok        |       ok           |    ok
+///
+///  ```
+///
+/// \p callerSerializedKind The caller's SerializedKind.
+  bool canBeInlinedIntoCaller(SerializedKind_t callerSerializedKind) const;
 
   /// Returns true if this function can be referenced from a fragile function
   /// body.
-  bool hasValidLinkageForFragileRef() const;
+  /// \p callerSerializedKind The caller's SerializedKind. Used to be passed to
+  ///                         \c canBeInlinedIntoCaller.
+  bool hasValidLinkageForFragileRef(SerializedKind_t callerSerializedKind) const;
 
   /// Get's the effective linkage which is used to derive the llvm linkage.
   /// Usually this is the same as getLinkage(), except in one case: if this
@@ -791,6 +912,10 @@ public:
   /// indicates that the object's definition might be required outside the
   /// current SILModule.
   bool isPossiblyUsedExternally() const;
+
+  /// Helper method which returns whether this function should be preserved so
+  /// it can potentially be used in the debugger.
+  bool shouldBePreservedForDebugger() const;
 
   /// In addition to isPossiblyUsedExternally() it returns also true if this
   /// is a (private or internal) vtable method which can be referenced by
@@ -843,6 +968,14 @@ public:
     IsDistributed = value;
   }
 
+  IsRuntimeAccessible_t isRuntimeAccessible() const {
+    return IsRuntimeAccessible_t(IsRuntimeAccessible);
+  }
+  void setIsRuntimeAccessible(IsRuntimeAccessible_t value =
+                                  IsRuntimeAccessible_t::IsRuntimeAccessible) {
+    IsRuntimeAccessible = value;
+  }
+
   bool needsStackProtection() const { return stackProtection; }
   void setNeedStackProtection(bool needSP) { stackProtection = needSP; }
 
@@ -860,7 +993,7 @@ public:
   /// TODO: This needs a better name.
   bool hasSemanticsAttrThatStartsWith(StringRef S) {
     return count_if(getSemanticsAttrs(), [&S](const std::string &Attr) -> bool {
-      return StringRef(Attr).startswith(S);
+      return StringRef(Attr).starts_with(S);
     });
   }
 
@@ -935,6 +1068,13 @@ public:
     perfConstraints = perfConstr;
   }
 
+  // see `IsPerformanceConstraint`
+  bool isPerformanceConstraint() const { return IsPerformanceConstraint; }
+
+  void setIsPerformanceConstraint(bool flag = true) {
+    IsPerformanceConstraint = flag;
+  }
+
   /// \returns True if the function is optimizable (i.e. not marked as no-opt),
   ///          or is raw SIL (so that the mandatory passes still run).
   bool shouldOptimize() const;
@@ -988,6 +1128,12 @@ public:
   /// Get the source location of the function.
   const SILDebugScope *getDebugScope() const { return DebugScope; }
 
+  /// Return the SILDeclRef for this SILFunction if one was assigned by SILGen.
+  SILDeclRef getDeclRef() const { return DeclRef; }
+
+  /// Set the SILDeclRef for this SILFunction. Used mainly by SILGen.
+  void setDeclRef(SILDeclRef declRef) { DeclRef = declRef; }
+
   /// Get this function's bare attribute.
   IsBare_t isBare() const { return IsBare_t(Bare); }
   void setBare(IsBare_t isB) { Bare = isB; }
@@ -999,11 +1145,21 @@ public:
     assert(!Transparent || !IsDynamicReplaceable);
   }
 
+  bool isSerialized() const {
+    return SerializedKind_t(SerializedKind) == IsSerialized;
+  }
+  bool isAnySerialized() const {
+    return SerializedKind_t(SerializedKind) == IsSerialized ||
+           SerializedKind_t(SerializedKind) == IsSerializedForPackage;
+  }
+
   /// Get this function's serialized attribute.
-  IsSerialized_t isSerialized() const { return IsSerialized_t(Serialized); }
-  void setSerialized(IsSerialized_t isSerialized) {
-    Serialized = isSerialized;
-    assert(this->isSerialized() == isSerialized &&
+  SerializedKind_t getSerializedKind() const {
+    return SerializedKind_t(SerializedKind);
+  }
+  void setSerializedKind(SerializedKind_t serializedKind) {
+    SerializedKind = serializedKind;
+    assert(this->getSerializedKind() == serializedKind &&
            "too few bits for Serialized storage");
   }
 
@@ -1053,7 +1209,10 @@ public:
   void copyEffects(SILFunction *from);
   bool hasArgumentEffects() const;
   void visitArgEffects(std::function<void(int, int, bool)> c) const;
-  SILInstruction::MemoryBehavior getMemoryBehavior(bool observeRetains);
+  MemoryBehavior getMemoryBehavior(bool observeRetains);
+
+  // Used by the MemoryLifetimeVerifier
+  bool argumentMayRead(Operand *argOp, SILValue addr);
 
   Purpose getSpecialPurpose() const { return specialPurpose; }
 
@@ -1138,8 +1297,22 @@ public:
   GenericEnvironment *getGenericEnvironment() const {
     return GenericEnv;
   }
-  void setGenericEnvironment(GenericEnvironment *env) {
+
+  /// Return any captured local generic environments, currently used for pack
+  /// element environments only. After SILGen, these are rewritten into
+  /// primary archetypes.
+  ArrayRef<GenericEnvironment *> getCapturedEnvironments() const {
+    return CapturedEnvs;
+  }
+
+  void setGenericEnvironment(GenericEnvironment *env);
+
+  void setGenericEnvironment(GenericEnvironment *env,
+                             ArrayRef<GenericEnvironment *> capturedEnvs,
+                             SubstitutionMap forwardingSubs) {
     GenericEnv = env;
+    CapturedEnvs = capturedEnvs;
+    ForwardingSubMap = forwardingSubs;
   }
 
   /// Retrieve the generic signature from the generic environment of this
@@ -1168,9 +1341,30 @@ public:
   /// responsibility of the caller.
   void eraseAllBlocks();
 
-  /// Return the identity substitutions necessary to forward this call if it is
-  /// generic.
-  SubstitutionMap getForwardingSubstitutionMap();
+  /// A substitution map that sends the generic parameters of the invocation
+  /// generic signature to some combination of primar and local archetypes.
+  ///
+  /// CAUTION: If this is a SILFunction that captures pack element environments,
+  /// then at SILGen time, this is not actually the forwarding substitution map
+  /// of the SILFunction's generic environment. This is because:
+  ///
+  /// 1) The SILFunction's generic signature includes extra generic parameters,
+  ///    to model captured pack elements;
+  /// 2) The SILFunction's generic environment is the AST generic environment,
+  ///    so it's based on the original generic signature;
+  /// 3) SILGen uses this AST generic environment together with local archetypes
+  ///    for lowering SIL instructions.
+  ///
+  /// Therefore, the SILFunction's forwarding substitution map takes the extended
+  /// generic signature (1). It maps the original generic parameters to the
+  /// archetypes of (2), and the extended generic parameters to the local archetypes
+  /// of (3).
+  ///
+  /// After SILGen, all archetypes are re-instantiated inside the SIL function,
+  /// and the forwarding substitution map and generic environment then align.
+  SubstitutionMap getForwardingSubstitutionMap() const {
+    return ForwardingSubMap;
+  }
 
   /// Returns true if this SILFunction must be a defer statement.
   ///
@@ -1195,6 +1389,50 @@ public:
     return V && V->getAttrs().hasAttribute<AlwaysEmitIntoClientAttr>();
   }
 
+  /// Return whether this function has attribute @_used on it
+  bool markedAsUsed() const { return MarkedAsUsed; }
+  void setMarkedAsUsed(bool value) { MarkedAsUsed = value; }
+
+  /// Return custom section name if @_section was used, otherwise empty
+  StringRef section() const { return Section; }
+  void setSection(StringRef value) { Section = value; }
+
+  /// Return Wasm export name if @_expose(wasm) was used, otherwise empty
+  StringRef wasmExportName() const { return WasmExportName; }
+  void setWasmExportName(StringRef value) { WasmExportName = value; }
+
+  /// Return Wasm import module name if @_extern(wasm) was used otherwise empty
+  StringRef wasmImportModuleName() const {
+    if (WasmImportModuleAndField)
+      return WasmImportModuleAndField->first;
+    return StringRef();
+  }
+
+  /// Return Wasm import field name if @_extern(wasm) was used otherwise empty
+  StringRef wasmImportFieldName() const {
+    if (WasmImportModuleAndField)
+      return WasmImportModuleAndField->second;
+    return StringRef();
+  }
+
+  void setWasmImportModuleAndField(StringRef module, StringRef field) {
+    WasmImportModuleAndField = std::make_pair(module, field);
+  }
+
+  bool isExternForwardDeclaration() const {
+    if (isExternalDeclaration()) {
+      if (auto declContext = getDeclContext()) {
+        if (auto decl = declContext->getAsDecl()) {
+          if (decl->getAttrs().hasAttribute<ExternAttr>())
+            return true;
+          if (decl->getAttrs().hasAttribute<SILGenNameAttr>())
+            return true;
+        }
+      }
+    }
+    return false;
+  }
+
   /// Returns true if this function belongs to a declaration that returns
   /// an opaque result type with one or more availability conditions that are
   /// allowed to produce a different underlying type at runtime.
@@ -1210,6 +1448,15 @@ public:
 
     return false;
   }
+
+  void setActorIsolation(ActorIsolation newActorIsolation) {
+    actorIsolation = newActorIsolation;
+  }
+
+  ActorIsolation getActorIsolation() const { return actorIsolation; }
+
+  /// Return the source file that this SILFunction belongs to if it exists.
+  SourceFile *getSourceFile() const;
 
   //===--------------------------------------------------------------------===//
   // Block List Access
@@ -1235,6 +1482,7 @@ public:
   const SILBasicBlock *getEntryBlock() const { return &front(); }
 
   SILBasicBlock *createBasicBlock();
+  SILBasicBlock *createBasicBlock(llvm::StringRef debugName);
   SILBasicBlock *createBasicBlockAfter(SILBasicBlock *afterBB);
   SILBasicBlock *createBasicBlockBefore(SILBasicBlock *beforeBB);
 
@@ -1291,7 +1539,7 @@ public:
     return std::find_if(begin(), end(),
                         [](const SILBasicBlock &BB) -> bool {
                           const TermInst *TI = BB.getTerminator();
-                          return isa<ThrowInst>(TI);
+                          return isa<ThrowInst>(TI) || isa<ThrowAddrInst>(TI);
                         });
   }
   
@@ -1301,7 +1549,7 @@ public:
     return std::find_if(begin(), end(),
                         [](const SILBasicBlock &BB) -> bool {
                           const TermInst *TI = BB.getTerminator();
-                          return isa<ThrowInst>(TI);
+                          return isa<ThrowInst>(TI) || isa<ThrowAddrInst>(TI);
                         });
   }
 
@@ -1343,13 +1591,33 @@ public:
   ArrayRef<SILArgument *> getArgumentsWithoutIndirectResults() const {
     assert(!empty() && "Cannot get arguments of a function without a body");
     return begin()->getArguments().slice(
-        getConventions().getNumIndirectSILResults());
+        getConventions().getNumIndirectSILResults() +
+          getConventions().getNumIndirectSILErrorResults());
   }
 
   const SILArgument *getSelfArgument() const {
     assert(hasSelfParam() && "This method can only be called if the "
                              "SILFunction has a self parameter");
     return getArguments().back();
+  }
+
+  /// Like getSelfArgument() except it returns a nullptr if we do not have a
+  /// selfparam.
+  const SILArgument *maybeGetSelfArgument() const {
+    if (!hasSelfParam())
+      return nullptr;
+    return getArguments().back();
+  }
+
+  /// If we have an isolated argument, return that. Returns nullptr otherwise.
+  const SILArgument *maybeGetIsolatedArgument() const {
+    for (auto *arg : getArgumentsWithoutIndirectResults()) {
+      if (cast<SILFunctionArgument>(arg)->getKnownParameterInfo().hasOption(
+              SILParameterInfo::Isolated))
+        return arg;
+    }
+
+    return nullptr;
   }
 
   const SILArgument *getDynamicSelfMetadata() const {
@@ -1369,24 +1637,43 @@ public:
         decl->getLifetimeAnnotation());
   }
 
-  /// verify - Run the IR verifier to make sure that the SILFunction follows
+  /// verify - Run the SIL verifier to make sure that the SILFunction follows
   /// invariants.
-  void verify(bool SingleFunction = true) const;
+  void verify(CalleeCache *calleeCache = nullptr,
+              bool SingleFunction = true,
+              bool isCompleteOSSA = true,
+              bool checkLinearLifetime = true) const;
+
+  /// Run the SIL verifier without assuming OSSA lifetimes end at dead end
+  /// blocks.
+  void verifyIncompleteOSSA() const {
+    verify(/*calleeCache*/nullptr, /*SingleFunction=*/true, /*completeOSSALifetimes=*/false);
+  }
 
   /// Verifies the lifetime of memory locations in the function.
-  void verifyMemoryLifetime();
+  void verifyMemoryLifetime(CalleeCache *calleeCache);
 
-  /// Run the SIL ownership verifier to check for ownership invariant failures.
+  /// Run the SIL ownership verifier to check that all values with ownership
+  /// have a linear lifetime. Regular OSSA invariants are checked separately in
+  /// normal SIL verification.
   ///
-  /// NOTE: The ownership verifier is always run when performing normal IR
+  /// \p deadEndBlocks is nullptr when OSSA lifetimes are complete.
+  ///
+  /// NOTE: The ownership verifier is run when performing normal IR
   /// verification, so this verification can be viewed as a subset of
-  /// SILFunction::verify.
+  /// SILFunction::verify(checkLinearLifetimes=true).
   void verifyOwnership(DeadEndBlocks *deadEndBlocks) const;
 
   /// Verify that all non-cond-br critical edges have been split.
   ///
   /// This is a fast subset of the checks performed in the SILVerifier.
   void verifyCriticalEdges() const;
+
+  /// Validate that all SILUndefs stored in the function's type -> SILUndef map
+  /// have this function as their parent function.
+  ///
+  /// Please only call this from the SILVerifier.
+  void verifySILUndefMap() const;
 
   /// Pretty-print the SILFunction.
   void dump(bool Verbose) const;

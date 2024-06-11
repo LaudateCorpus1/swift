@@ -17,8 +17,9 @@
 #ifndef SWIFT_IRGEN_CALLEMISSION_H
 #define SWIFT_IRGEN_CALLEMISSION_H
 
-#include "Temporary.h"
+#include "Address.h"
 #include "Callee.h"
+#include "Temporary.h"
 
 namespace llvm {
   class CallSite;
@@ -49,8 +50,21 @@ protected:
   /// Temporaries required by the call.
   TemporarySet Temporaries;
 
+  /// Temporaries required by the call that are not mapped to any
+  /// SIL value.
+  SmallVector<StackAddress, 8> RawTempraries;
+
   /// The function we're going to call.
   Callee CurCallee;
+
+  /// Only valid if the SIL function has indirect return values.
+  /// If the function has multiple indirect return values, this is the address
+  /// of the first indirect return value.
+  Address indirectReturnAddress;
+
+  /// For C-functions: true if the return is indirect in SIL, but direct for a C-function.
+  /// That can happen for "sensitive" structs.
+  bool convertDirectToIndirectReturn = false;
 
   unsigned LastArgWritten;
 
@@ -63,16 +77,36 @@ protected:
   /// RemainingArgsForCallee, at least between calls.
   bool EmittedCall;
 
+  /// The basic block to which the call to a potentially throwing foreign
+  /// function should jump to continue normal execution of the program.
+  llvm::BasicBlock *invokeNormalDest = nullptr;
+
+  /// The basic block to which the call to a potentially throwing foreign
+  /// function should jump to in case an exception has been thrown during the
+  /// invocation of the call.
+  llvm::BasicBlock *invokeUnwindDest = nullptr;
+
+  unsigned IndirectTypedErrorArgIdx = 0;
+
+
   virtual void setFromCallee();
   void emitToUnmappedMemory(Address addr);
   void emitToUnmappedExplosion(Explosion &out);
-  virtual void emitCallToUnmappedExplosion(llvm::CallInst *call, Explosion &out) = 0;
+  virtual void emitCallToUnmappedExplosion(llvm::CallBase *call,
+                                           Explosion &out) = 0;
   void emitYieldsToExplosion(Explosion &out);
+  void setKeyPathAccessorArguments(Explosion &in, bool isOutlined,
+                                   Explosion &out);
   virtual FunctionPointer getCalleeFunctionPointer() = 0;
-  llvm::CallInst *emitCallSite();
+  llvm::CallBase *emitCallSite();
 
-  virtual llvm::CallInst *createCall(const FunctionPointer &fn,
+  virtual llvm::CallBase *createCall(const FunctionPointer &fn,
                                      ArrayRef<llvm::Value *> args) = 0;
+
+  void externalizeArguments(IRGenFunction &IGF, const Callee &callee,
+                                   Explosion &in, Explosion &out,
+                                   TemporarySet &temporaries,
+                                   bool isOutlined);
 
   CallEmission(IRGenFunction &IGF, llvm::Value *selfValue, Callee &&callee)
       : IGF(IGF), selfValue(selfValue), CurCallee(std::move(callee)) {}
@@ -99,13 +133,15 @@ public:
 
   void addFnAttribute(llvm::Attribute::AttrKind Attr);
 
+  void setIndirectReturnAddress(Address addr) { indirectReturnAddress = addr; }
+
   void addParamAttribute(unsigned ParamIndex, llvm::Attribute::AttrKind Attr);
 
   void emitToMemory(Address addr, const LoadableTypeInfo &substResultTI,
                     bool isOutlined);
   void emitToExplosion(Explosion &out, bool isOutlined);
 
-  llvm::CallInst *emitCoroutineAsOrdinaryFunction() {
+  llvm::CallBase *emitCoroutineAsOrdinaryFunction() {
     assert(IsCoroutine);
     IsCoroutine = false;
 
@@ -124,6 +160,15 @@ public:
 
   virtual llvm::Value *getResumeFunctionPointer() = 0;
   virtual llvm::Value *getAsyncContext() = 0;
+
+  void setIndirectTypedErrorResultSlot(llvm::Value *addr) {
+    Args[IndirectTypedErrorArgIdx] = addr;
+  }
+
+  void setIndirectTypedErrorResultSlotArgsIndex(unsigned idx) {
+    assert(idx != 0);
+    IndirectTypedErrorArgIdx = idx;
+  }
 };
 
 std::unique_ptr<CallEmission>

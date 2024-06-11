@@ -48,9 +48,10 @@ struct SymbolGraphASTWalker : public SourceEntityWalker {
   const ModuleDecl &M;
 
   // FIXME: these should be tracked per-graph, rather than at the top level
-  const SmallPtrSet<ModuleDecl *, 4> ExportedImportedModules;
+  const SmallPtrSet<const ModuleDecl *, 4> ExportedImportedModules;
 
-  const llvm::SmallDenseMap<ModuleDecl *, SmallPtrSet<Decl *, 4>, 4> QualifiedExportedImports;
+  const llvm::SmallDenseMap<const ModuleDecl *, SmallPtrSet<Decl *, 4>, 4>
+      QualifiedExportedImports;
 
   /// The symbol graph for the main module of interest.
   SymbolGraph MainGraph;
@@ -59,11 +60,15 @@ struct SymbolGraphASTWalker : public SourceEntityWalker {
   llvm::StringMap<SymbolGraph *> ExtendedModuleGraphs;
 
   // MARK: - Initialization
-  
-  SymbolGraphASTWalker(ModuleDecl &M,
-                       const SmallPtrSet<ModuleDecl *, 4> ExportedImportedModules,
-                       const llvm::SmallDenseMap<ModuleDecl *, SmallPtrSet<Decl *, 4>, 4> QualifiedExportedImports,
-                       const SymbolGraphOptions &Options);
+
+  SymbolGraphASTWalker(
+      ModuleDecl &M,
+      const SmallPtrSet<const ModuleDecl *, 4> ExportedImportedModules,
+      const llvm::SmallDenseMap<const ModuleDecl *, SmallPtrSet<Decl *, 4>, 4>
+          QualifiedExportedImports,
+      const SymbolGraphOptions &Options);
+
+  SymbolGraphASTWalker(ModuleDecl &M, const SymbolGraphOptions &Options);
   virtual ~SymbolGraphASTWalker() {}
 
   // MARK: - Utilities
@@ -103,13 +108,19 @@ struct SymbolGraphASTWalker : public SourceEntityWalker {
   virtual bool isConsideredExportedImported(const Decl *D) const;
   
   /// Returns whether the given declaration comes from an `@_exported import` module.
-  virtual bool isFromExportedImportedModule(const Decl *D) const;
+  ///
+  /// If `countUnderlyingClangModule` is `false`, decls from Clang modules will not be considered
+  /// re-exported unless the Clang module was itself directly re-exported.
+  virtual bool isFromExportedImportedModule(const Decl *D, bool countUnderlyingClangModule = true) const;
 
   /// Returns whether the given declaration was imported via an `@_exported import <type>` declaration.
   virtual bool isQualifiedExportedImport(const Decl *D) const;
 
   /// Returns whether the given module is an `@_exported import` module.
-  virtual bool isExportedImportedModule(const ModuleDecl *M) const;
+  ///
+  /// If `countUnderlyingClangModule` is `false`, Clang modules will not be considered re-exported
+  /// unless the Clang module itself was directly re-exported.
+  virtual bool isExportedImportedModule(const ModuleDecl *M, bool countUnderlyingClangModule = true) const;
 
   /// Returns whether the given module is the main module, or is an `@_exported import` module.
   virtual bool isOurModule(const ModuleDecl *M) const;

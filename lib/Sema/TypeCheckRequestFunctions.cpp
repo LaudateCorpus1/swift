@@ -26,7 +26,7 @@
 
 using namespace swift;
 
-Type InheritedTypeRequest::evaluate(
+InheritedTypeResult InheritedTypeRequest::evaluate(
     Evaluator &evaluator,
     llvm::PointerUnion<const TypeDecl *, const ExtensionDecl *> decl,
     unsigned index, TypeResolutionStage stage) const {
@@ -52,79 +52,71 @@ Type InheritedTypeRequest::evaluate(
     context = TypeResolverContext::Inherited;
   }
 
-  Optional<TypeResolution> resolution;
+  std::optional<TypeResolution> resolution;
   switch (stage) {
   case TypeResolutionStage::Structural:
     resolution =
         TypeResolution::forStructural(dc, context,
                                       /*unboundTyOpener*/ nullptr,
-                                      /*placeholderHandler*/ nullptr);
+                                      /*placeholderHandler*/ nullptr,
+                                      /*packElementOpener*/ nullptr);
     break;
 
   case TypeResolutionStage::Interface:
     resolution =
         TypeResolution::forInterface(dc, context,
                                      /*unboundTyOpener*/ nullptr,
-                                     /*placeholderHandler*/ nullptr);
+                                     /*placeholderHandler*/ nullptr,
+                                     /*packElementOpener*/ nullptr);
     break;
   }
 
-  const TypeLoc &typeLoc = getInheritedTypeLocAtIndex(decl, index);
+  const InheritedEntry &inheritedEntry = InheritedTypes(decl).getEntry(index);
 
   Type inheritedType;
-  if (typeLoc.getTypeRepr())
-    inheritedType = resolution->resolveType(typeLoc.getTypeRepr());
-  else
-    inheritedType = typeLoc.getType();
+  if (auto *typeRepr = inheritedEntry.getTypeRepr()) {
+    // Check for suppressed inferrable conformances.
+    if (auto itr = dyn_cast<InverseTypeRepr>(typeRepr)) {
+      Type inheritedTy = resolution->resolveType(itr->getConstraint());
+      return InheritedTypeResult::forSuppressed(inheritedTy, itr);
+    }
+    inheritedType = resolution->resolveType(typeRepr);
+  } else {
+    auto ty = inheritedEntry.getType();
+    if (inheritedEntry.isSuppressed()) {
+      return InheritedTypeResult::forSuppressed(ty, nullptr);
+    }
+    inheritedType = ty;
+  }
 
-  return inheritedType ? inheritedType : ErrorType::get(dc->getASTContext());
+  return InheritedTypeResult::forInherited(
+      inheritedType ? inheritedType : ErrorType::get(dc->getASTContext()));
 }
 
 Type
 SuperclassTypeRequest::evaluate(Evaluator &evaluator,
-                                NominalTypeDecl *nominalDecl,
+                                ClassDecl *classDecl,
                                 TypeResolutionStage stage) const {
-  assert(isa<ClassDecl>(nominalDecl) || isa<ProtocolDecl>(nominalDecl));
+  if (!classDecl->getSuperclassDecl())
+    return Type();
 
-  // If this is a protocol that came from a serialized module, compute the
-  // superclass via its generic signature.
-  if (auto *proto = dyn_cast<ProtocolDecl>(nominalDecl)) {
-    if (proto->wasDeserialized()) {
-      return proto->getGenericSignature()
-          ->getSuperclassBound(proto->getSelfInterfaceType());
-    }
-
-    if (!proto->getSuperclassDecl())
-      return Type();
-  } else if (auto classDecl = dyn_cast<ClassDecl>(nominalDecl)) {
-    if (!classDecl->getSuperclassDecl())
-      return Type();
-  }
-
-  for (unsigned int idx : indices(nominalDecl->getInherited())) {
-    auto result = evaluator(InheritedTypeRequest{nominalDecl, idx, stage});
-
-    if (auto err = result.takeError()) {
-      // FIXME: Should this just return once a cycle is detected?
-      llvm::handleAllErrors(std::move(err),
-        [](const CyclicalRequestError<InheritedTypeRequest> &E) {
-          /* cycle detected */
-        });
+  for (unsigned int idx : classDecl->getInherited().getIndices()) {
+    auto result = evaluateOrDefault(evaluator,
+                                    InheritedTypeRequest{classDecl, idx, stage},
+                                    InheritedTypeResult::forDefault())
+                      .getInheritedTypeOrNull(classDecl->getASTContext());
+    if (!result)
       continue;
-    }
-
-    Type inheritedType = *result;
-    if (!inheritedType) continue;
 
     // If we found a class, return it.
-    if (inheritedType->getClassOrBoundGenericClass()) {
-      return inheritedType;
+    if (result->getClassOrBoundGenericClass()) {
+      return result;
     }
 
     // If we found an existential with a superclass bound, return it.
-    if (inheritedType->isExistentialType()) {
+    if (result->isExistentialType()) {
       if (auto superclassType =
-            inheritedType->getExistentialLayout().explicitSuperclass) {
+            result->getExistentialLayout().explicitSuperclass) {
         if (superclassType->getClassOrBoundGenericClass()) {
           return superclassType;
         }
@@ -138,19 +130,13 @@ SuperclassTypeRequest::evaluate(Evaluator &evaluator,
 
 Type EnumRawTypeRequest::evaluate(Evaluator &evaluator,
                                   EnumDecl *enumDecl) const {
-  for (unsigned int idx : indices(enumDecl->getInherited())) {
-    auto inheritedTypeResult = evaluator(
-        InheritedTypeRequest{enumDecl, idx, TypeResolutionStage::Interface});
-
-    if (auto err = inheritedTypeResult.takeError()) {
-      llvm::handleAllErrors(std::move(err),
-        [](const CyclicalRequestError<InheritedTypeRequest> &E) {
-          // cycle detected
-        });
-      continue;
-    }
-
-    auto &inheritedType = *inheritedTypeResult;
+  for (unsigned int idx : enumDecl->getInherited().getIndices()) {
+    auto inheritedType =
+        evaluateOrDefault(
+            evaluator,
+            InheritedTypeRequest{enumDecl, idx, TypeResolutionStage::Interface},
+            InheritedTypeResult::forDefault())
+            .getInheritedTypeOrNull(enumDecl->getASTContext());
     if (!inheritedType) continue;
 
     // Skip protocol conformances.
@@ -164,6 +150,30 @@ Type EnumRawTypeRequest::evaluate(Evaluator &evaluator,
   return Type();
 }
 
+bool SuppressesConformanceRequest::evaluate(Evaluator &evaluator,
+                                            NominalTypeDecl *nominal,
+                                            KnownProtocolKind kp) const {
+  auto inheritedTypes = InheritedTypes(nominal);
+  auto inheritedClause = inheritedTypes.getEntries();
+  for (unsigned i = 0, n = inheritedClause.size(); i != n; ++i) {
+    InheritedTypeRequest request{nominal, i, TypeResolutionStage::Interface};
+    auto result = evaluateOrDefault(evaluator, request,
+                                    InheritedTypeResult::forDefault());
+    if (result != InheritedTypeResult::Suppressed)
+      continue;
+    auto pair = result.getSuppressed();
+    auto ty = pair.first;
+    if (!ty)
+      continue;
+    auto other = ty->getKnownProtocol();
+    if (!other)
+      continue;
+    if (other == kp)
+      return true;
+  }
+  return false;
+}
+
 CustomAttr *
 AttachedResultBuilderRequest::evaluate(Evaluator &evaluator,
                                          ValueDecl *decl) const {
@@ -172,11 +182,10 @@ AttachedResultBuilderRequest::evaluate(Evaluator &evaluator,
   for (auto attr : decl->getAttrs().getAttributes<CustomAttr>()) {
     auto mutableAttr = const_cast<CustomAttr *>(attr);
     // Figure out which nominal declaration this custom attribute refers to.
-    auto nominal = evaluateOrDefault(ctx.evaluator,
-                                     CustomAttrNominalRequest{mutableAttr, dc},
-                                     nullptr);
+    auto *nominal = evaluateOrDefault(ctx.evaluator,
+                                      CustomAttrNominalRequest{mutableAttr, dc},
+                                      nullptr);
 
-    // Ignore unresolvable custom attributes.
     if (!nominal)
       continue;
 

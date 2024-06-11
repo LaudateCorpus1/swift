@@ -48,6 +48,7 @@ class SwiftPM(product.Product):
 
         toolchain_path = self.native_toolchain_path(host_target)
         swiftc = os.path.join(toolchain_path, "bin", "swiftc")
+        clang = os.path.join(toolchain_path, "bin", "clang")
 
         # FIXME: We require llbuild build directory in order to build. Is
         # there a better way to get this?
@@ -67,7 +68,7 @@ class SwiftPM(product.Product):
 
         helper_cmd += [
             "--swiftc-path", swiftc,
-            "--clang-path", self.toolchain.cc,
+            "--clang-path", clang,
             "--cmake-path", self.toolchain.cmake,
             "--ninja-path", self.toolchain.ninja,
             "--build-dir", self.build_dir,
@@ -81,15 +82,6 @@ class SwiftPM(product.Product):
         if os.path.exists(dispatch_build_dir):
             helper_cmd += [
                 "--dispatch-build-dir", dispatch_build_dir
-            ]
-
-        # Pass Foundation directory down if we built it
-        foundation_build_dir = os.path.join(
-            build_root, '%s-%s' % ("foundation", host_target))
-
-        if os.path.exists(foundation_build_dir):
-            helper_cmd += [
-                "--foundation-build-dir", foundation_build_dir
             ]
 
         # Pass Cross compile host info

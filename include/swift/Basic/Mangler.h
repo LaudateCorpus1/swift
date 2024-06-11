@@ -21,6 +21,7 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
 namespace swift {
@@ -54,6 +55,12 @@ protected:
 
   /// Identifier substitutions.
   llvm::StringMap<unsigned> StringSubstitutions;
+  
+  /// Index to use for the next added substitution.
+  /// Note that this is not simply the sum of the size of the \c Substitutions
+  /// and \c StringSubstitutions maps above, since in some circumstances the
+  /// same entity may be registered for multiple substitution indexes.
+  unsigned NextSubstitutionIndex = 0;
 
   /// Word substitutions in mangled identifiers.
   llvm::SmallVector<SubstitutionWord, 26> Words;
@@ -94,14 +101,23 @@ protected:
     return StringRef(Storage.data(), Storage.size());
   }
 
+  void print(llvm::raw_ostream &os) const {
+    os << getBufferStr() << '\n';
+  }
+
+public:
+  /// Dump the current stored state in the Mangler. Only for use in the debugger!
+  SWIFT_DEBUG_DUMPER(dumpBufferStr()) {
+    print(llvm::dbgs());
+  }
+
+protected:
   /// Removes the last characters of the buffer by setting it's size to a
   /// smaller value.
   void resetBuffer(size_t toPos) {
     assert(toPos <= Storage.size());
     Storage.resize(toPos);
   }
-
-protected:
 
   Mangler() : Buffer(Storage) { }
 
@@ -134,15 +150,15 @@ protected:
   void addSubstitution(const void *ptr) {
     if (!UseSubstitutions)
       return;
-
-    auto value = Substitutions.size() + StringSubstitutions.size();
+    
+    auto value = NextSubstitutionIndex++;
     Substitutions[ptr] = value;
   }
   void addSubstitution(StringRef Str) {
     if (!UseSubstitutions)
       return;
 
-    auto value = Substitutions.size() + StringSubstitutions.size();
+    auto value = NextSubstitutionIndex++;
     StringSubstitutions[Str] = value;
   }
 

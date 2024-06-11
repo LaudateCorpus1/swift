@@ -130,7 +130,8 @@ SILFunction *getOrCreateReabstractionThunk(SILOptFunctionBuilder &fb,
 
   auto *thunk = fb.getOrCreateSharedFunction(
       loc, name, thunkDeclType, IsBare, IsTransparent, IsSerialized,
-      ProfileCounter(), IsReabstractionThunk, IsNotDynamic, IsNotDistributed);
+      ProfileCounter(), IsReabstractionThunk, IsNotDynamic, IsNotDistributed,
+      IsNotRuntimeAccessible);
   if (!thunk->empty())
     return thunk;
 
@@ -325,6 +326,41 @@ SILFunction *getOrCreateReabstractionThunk(SILOptFunctionBuilder &fb,
   return thunk;
 }
 
+// FIXME: This is pretty rudimentary as of now as there is no proper AST type
+// for coroutine and therefore we cannot e.g. store a coroutine into a tuple or
+// do other things that are allowed with first-class function types. For now we
+// have to unsafely bitcast coroutine to function type and vice versa. This
+// function should be rethought when we will have proper AST coroutine types.
+SILValue reabstractCoroutine(
+    SILBuilder &builder, SILOptFunctionBuilder &fb, SILLocation loc,
+    SILValue fn, CanSILFunctionType toType,
+    std::function<SubstitutionMap(SubstitutionMap)> remapSubstitutions) {
+  auto &module = *fn->getModule();
+  auto fromType = fn->getType().getAs<SILFunctionType>();
+  auto unsubstFromType = fromType->getUnsubstitutedType(module);
+  auto unsubstToType = toType->getUnsubstitutedType(module);
+
+  LLVM_DEBUG(auto &s = getADDebugStream() << "Converting coroutine\n";
+             s << "  From type: " << fromType << '\n';
+             s << "  To type: " << toType << '\n'; s << '\n');
+  
+  if (fromType != unsubstFromType)
+    fn = builder.createConvertFunction(
+        loc, fn, SILType::getPrimitiveObjectType(unsubstFromType),
+        /*withoutActuallyEscaping*/ false);
+
+  fn = builder.createConvertFunction(loc, fn,
+                                     SILType::getPrimitiveObjectType(unsubstToType),
+                                     /*withoutActuallyEscaping*/ false);
+  
+  if (toType != unsubstToType)
+    fn = builder.createConvertFunction(loc, fn,
+                                       SILType::getPrimitiveObjectType(toType),
+                                       /*withoutActuallyEscaping*/ false);
+
+  return fn;
+}
+
 SILValue reabstractFunction(
     SILBuilder &builder, SILOptFunctionBuilder &fb, SILLocation loc,
     SILValue fn, CanSILFunctionType toType,
@@ -364,7 +400,9 @@ getOrCreateSubsetParametersThunkForLinearMap(
     const AutoDiffConfig &desiredConfig, const AutoDiffConfig &actualConfig,
     ADContext &adContext) {
   LLVM_DEBUG(getADDebugStream()
-             << "Getting a subset parameters thunk for " << linearMapType
+             << "Getting a subset parameters thunk for "
+             << (kind == AutoDiffDerivativeFunctionKind::JVP ? "jvp" : "vjp")
+             << " linear map " << linearMapType
              << " from " << actualConfig << " to " << desiredConfig << '\n');
 
   assert(!linearMapType->getCombinedSubstitutions());
@@ -388,7 +426,8 @@ getOrCreateSubsetParametersThunkForLinearMap(
   auto loc = parentThunk->getLocation();
   auto *thunk = fb.getOrCreateSharedFunction(
       loc, thunkName, thunkType, IsBare, IsTransparent, IsSerialized,
-      ProfileCounter(), IsThunk, IsNotDynamic, IsNotDistributed);
+      ProfileCounter(), IsThunk, IsNotDynamic, IsNotDistributed,
+      IsNotRuntimeAccessible);
 
   if (!thunk->empty())
     return {thunk, interfaceSubs};
@@ -472,6 +511,12 @@ getOrCreateSubsetParametersThunkForLinearMap(
     return mappedIndex;
   };
 
+  auto toIndirectResultsIter = thunk->getIndirectResults().begin();
+  auto useNextIndirectResult = [&]() {
+      assert(toIndirectResultsIter != thunk->getIndirectResults().end());
+      arguments.push_back(*toIndirectResultsIter++);
+  };
+
   switch (kind) {
   // Differential arguments are:
   // - All indirect results, followed by:
@@ -480,9 +525,29 @@ getOrCreateSubsetParametersThunkForLinearMap(
   //     indices).
   //   - Zeros (when parameter is not in desired indices).
   case AutoDiffDerivativeFunctionKind::JVP: {
-    // Forward all indirect results.
-    arguments.append(thunk->getIndirectResults().begin(),
-                     thunk->getIndirectResults().end());
+    unsigned numIndirectResults = linearMapType->getNumIndirectFormalResults();
+    // Forward desired indirect results
+    for (unsigned idx : *actualConfig.resultIndices) {
+      if (idx >= numIndirectResults)
+        break;
+
+      auto resultInfo = linearMapType->getResults()[idx];
+      assert(idx < linearMapType->getNumResults());
+
+      // Forward result argument in case we do not need to thunk it away
+      if (desiredConfig.resultIndices->contains(idx)) {
+        useNextIndirectResult();
+        continue;
+      }
+
+      // Otherwise, allocate and use an uninitialized indirect result
+      auto *indirectResult = builder.createAllocStack(
+        loc, resultInfo.getSILStorageInterfaceType());
+      localAllocations.push_back(indirectResult);
+      arguments.push_back(indirectResult);
+    }
+    assert(toIndirectResultsIter == thunk->getIndirectResults().end());
+
     auto toArgIter = thunk->getArgumentsWithoutIndirectResults().begin();
     auto useNextArgument = [&]() { arguments.push_back(*toArgIter++); };
     // Iterate over actual indices.
@@ -507,18 +572,14 @@ getOrCreateSubsetParametersThunkForLinearMap(
   //   - Zeros (when parameter is not in desired indices).
   // - All actual arguments.
   case AutoDiffDerivativeFunctionKind::VJP: {
-    auto toIndirectResultsIter = thunk->getIndirectResults().begin();
-    auto useNextIndirectResult = [&]() {
-      arguments.push_back(*toIndirectResultsIter++);
-    };
     // Collect pullback arguments.
     unsigned pullbackResultIndex = 0;
     for (unsigned i : actualConfig.parameterIndices->getIndices()) {
       auto origParamInfo = origFnType->getParameters()[i];
-      // Skip original `inout` parameters. All non-indirect-result pullback
-      // arguments (including `inout` arguments) are appended to `arguments`
+      // Skip original semantic result parameters. All non-indirect-result pullback
+      // arguments (including semantic result` arguments) are appended to `arguments`
       // later.
-      if (origParamInfo.isIndirectMutating())
+      if (origParamInfo.isAutoDiffSemanticResult())
         continue;
       auto resultInfo = linearMapType->getResults()[pullbackResultIndex];
       assert(pullbackResultIndex < linearMapType->getNumResults());
@@ -539,8 +600,17 @@ getOrCreateSubsetParametersThunkForLinearMap(
       arguments.push_back(indirectResult);
     }
     // Forward all actual non-indirect-result arguments.
-    arguments.append(thunk->getArgumentsWithoutIndirectResults().begin(),
-                     thunk->getArgumentsWithoutIndirectResults().end() - 1);
+    auto thunkArgs = thunk->getArgumentsWithoutIndirectResults();
+    // Slice out the function to be called
+    thunkArgs = thunkArgs.slice(0, thunkArgs.size() - 1);
+    unsigned thunkArg = 0;
+    for (unsigned idx : *actualConfig.resultIndices) {
+      // Forward result argument in case we do not need to thunk it away
+      if (desiredConfig.resultIndices->contains(idx))
+        arguments.push_back(thunkArgs[thunkArg++]);
+      else // otherwise, zero it out
+        buildZeroArgument(linearMapType->getParameters()[arguments.size()]);
+    }
     break;
   }
   }
@@ -550,10 +620,33 @@ getOrCreateSubsetParametersThunkForLinearMap(
   auto *ai = builder.createApply(loc, linearMap, SubstitutionMap(), arguments);
 
   // If differential thunk, deallocate local allocations and directly return
-  // `apply` result.
+  // `apply` result (if it is desired).
   if (kind == AutoDiffDerivativeFunctionKind::JVP) {
+    SmallVector<SILValue, 8> differentialDirectResults;
+    extractAllElements(ai, builder, differentialDirectResults);
+    SmallVector<SILValue, 8> allResults;
+    collectAllActualResultsInTypeOrder(ai, differentialDirectResults, allResults);
+    unsigned numResults = thunk->getConventions().getNumDirectSILResults() +
+     thunk->getConventions().getNumDirectSILResults();
+    SmallVector<SILValue, 8> results;
+    for (unsigned idx : *actualConfig.resultIndices) {
+      if (idx >= numResults)
+        break;
+
+      auto result = allResults[idx];
+      if (desiredConfig.isWrtResult(idx))
+        results.push_back(result);
+      else {
+        if (result->getType().isAddress())
+          builder.emitDestroyAddrAndFold(loc, result);
+        else
+          builder.emitDestroyValueOperation(loc, result);
+      }
+    }
+
     cleanupValues();
-    builder.createReturn(loc, ai);
+    auto result = joinElements(results, builder, loc);
+    builder.createReturn(loc, result);
     return {thunk, interfaceSubs};
   }
 
@@ -563,16 +656,18 @@ getOrCreateSubsetParametersThunkForLinearMap(
   extractAllElements(ai, builder, pullbackDirectResults);
   SmallVector<SILValue, 8> allResults;
   collectAllActualResultsInTypeOrder(ai, pullbackDirectResults, allResults);
-  // Collect pullback `inout` arguments in type order.
-  unsigned inoutArgIdx = 0;
+  // Collect pullback semantic result arguments in type order.
+  unsigned semanticResultArgIdx = 0;
   SILFunctionConventions origConv(origFnType, thunk->getModule());
   for (auto paramIdx : actualConfig.parameterIndices->getIndices()) {
     auto paramInfo = origConv.getParameters()[paramIdx];
-    if (!paramInfo.isIndirectMutating())
+    if (!paramInfo.isAutoDiffSemanticResult())
       continue;
-    auto inoutArg = *std::next(ai->getInoutArguments().begin(), inoutArgIdx++);
+    auto semanticResultArg =
+      *std::next(ai->getAutoDiffSemanticResultArguments().begin(),
+                 semanticResultArgIdx++);
     unsigned mappedParamIdx = mapOriginalParameterIndex(paramIdx);
-    allResults.insert(allResults.begin() + mappedParamIdx, inoutArg);
+    allResults.insert(allResults.begin() + mappedParamIdx, semanticResultArg);
   }
   assert(allResults.size() == actualConfig.parameterIndices->getNumIndices() &&
          "Number of pullback results should match number of differentiability "
@@ -612,8 +707,10 @@ getOrCreateSubsetParametersThunkForDerivativeFunction(
     AutoDiffDerivativeFunctionKind kind, const AutoDiffConfig &desiredConfig,
     const AutoDiffConfig &actualConfig, ADContext &adContext) {
   LLVM_DEBUG(getADDebugStream()
-             << "Getting a subset parameters thunk for derivative function "
-             << derivativeFn << " of the original function " << origFnOperand
+             << "Getting a subset parameters thunk for derivative "
+             << (kind == AutoDiffDerivativeFunctionKind::JVP ? "jvp" : "vjp")
+             << " function " << derivativeFn
+             << " of the original function " << origFnOperand
              << " from " << actualConfig << " to " << desiredConfig << '\n');
 
   auto origFnType = origFnOperand->getType().castTo<SILFunctionType>();
@@ -668,8 +765,9 @@ getOrCreateSubsetParametersThunkForDerivativeFunction(
 
   auto loc = origFnOperand.getLoc();
   auto *thunk = fb.getOrCreateSharedFunction(
-      loc, thunkName, thunkType, IsBare, IsTransparent, caller->isSerialized(),
-      ProfileCounter(), IsThunk, IsNotDynamic, IsNotDistributed);
+      loc, thunkName, thunkType, IsBare, IsTransparent,
+      caller->getSerializedKind(), ProfileCounter(), IsThunk, IsNotDynamic,
+      IsNotDistributed, IsNotRuntimeAccessible);
 
   if (!thunk->empty())
     return {thunk, interfaceSubs};
@@ -729,10 +827,8 @@ getOrCreateSubsetParametersThunkForDerivativeFunction(
   // Extract all direct results.
   SmallVector<SILValue, 8> directResults;
   extractAllElements(apply, builder, directResults);
-  auto originalDirectResults = ArrayRef<SILValue>(directResults).drop_back(1);
-  auto originalDirectResult =
-      joinElements(originalDirectResults, builder, apply->getLoc());
   auto linearMap = directResults.back();
+  directResults.pop_back();
 
   auto linearMapType = linearMap->getType().castTo<SILFunctionType>();
   auto linearMapTargetType = targetType->getResults()
@@ -768,13 +864,11 @@ getOrCreateSubsetParametersThunkForDerivativeFunction(
         SILType::getPrimitiveObjectType(linearMapTargetType),
         /*withoutActuallyEscaping*/ false);
   }
-  assert(origFnType->getNumResults() +
-             origFnType->getNumIndirectMutatingParameters() ==
-         1);
+  assert(origFnType->getNumAutoDiffSemanticResults() > 0);
   if (origFnType->getNumResults() > 0 &&
       origFnType->getResults().front().isFormalDirect()) {
-    auto result =
-        joinElements({originalDirectResult, thunkedLinearMap}, builder, loc);
+    directResults.push_back(thunkedLinearMap);
+    auto result = joinElements(directResults, builder, loc);
     builder.createReturn(loc, result);
   } else {
     builder.createReturn(loc, thunkedLinearMap);

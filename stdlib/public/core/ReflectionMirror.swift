@@ -66,7 +66,7 @@ internal func getChild<T>(of value: T, type: Any.Type, index: Int) -> (label: St
   
   let value = _getChild(of: value, type: type, index: index, outName: &nameC, outFreeFunc: &freeFunc)
   
-  let name = nameC.flatMap({ String(validatingUTF8: $0) })
+  let name = nameC.flatMap({ String(validatingCString: $0) })
   freeFunc?(nameC)
   return (name, value)
 }
@@ -213,6 +213,9 @@ public struct _EachFieldOptions: OptionSet {
   public static var ignoreUnknown = _EachFieldOptions(rawValue: 1 << 1)
 }
 
+@available(SwiftStdlib 5.2, *)
+extension _EachFieldOptions: Sendable {}
+
 /// The metadata "kind" for a type.
 @available(SwiftStdlib 5.2, *)
 @_spi(Reflection)
@@ -249,6 +252,9 @@ public enum _MetadataKind: UInt {
   }
 }
 
+@available(SwiftStdlib 5.2, *)
+extension _MetadataKind: Sendable {}
+
 /// Calls the given closure on every field of the specified type.
 ///
 /// If `body` returns `false` for any field, no additional fields are visited.
@@ -284,8 +290,14 @@ public func _forEachField(
     defer { field.freeFunc?(field.name) }
     let kind = _MetadataKind(childType)
 
-    if !body(field.name!, offset, childType, kind) {
-      return false
+    if let name = field.name {
+      if !body(name, offset, childType, kind) {
+        return false
+      }
+    } else {
+      if !body("", offset, childType, kind) {
+        return false
+      }
     }
   }
 
@@ -362,8 +374,14 @@ public func _forEachFieldWithKeyPath<Root>(
         endOfReferencePrefix: false)
     }
 
-    if !body(field.name!, partialKeyPath) {
-      return false
+    if let name = field.name {
+      if !body(name, partialKeyPath) {
+        return false
+      }
+    } else {
+      if !body("", partialKeyPath) {
+        return false
+      }
     }
   }
 

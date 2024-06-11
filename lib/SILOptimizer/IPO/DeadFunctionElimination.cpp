@@ -71,6 +71,8 @@ class DeadFunctionAndGlobalElimination {
     }
 
     /// Adds an implementation of the method in a specific conformance.
+    ///
+    /// \p Conf is null for default implementations and move-only deinits
     void addWitnessFunction(SILFunction *F, RootProtocolConformance *Conf) {
       assert(isWitnessMethod);
       implementingFunctions.push_back(FuncImpl(F, Conf));
@@ -90,6 +92,13 @@ class DeadFunctionAndGlobalElimination {
 
   /// Checks is a function is alive, e.g. because it is visible externally.
   bool isAnchorFunction(SILFunction *F) {
+    // In embedded Swift, (even public) generic functions *after serialization*
+    // cannot be used externally and are not anchors.
+    bool embedded = Module->getOptions().EmbeddedSwift;
+    bool generic = F->isGeneric();
+    bool isSerialized = Module->isSerialized();
+    if (embedded && generic && isSerialized)
+      return false;
 
     // Functions that may be used externally cannot be removed.
     if (F->isPossiblyUsedExternally())
@@ -146,6 +155,7 @@ class DeadFunctionAndGlobalElimination {
 
   /// Marks a function as alive.
   void makeAlive(SILFunction *F) {
+    LLVM_DEBUG(llvm::dbgs() << "         makeAlive " << F->getName() << '\n');
     AliveFunctionsAndTables.insert(F);
     assert(F && "function does not exist");
     Worklist.insert(F);
@@ -210,6 +220,10 @@ class DeadFunctionAndGlobalElimination {
     for (const SILInstruction &initInst : *global) {
       if (auto *fRef = dyn_cast<FunctionRefInst>(&initInst))
         ensureAlive(fRef->getReferencedFunction());
+      if (auto *gRef = dyn_cast<GlobalAddrInst>(&initInst))
+        ensureAlive(gRef->getReferencedGlobal());
+      if (auto *gVal = dyn_cast<GlobalValueInst>(&initInst))
+        ensureAlive(gVal->getReferencedGlobal());
     }
   }
 
@@ -362,6 +376,8 @@ class DeadFunctionAndGlobalElimination {
             ensureKeyPathComponentIsAlive(component);
         } else if (auto *GA = dyn_cast<GlobalAddrInst>(&I)) {
           ensureAlive(GA->getReferencedGlobal());
+        } else if (auto *agi = dyn_cast<AllocGlobalInst>(&I)) {
+          ensureAlive(agi->getReferencedGlobal());
         } else if (auto *GV = dyn_cast<GlobalValueInst>(&I)) {
           ensureAlive(GV->getReferencedGlobal());
         } else if (auto *HSI = dyn_cast<HasSymbolInst>(&I)) {
@@ -393,6 +409,9 @@ class DeadFunctionAndGlobalElimination {
       break;
     case AccessLevel::Internal:
       linkage = SILLinkage::Hidden;
+      break;
+    case AccessLevel::Package:
+      linkage = SILLinkage::Package;
       break;
     case AccessLevel::Public:
     case AccessLevel::Open:
@@ -426,7 +445,11 @@ class DeadFunctionAndGlobalElimination {
       F.forEachSpecializeAttrTargetFunction(
           [this](SILFunction *targetFun) { ensureAlive(targetFun); });
 
-      if (!F.shouldOptimize()) {
+      bool retainBecauseFunctionIsNoOpt = !F.shouldOptimize();
+      if (Module->getOptions().EmbeddedSwift)
+        retainBecauseFunctionIsNoOpt = false;
+
+      if (retainBecauseFunctionIsNoOpt) {
         LLVM_DEBUG(llvm::dbgs() << "  anchor a no optimization function: "
                                 << F.getName() << "\n");
         ensureAlive(&F);
@@ -521,6 +544,8 @@ class DeadFunctionAndGlobalElimination {
 
     // Check vtable methods.
     for (auto &vTable : Module->getVTables()) {
+      LLVM_DEBUG(llvm::dbgs() << " processing vtable "
+                              << vTable->getClass()->getName() << '\n');
       for (const SILVTable::Entry &entry : vTable->getEntries()) {
         if (entry.getMethod().kind == SILDeclRef::Kind::Deallocator ||
             entry.getMethod().kind == SILDeclRef::Kind::IVarDestroyer) {
@@ -533,6 +558,12 @@ class DeadFunctionAndGlobalElimination {
         auto *fd = getBaseMethod(
             cast<AbstractFunctionDecl>(entry.getMethod().getDecl()));
 
+        // In Embedded Swift, we don't expect SILFunction without definitions on
+        // vtable entries. Having one means the base method was DCE'd already,
+        // so let's avoid marking it alive in the subclass vtable either.
+        bool embedded = Module->getOptions().EmbeddedSwift;
+        if (embedded && !F->isDefinition()) { continue; }
+        
         if (// We also have to check the method declaration's access level.
             // Needed if it's a public base method declared in another
             // compilation unit (for this we have no SILFunction).
@@ -614,6 +645,14 @@ class DeadFunctionAndGlobalElimination {
         ensureAlive(dw.getJVP());
       if (dw.getVJP())
         ensureAlive(dw.getVJP());
+    }
+
+    // Collect move-only deinit methods.
+    //
+    // TODO: Similar to addWitnessFunction, track the associated
+    // struct/enum decl to allow DCE of unused deinits.
+    for (auto *deinit : Module->getMoveOnlyDeinits()) {
+      makeAlive(deinit->getImplementation());
     }
   }
 

@@ -33,7 +33,7 @@ void reportEvaluatedRequest(UnifiedStatsReporter &stats,
                             const Request &request);
 
 struct FingerprintAndMembers {
-  Optional<Fingerprint> fingerprint = None;
+  std::optional<Fingerprint> fingerprint = std::nullopt;
   ArrayRef<Decl *> members = {};
   bool operator==(const FingerprintAndMembers &x) const {
     return fingerprint == x.fingerprint && members == x.members;
@@ -81,14 +81,14 @@ private:
 public:
   // Caching
   bool isCached() const { return true; }
-  Optional<BodyAndFingerprint> getCachedResult() const;
+  std::optional<BodyAndFingerprint> getCachedResult() const;
   void cacheResult(BodyAndFingerprint value) const;
 };
 
 struct SourceFileParsingResult {
   ArrayRef<ASTNode> TopLevelItems;
-  Optional<ArrayRef<Token>> CollectedTokens;
-  Optional<StableHasher> InterfaceHasher;
+  std::optional<ArrayRef<Token>> CollectedTokens;
+  std::optional<StableHasher> InterfaceHasher;
 };
 
 /// Parse the top-level items of a SourceFile.
@@ -108,12 +108,30 @@ private:
 public:
   // Caching.
   bool isCached() const { return true; }
-  Optional<SourceFileParsingResult> getCachedResult() const;
+  std::optional<SourceFileParsingResult> getCachedResult() const;
   void cacheResult(SourceFileParsingResult result) const;
 
 public:
   evaluator::DependencySource
   readDependencySource(const evaluator::DependencyRecorder &) const;
+};
+
+/// Parse the ExportedSourceFile for a given SourceFile.
+class ExportedSourceFileRequest
+    : public SimpleRequest<ExportedSourceFileRequest,
+                           void *(const SourceFile *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  void *evaluate(Evaluator &evaluator, const SourceFile *SF) const;
+
+public:
+  // Cached.
+  bool isCached() const { return true; }
 };
 
 /// Parse the top-level items of a SourceFile.

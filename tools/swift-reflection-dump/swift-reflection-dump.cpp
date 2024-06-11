@@ -16,9 +16,9 @@
 #include "swift/ABI/MetadataValues.h"
 #include "swift/Basic/LLVMInitialize.h"
 #include "swift/Demangling/Demangle.h"
-#include "swift/Reflection/ReflectionContext.h"
-#include "swift/Reflection/TypeRef.h"
-#include "swift/Reflection/TypeRefBuilder.h"
+#include "swift/RemoteInspection/ReflectionContext.h"
+#include "swift/RemoteInspection/TypeRef.h"
+#include "swift/RemoteInspection/TypeRefBuilder.h"
 #include "swift/StaticMirror/ObjectFileContext.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Object/Archive.h"
@@ -157,7 +157,7 @@ static int doDumpReflectionSections(ArrayRef<std::string> BinaryFilenames,
       if (Line.empty())
         continue;
 
-      if (StringRef(Line).startswith("//"))
+      if (StringRef(Line).starts_with("//"))
         continue;
 
       Demangle::Demangler Dem;

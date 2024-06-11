@@ -10,6 +10,11 @@ struct ImplicitDefaultConstructor {
   int x = 42;
 };
 
+struct DefaultedDefaultConstructor {
+  int x = 42;
+  DefaultedDefaultConstructor() = default;
+};
+
 struct MemberOfClassType {
   ImplicitDefaultConstructor member;
 };
@@ -27,6 +32,9 @@ struct ConstructorWithParam {
 struct CopyAndMoveConstructor {
   CopyAndMoveConstructor(const CopyAndMoveConstructor &) = default;
   CopyAndMoveConstructor(CopyAndMoveConstructor &&) = default;
+
+  int value = 123;
+  int *ptr = nullptr;
 };
 
 struct Base {};
@@ -75,10 +83,10 @@ struct DeletedCopyConstructor {
   DeletedCopyConstructor(const DeletedCopyConstructor &) = delete;
 };
 
-// TODO: we should be able to import this constructor correctly. Until we can,
-// make sure not to crash.
-struct UsingBaseConstructor : ConstructorWithParam {
-  using ConstructorWithParam::ConstructorWithParam;
+#ifdef ENABLE_PTRAUTH
+struct HasPtrAuthMember {
+  void (*__ptrauth(1, 1, 3) handler)();
 };
+#endif
 
 #endif // TEST_INTEROP_CXX_CLASS_INPUTS_CONSTRUCTORS_H

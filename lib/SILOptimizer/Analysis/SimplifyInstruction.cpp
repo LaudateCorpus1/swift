@@ -172,6 +172,8 @@ SILValue InstSimplifier::visitStructExtractInst(StructExtractInst *sei) {
 
 SILValue
 InstSimplifier::visitUncheckedEnumDataInst(UncheckedEnumDataInst *uedi) {
+  if (uedi->getOperand()->getType().isValueTypeWithDeinit())
+    return SILValue();
   // (unchecked_enum_data (enum payload)) -> payload
   auto opt = lookThroughOwnershipInsts(uedi->getOperand());
   if (auto *ei = dyn_cast<EnumInst>(opt)) {
@@ -477,10 +479,10 @@ SILValue InstSimplifier::visitConvertFunctionInst(ConvertFunctionInst *cfi) {
   // SILCombine.
   //
   // (convert_function Y->X (convert_function x X->Y)) -> x
-  SILValue convertedValue = lookThroughOwnershipInsts(cfi->getConverted());
+  SILValue convertedValue = lookThroughOwnershipInsts(cfi->getOperand());
   if (auto *subCFI = dyn_cast<ConvertFunctionInst>(convertedValue))
-    if (subCFI->getConverted()->getType() == cfi->getType())
-      return lookThroughOwnershipInsts(subCFI->getConverted());
+    if (subCFI->getOperand()->getType() == cfi->getType())
+      return lookThroughOwnershipInsts(subCFI->getOperand());
 
   return SILValue();
 }

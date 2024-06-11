@@ -23,7 +23,7 @@
 /// resource or memory.  Concurrent executors are usually used to
 /// manage a pool of threads and prevent the number of allocated
 /// threads from growing without limit.
-/// 
+///
 /// Second, executors may own dedicated threads, or they may schedule
 /// work onto some underlying executor.  Dedicated threads can
 /// improve the responsiveness of a subsystem *locally*, but they impose
@@ -41,7 +41,7 @@
 /// of threads.  Having multiple independent concurrent executors
 /// with their own dedicated threads would undermine that.
 /// Therefore, it is sensible to have a single, global executor
-/// that will ultimately schedule most of the work in the system.  
+/// that will ultimately schedule most of the work in the system.
 /// With that as a baseline, special needs can be recognized and
 /// carved out from the global executor with its cooperation.
 ///
@@ -80,8 +80,26 @@ void (*swift::swift_task_enqueueGlobalWithDeadline_hook)(
     swift_task_enqueueGlobalWithDeadline_original original) = nullptr;
 
 SWIFT_CC(swift)
+bool (*swift::swift_task_isOnExecutor_hook)(
+    HeapObject *executor,
+    const Metadata *selfType,
+    const SerialExecutorWitnessTable *wtable,
+    swift_task_isOnExecutor_original original) = nullptr;
+
+SWIFT_CC(swift)
 void (*swift::swift_task_enqueueMainExecutor_hook)(
     Job *job, swift_task_enqueueMainExecutor_original original) = nullptr;
+
+SWIFT_CC(swift)
+void (*swift::swift_task_checkIsolated_hook)(
+    SerialExecutorRef executor,
+    swift_task_checkIsolated_original original) = nullptr;
+
+extern "C" SWIFT_CC(swift)
+    void _task_serialExecutor_checkIsolated(
+        HeapObject *executor,
+        const Metadata *selfType,
+        const SerialExecutorWitnessTable *wtable);
 
 #if SWIFT_CONCURRENCY_COOPERATIVE_GLOBAL_EXECUTOR
 #include "CooperativeGlobalExecutor.inc"
@@ -125,6 +143,78 @@ void swift::swift_task_enqueueGlobalWithDeadline(
     swift_task_enqueueGlobalWithDeadlineImpl(sec, nsec, tsec, tnsec, clock, job);
 }
 
+void swift::swift_task_checkIsolated(SerialExecutorRef executor) {
+  if (swift_task_checkIsolated_hook)
+    swift_task_checkIsolated_hook(executor, swift_task_checkIsolatedImpl);
+  else
+    swift_task_checkIsolatedImpl(executor);
+}
+
+// Implemented in Swift because we need to obtain the user-defined flags on the executor ref.
+//
+// We could inline this with effort, though.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
+extern "C" SWIFT_CC(swift)
+SerialExecutorRef _task_serialExecutor_getExecutorRef(
+        HeapObject *executor, const Metadata *selfType,
+        const SerialExecutorWitnessTable *wtable);
+#pragma clang diagnostic pop
+
+// Implemented in Swift because we need to obtain the user-defined flags on the executor ref.
+//
+// We could inline this with effort, though.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
+extern "C" SWIFT_CC(swift)
+TaskExecutorRef _task_executor_getTaskExecutorRef(
+    HeapObject *executor, const Metadata *selfType,
+    const SerialExecutorWitnessTable *wtable);
+#pragma clang diagnostic pop
+
+
+/// WARNING: This method is expected to CRASH in new runtimes, and cannot be
+/// used to implement "log warnings" mode. We would need a new entry point to
+/// implement a "only log warnings" actor isolation checking mode, and it would
+/// no be able handle more complex situations, as `SerialExecutor.checkIsolated`
+/// is able to (by calling into dispatchPrecondition on old runtimes).
+SWIFT_CC(swift)
+static bool swift_task_isOnExecutorImpl(HeapObject *executor,
+                                        const Metadata *selfType,
+                                        const SerialExecutorWitnessTable *wtable) {
+  auto executorRef = _task_serialExecutor_getExecutorRef(executor, selfType, wtable);
+  return swift_task_isCurrentExecutor(executorRef);
+}
+
+bool swift::swift_task_isOnExecutor(HeapObject *executor,
+                                    const Metadata *selfType,
+                                    const SerialExecutorWitnessTable *wtable) {
+  if (swift_task_isOnExecutor_hook)
+    return swift_task_isOnExecutor_hook(
+        executor, selfType, wtable, swift_task_isOnExecutorImpl);
+  else
+    return swift_task_isOnExecutorImpl(executor, selfType, wtable);
+}
+
+bool swift::swift_executor_isComplexEquality(SerialExecutorRef ref) {
+  return ref.isComplexEquality();
+}
+
+uint64_t swift::swift_task_getJobTaskId(Job *job) {
+  if (auto task = dyn_cast<AsyncTask>(job)) {
+    // TaskID is actually:
+    //   32bits of Job's Id
+    // + 32bits stored in the AsyncTask
+    return task->getTaskId();
+  } else {
+    return job->getJobId();
+  }
+}
+
+/*****************************************************************************/
+/****************************** MAIN EXECUTOR  *******************************/
+/*****************************************************************************/
+
 void swift::swift_task_enqueueMainExecutor(Job *job) {
   concurrency::trace::job_enqueue_main_executor(job);
   if (swift_task_enqueueMainExecutor_hook)
@@ -134,18 +224,18 @@ void swift::swift_task_enqueueMainExecutor(Job *job) {
     swift_task_enqueueMainExecutorImpl(job);
 }
 
-ExecutorRef swift::swift_task_getMainExecutor() {
+SerialExecutorRef swift::swift_task_getMainExecutor() {
 #if !SWIFT_CONCURRENCY_ENABLE_DISPATCH
   // FIXME: this isn't right for the non-cooperative environment
-  return ExecutorRef::generic();
+  return SerialExecutorRef::generic();
 #else
-  return ExecutorRef::forOrdinary(
+  return SerialExecutorRef::forOrdinary(
            reinterpret_cast<HeapObject*>(&_dispatch_main_q),
            _swift_task_getDispatchQueueSerialExecutorWitnessTable());
 #endif
 }
 
-bool ExecutorRef::isMainExecutor() const {
+bool SerialExecutorRef::isMainExecutor() const {
 #if !SWIFT_CONCURRENCY_ENABLE_DISPATCH
   // FIXME: this isn't right for the non-cooperative environment
   return isGeneric();

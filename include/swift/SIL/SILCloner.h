@@ -29,6 +29,35 @@
 
 namespace swift {
 
+struct SubstitutionMapWithLocalArchetypes {
+  std::optional<SubstitutionMap> SubsMap;
+  TypeSubstitutionMap LocalArchetypeSubs;
+
+  SubstitutionMapWithLocalArchetypes() {}
+  SubstitutionMapWithLocalArchetypes(SubstitutionMap subs) : SubsMap(subs) {}
+
+  Type operator()(SubstitutableType *type) {
+    if (isa<LocalArchetypeType>(type))
+      return QueryTypeSubstitutionMap{LocalArchetypeSubs}(type);
+
+    if (SubsMap)
+      return Type(type).subst(*SubsMap);
+
+    return Type(type);
+  }
+
+  ProtocolConformanceRef operator()(CanType origType,
+                                    Type substType,
+                                    ProtocolDecl *proto) {
+    if (isa<LocalArchetypeType>(origType))
+      return proto->getParentModule()->lookupConformance(substType, proto);
+    if (SubsMap)
+      return SubsMap->lookupConformance(origType, proto);
+
+    return ProtocolConformanceRef(proto);
+  }
+};
+
 /// SILCloner - Abstract SIL visitor which knows how to clone instructions and
 /// whose behavior can be customized by subclasses via the CRTP. This is meant
 /// to be subclassed to implement inlining, function specialization, and other
@@ -49,7 +78,7 @@ protected:
 
   SILBuilder Builder;
   DominanceInfo *DomTree = nullptr;
-  TypeSubstitutionMap OpenedExistentialSubs;
+  SubstitutionMapWithLocalArchetypes Functor;
 
   // The old-to-new value map.
   llvm::DenseMap<SILValue, SILValue> ValueMap;
@@ -78,7 +107,8 @@ public:
   explicit SILCloner(SILFunction &F, DominanceInfo *DT = nullptr)
       : Builder(F), DomTree(DT) {}
 
-  explicit SILCloner(SILGlobalVariable *GlobVar) : Builder(GlobVar) {}
+  explicit SILCloner(SILGlobalVariable *GlobVar)
+      : Builder(GlobVar) {}
 
   void clearClonerState() {
     ValueMap.clear();
@@ -164,10 +194,10 @@ public:
     asImpl().mapValue(origValue, mappedValue);
   }
 
-  /// Register a re-mapping for opened existentials.
-  void registerOpenedExistentialRemapping(ArchetypeType *From,
-                                          ArchetypeType *To) {
-    auto result = OpenedExistentialSubs.insert(
+  /// Register a re-mapping for local archetypes such as opened existentials.
+  void registerLocalArchetypeRemapping(ArchetypeType *From,
+                                       ArchetypeType *To) {
+    auto result = Functor.LocalArchetypeSubs.insert(
         std::make_pair(CanArchetypeType(From), CanType(To)));
     assert(result.second);
     (void)result;
@@ -189,65 +219,111 @@ public:
   }
 
   SubstitutionMap getOpSubstitutionMap(SubstitutionMap Subs) {
-    // If we have open existentials to substitute, check whether that's
-    // relevant to this particular substitution.
-    if (!OpenedExistentialSubs.empty()) {
-      for (auto ty : Subs.getReplacementTypes()) {
-        // If we found a type containing an opened existential, substitute
-        // open existentials throughout the substitution map.
-        if (ty->hasOpenedExistential()) {
-          Subs = Subs.subst(QueryTypeSubstitutionMapOrIdentity{
-                              OpenedExistentialSubs},
-                            MakeAbstractConformanceForGenericType());
-          break;
-        }
+    auto substSubs = asImpl().remapSubstitutionMap(Subs)
+                   .getCanonical(/*canonicalizeSignature*/false);
+
+#ifndef NDEBUG
+    for (auto substConf : substSubs.getConformances()) {
+      if (substConf.isInvalid()) {
+        llvm::errs() << "Invalid conformance in SIL cloner:\n";
+        if (Functor.SubsMap)
+          Functor.SubsMap->dump(llvm::errs());
+        llvm::errs() << "\nsubstitution map:\n";
+        Subs.dump(llvm::errs());
+        llvm::errs() << "\n";
+        abort();
       }
     }
+#endif
 
-    return asImpl().remapSubstitutionMap(Subs).getCanonical();
+    return substSubs;
   }
 
-  SILType getTypeInClonedContext(SILType Ty) {
-    auto objectTy = Ty.getASTType();
-    // Do not substitute opened existential types, if we do not have any.
-    if (!objectTy->hasOpenedExistential())
-      return Ty;
-    // Do not substitute opened existential types, if it is not required.
-    // This is often the case when cloning basic blocks inside the same
-    // function.
-    if (OpenedExistentialSubs.empty())
-      return Ty;
-
-    // Substitute opened existential types, if we have any.
-    return Ty.subst(
-      Builder.getModule(),
-      QueryTypeSubstitutionMapOrIdentity{OpenedExistentialSubs},
-      MakeAbstractConformanceForGenericType());
-  }
   SILType getOpType(SILType Ty) {
-    Ty = getTypeInClonedContext(Ty);
     return asImpl().remapType(Ty);
   }
 
-  CanType getASTTypeInClonedContext(Type ty) {
-    // Do not substitute opened existential types, if we do not have any.
-    if (!ty->hasOpenedExistential())
-      return ty->getCanonicalType();
-    // Do not substitute opened existential types, if it is not required.
-    // This is often the case when cloning basic blocks inside the same
-    // function.
-    if (OpenedExistentialSubs.empty())
-      return ty->getCanonicalType();
-
-    return ty.subst(
-      QueryTypeSubstitutionMapOrIdentity{OpenedExistentialSubs},
-      MakeAbstractConformanceForGenericType()
-    )->getCanonicalType();
+  CanType getOpASTType(CanType ty) {
+    return asImpl().remapASTType(ty);
   }
 
-  CanType getOpASTType(CanType ty) {
-    ty = getASTTypeInClonedContext(ty);
-    return asImpl().remapASTType(ty);
+  /// Remap a structural index into a pack so that it will point to the
+  /// corresponding structural index in the remapped pack type.
+  unsigned getOpStructuralPackIndex(CanPackType origPackType,
+                                    unsigned origIndex) {
+    assert(origIndex < origPackType->getNumElements());
+    unsigned newIndex = 0;
+    for (unsigned i = 0; i != origIndex; ++i) {
+      auto origComponentType = origPackType.getElementType(i);
+      if (auto origExpansionType =
+            dyn_cast<PackExpansionType>(origComponentType)) {
+        auto newShapeClass = getOpASTType(origExpansionType.getCountType());
+        if (auto newShapePack = dyn_cast<PackType>(newShapeClass))
+          newIndex += newShapePack->getNumElements();
+        else
+          newIndex++;
+      } else {
+        newIndex++;
+      }
+    }
+    return newIndex;
+  }
+
+  /// Does type substitution make the given tuple type no longer a tuple?
+  bool doesOpTupleDisappear(CanTupleType type) {
+    // Fast-path the empty tuple.
+    if (type->getNumElements() == 0) return false;
+
+    // Do a first pass over the tuple elements to check out the
+    // non-expansions.  If there's more than one of them we definitely
+    // stay a tuple and don't need to substitute any of the expansions.
+    unsigned numScalarElements = type->getNumScalarElements();
+    if (numScalarElements > 1)
+      return false;
+
+    // Okay, we need to substitute the count types for the expansions.
+    for (auto index : indices(type->getElements())) {
+      // Ignore non-expansions because we've already counted them.
+      auto expansion = dyn_cast<PackExpansionType>(type.getElementType(index));
+      if (!expansion) {
+        // If we have a non-expansion with a label, we stay a tuple.
+        if (type->getElement(index).hasName())
+          return false;
+        continue;
+      }
+
+      // Substitute the shape class of the expansion.  If this doesn't
+      // give us a pack (e.g. if this isn't a substituting clone),
+      // we're never erasing tuple structure.
+      auto newShapeClass = getOpASTType(expansion.getCountType());
+      auto newShapePack = dyn_cast<PackType>(newShapeClass);
+      if (!newShapePack)
+        return false;
+
+      // If the element has a name, then the tuple sticks around unless
+      // the expansion disappears completely.
+      if (type->getElement(index).hasName()) {
+        if (newShapePack->getNumElements() == 0)
+          continue;
+        return false;
+      }
+
+      // Otherwise, walk the substituted shape components.
+      for (auto newShapeElement : newShapePack.getElementTypes()) {
+        // If there's an expansion in the shape, we'll have an expansion
+        // in the tuple elements, which forces the tuple structure to remain.
+        if (isa<PackExpansionType>(newShapeElement)) return false;
+
+        // Otherwise, add another scalar element.
+        if (++numScalarElements > 1) return false;
+      }
+    }
+
+    // All of the packs expanded to scalars.  We should've short-circuited
+    // if we ever saw a second or labeled scalar, so all we need to test
+    // is whether we have exactly one scalar.
+    assert(numScalarElements <= 1);
+    return numScalarElements == 1;
   }
 
   void remapRootOpenedType(CanOpenedArchetypeType archetypeTy) {
@@ -258,32 +334,39 @@ public:
         ->getCanonicalType();
     auto substExistentialTy = getOpASTType(origExistentialTy);
     auto replacementTy = OpenedArchetypeType::get(substExistentialTy, sig);
-    registerOpenedExistentialRemapping(archetypeTy, replacementTy);
+    registerLocalArchetypeRemapping(archetypeTy, replacementTy);
   }
 
-  // SILCloner will take care of debug scope on the instruction
-  // and this helper will remap the auxiliary debug scope too, if there is any.
-  void remapDebugVarInfo(DebugVarCarryingInst DbgVarInst) {
-    if (!DbgVarInst)
+  /// SILCloner will take care of debug scope on the instruction
+  /// and this helper will remap the auxiliary debug scope too, if there is any.
+  void remapDebugVariable(std::optional<SILDebugVariable> &VarInfo) {
+    if (!VarInfo)
       return;
-    auto VarInfo = DbgVarInst.getVarInfo();
-    if (VarInfo && VarInfo->Scope)
-      DbgVarInst.setDebugVarScope(getOpScope(VarInfo->Scope));
+    if (VarInfo->Type)
+      VarInfo->Type = getOpType(*VarInfo->Type);
+    // Don't remap locations for debug values.
+    if (VarInfo->Scope)
+      VarInfo->Scope = getOpScope(VarInfo->Scope);
   }
 
   ProtocolConformanceRef getOpConformance(Type ty,
                                           ProtocolConformanceRef conformance) {
-    // If we have open existentials to substitute, do so now.
-    if (ty->hasOpenedExistential() && !OpenedExistentialSubs.empty()) {
-      conformance =
-        conformance.subst(ty,
-                          QueryTypeSubstitutionMapOrIdentity{
-                                                        OpenedExistentialSubs},
-                          MakeAbstractConformanceForGenericType());
-    }
+    auto substConf = asImpl().remapConformance(ty, conformance);
 
-    return asImpl().remapConformance(getASTTypeInClonedContext(ty),
-                                     conformance);
+#ifndef NDEBUG
+    if (substConf.isInvalid()) {
+      llvm::errs() << "Invalid conformance in SIL cloner:\n";
+      if (Functor.SubsMap)
+        Functor.SubsMap->dump(llvm::errs());
+      llvm::errs() << "\nconformance:\n";
+      conformance.dump(llvm::errs());
+      llvm::errs() << "original type:\n";
+      ty.dump(llvm::errs());
+      abort();
+    }
+#endif
+
+    return substConf;
   }
 
   ArrayRef<ProtocolConformanceRef>
@@ -365,17 +448,91 @@ protected:
 
   SILLocation remapLocation(SILLocation Loc) { return Loc; }
   const SILDebugScope *remapScope(const SILDebugScope *DS) { return DS; }
-  SILType remapType(SILType Ty) {
-      return Ty;
-  }
 
-  CanType remapASTType(CanType Ty) {
+  bool shouldSubstOpaqueArchetypes() const { return false; }
+
+  SILType remapType(SILType Ty) {
+    if (Functor.SubsMap || Ty.hasLocalArchetype()) {
+      Ty = Ty.subst(Builder.getModule(), Functor, Functor,
+                    CanGenericSignature());
+    }
+
+    if (asImpl().shouldSubstOpaqueArchetypes()) {
+      auto context = getBuilder().getTypeExpansionContext();
+
+      if (!Ty.hasOpaqueArchetype() ||
+          !context.shouldLookThroughOpaqueTypeArchetypes())
+        return Ty;
+
+      // Remap types containing opaque result types in the current context.
+      Ty = getBuilder().getTypeLowering(Ty).getLoweredType().getCategoryType(
+          Ty.getCategory());
+    }
+
     return Ty;
   }
 
+  CanType remapASTType(CanType ty) {
+    if (Functor.SubsMap || ty->hasLocalArchetype())
+      ty = ty.subst(Functor, Functor)->getCanonicalType();
+
+    if (asImpl().shouldSubstOpaqueArchetypes()) {
+      auto context = getBuilder().getTypeExpansionContext();
+
+      if (!ty->hasOpaqueArchetype() ||
+          !context.shouldLookThroughOpaqueTypeArchetypes())
+        return ty;
+
+      // Remap types containing opaque result types in the current context.
+      return substOpaqueTypesWithUnderlyingTypes(ty, context,
+                                                 /*allowLoweredTypes=*/false);
+    }
+
+    return ty;
+  }
+
   ProtocolConformanceRef remapConformance(Type Ty, ProtocolConformanceRef C) {
+    if (Functor.SubsMap || Ty->hasLocalArchetype()) {
+      C = C.subst(Ty, Functor, Functor);
+      if (asImpl().shouldSubstOpaqueArchetypes())
+        Ty = Ty.subst(Functor, Functor);
+    }
+
+    if (asImpl().shouldSubstOpaqueArchetypes()) {
+      auto context = getBuilder().getTypeExpansionContext();
+
+      if (!Ty->hasOpaqueArchetype() ||
+          !context.shouldLookThroughOpaqueTypeArchetypes())
+        return C;
+
+      return substOpaqueTypesWithUnderlyingTypes(C, Ty, context);
+    }
+
     return C;
   }
+
+  SubstitutionMap remapSubstitutionMap(SubstitutionMap Subs) {
+    // If we have local archetypes to substitute, do so now.
+    if (Subs.hasLocalArchetypes() || Functor.SubsMap)
+      Subs = Subs.subst(Functor, Functor);
+
+    if (asImpl().shouldSubstOpaqueArchetypes()) {
+      auto context = getBuilder().getTypeExpansionContext();
+
+      if (!Subs.hasOpaqueArchetypes() ||
+          !context.shouldLookThroughOpaqueTypeArchetypes())
+        return Subs;
+
+      ReplaceOpaqueTypesWithUnderlyingTypes replacer(
+        context.getContext(), context.getResilienceExpansion(),
+        context.isWholeModuleContext());
+      return Subs.subst(replacer, replacer,
+                        SubstFlags::SubstituteOpaqueArchetypes);
+    }
+
+    return Subs;
+  }
+
   /// Get the value that takes the place of the given `Value` within the cloned
   /// region. The given value must already have been mapped by this cloner.
   SILValue getMappedValue(SILValue Value);
@@ -384,8 +541,6 @@ protected:
   SILFunction *remapFunction(SILFunction *Func) { return Func; }
   SILBasicBlock *remapBasicBlock(SILBasicBlock *BB);
   void postProcess(SILInstruction *Orig, SILInstruction *Cloned);
-
-  SubstitutionMap remapSubstitutionMap(SubstitutionMap Subs) { return Subs; }
 
   /// This is called by either of the top-level visitors, cloneReachableBlocks
   /// or cloneSILFunction, after all other visitors are have been called.
@@ -519,9 +674,7 @@ SILCloner<ImplClass>::getMappedValue(SILValue Value) {
   // If we have undef, just remap the type.
   if (auto *U = dyn_cast<SILUndef>(Value)) {
     auto type = getOpType(U->getType());
-    ValueBase *undef =
-      (type == U->getType() ? U : SILUndef::get(type, Builder.getFunction()));
-    return SILValue(undef);
+    return SILUndef::get(Builder.getFunction(), type);
   }
 
   llvm_unreachable("Unmapped value while cloning?");
@@ -658,7 +811,8 @@ void SILCloner<ImplClass>::clonePhiArgs(SILBasicBlock *oldBB) {
   // Create new arguments for each of the original block's arguments.
   for (auto *Arg : oldBB->getSILPhiArguments()) {
     SILValue mappedArg = mappedBB->createPhiArgument(
-      getOpType(Arg->getType()), Arg->getOwnershipKind());
+        getOpType(Arg->getType()), Arg->getOwnershipKind(), Arg->getDecl(),
+        Arg->isReborrow(), Arg->hasPointerEscape());
 
     asImpl().mapValue(Arg, mappedArg);
   }
@@ -798,15 +952,50 @@ SILCloner<ImplClass>::visitAllocStackInst(AllocStackInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
   // Drop the debug info from mandatory-inlined instructions. It's the law!
   SILLocation Loc = getOpLocation(Inst->getLoc());
-  Optional<SILDebugVariable> VarInfo = Inst->getVarInfo();
+  std::optional<SILDebugVariable> VarInfo = Inst->getVarInfo();
   if (Loc.getKind() == SILLocation::MandatoryInlinedKind) {
     Loc = MandatoryInlinedLocation::getAutoGeneratedLocation();
-    VarInfo = None;
+    VarInfo = std::nullopt;
   }
+  remapDebugVariable(VarInfo);
   auto *NewInst = getBuilder().createAllocStack(
       Loc, getOpType(Inst->getElementType()), VarInfo,
-      Inst->hasDynamicLifetime(), Inst->isLexical(), Inst->getWasMoved());
-  remapDebugVarInfo(DebugVarCarryingInst(NewInst));
+      Inst->hasDynamicLifetime(), Inst->isLexical(), Inst->isFromVarDecl(),
+      Inst->usesMoveableValueDebugInfo()
+#ifndef NDEBUG
+          ,
+      true
+#endif
+  );
+  recordClonedInstruction(Inst, NewInst);
+}
+
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitAllocVectorInst(
+    AllocVectorInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+  recordClonedInstruction(Inst, getBuilder().createAllocVector(
+                                    getOpLocation(Inst->getLoc()),
+                                    getOpValue(Inst->getCapacity()),
+                                    getOpType(Inst->getElementType())));
+}
+
+
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitAllocPackMetadataInst(
+    AllocPackMetadataInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+  recordClonedInstruction(Inst, getBuilder().createAllocPackMetadata(
+                                    getOpLocation(Inst->getLoc())));
+}
+
+template<typename ImplClass>
+void
+SILCloner<ImplClass>::visitAllocPackInst(AllocPackInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+  SILLocation Loc = getOpLocation(Inst->getLoc());
+  auto *NewInst = getBuilder().createAllocPack(
+      Loc, getOpType(Inst->getType().getObjectType()));
   recordClonedInstruction(Inst, NewInst);
 }
 
@@ -822,7 +1011,7 @@ SILCloner<ImplClass>::visitAllocRefInst(AllocRefInst *Inst) {
   }
   auto *NewInst = getBuilder().createAllocRef(getOpLocation(Inst->getLoc()),
                                       getOpType(Inst->getType()),
-                                      Inst->isObjC(), Inst->canAllocOnStack(),
+                                      Inst->isObjC(), Inst->canAllocOnStack(), Inst->isBare(),
                                       ElemTypes, CountArgs);
   recordClonedInstruction(Inst, NewInst);
 }
@@ -853,17 +1042,19 @@ SILCloner<ImplClass>::visitAllocBoxInst(AllocBoxInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
   // Drop the debug info from mandatory-inlined instructions.
   SILLocation Loc = getOpLocation(Inst->getLoc());
-  Optional<SILDebugVariable> VarInfo = Inst->getVarInfo();
+  std::optional<SILDebugVariable> VarInfo = Inst->getVarInfo();
   if (Loc.getKind() == SILLocation::MandatoryInlinedKind) {
     Loc = MandatoryInlinedLocation::getAutoGeneratedLocation();
-    VarInfo = None;
+    VarInfo = std::nullopt;
   }
 
   recordClonedInstruction(
       Inst,
       getBuilder().createAllocBox(
           Loc, this->getOpType(Inst->getType()).template castTo<SILBoxType>(),
-          VarInfo));
+          VarInfo, Inst->hasDynamicLifetime(), Inst->emitReflectionMetadata(),
+          Inst->usesMoveableValueDebugInfo(),
+          /*skipVarDeclAssert*/ true, Inst->hasPointerEscape()));
 }
 
 template<typename ImplClass>
@@ -932,7 +1123,8 @@ SILCloner<ImplClass>::visitPartialApplyInst(PartialApplyInst *Inst) {
       Inst, getBuilder().createPartialApply(
                 getOpLocation(Inst->getLoc()), getOpValue(Inst->getCallee()),
                 getOpSubstitutionMap(Inst->getSubstitutionMap()), Args,
-                Inst->getType().getAs<SILFunctionType>()->getCalleeConvention(),
+                Inst->getCalleeConvention(),
+                Inst->getResultIsolation(),
                 Inst->isOnStack(),
                 GenericSpecializationInformation::create(Inst, getBuilder())));
 }
@@ -965,7 +1157,8 @@ SILCloner<ImplClass>::visitEndApplyInst(EndApplyInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
   recordClonedInstruction(
       Inst, getBuilder().createEndApply(getOpLocation(Inst->getLoc()),
-                                        getOpValue(Inst->getOperand())));
+                                        getOpValue(Inst->getOperand()),
+                                        getOpType(Inst->getType())));
 }
 
 template<typename ImplClass>
@@ -1013,7 +1206,10 @@ SILCloner<ImplClass>::visitGlobalAddrInst(GlobalAddrInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
   recordClonedInstruction(
       Inst, getBuilder().createGlobalAddr(getOpLocation(Inst->getLoc()),
-                                          Inst->getReferencedGlobal()));
+                                          Inst->getReferencedGlobal(),
+                                          Inst->hasOperand() ?
+                                            getOpValue(Inst->getDependencyToken()) :
+                                            SILValue()));
 }
 
 template<typename ImplClass>
@@ -1022,7 +1218,8 @@ SILCloner<ImplClass>::visitGlobalValueInst(GlobalValueInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
   recordClonedInstruction(
       Inst, getBuilder().createGlobalValue(getOpLocation(Inst->getLoc()),
-                                           Inst->getReferencedGlobal()));
+                                           Inst->getReferencedGlobal(),
+                                           Inst->isBare()));
 }
 
 template<typename ImplClass>
@@ -1116,10 +1313,26 @@ void SILCloner<ImplClass>::visitBeginBorrowInst(BeginBorrowInst *Inst) {
     return recordFoldedValue(Inst, getOpValue(Inst->getOperand()));
   }
 
-  recordClonedInstruction(
-      Inst, getBuilder().createBeginBorrow(getOpLocation(Inst->getLoc()),
-                                           getOpValue(Inst->getOperand()),
-                                           Inst->isLexical()));
+  recordClonedInstruction(Inst,
+                          getBuilder().createBeginBorrow(
+                              getOpLocation(Inst->getLoc()),
+                              getOpValue(Inst->getOperand()), Inst->isLexical(),
+                              Inst->hasPointerEscape(), Inst->isFromVarDecl()));
+}
+
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitBorrowedFromInst(BorrowedFromInst *bfi) {
+  getBuilder().setCurrentDebugScope(getOpScope(bfi->getDebugScope()));
+  if (!getBuilder().hasOwnership()) {
+    return recordFoldedValue(bfi, getOpValue(bfi->getBorrowedValue()));
+  }
+
+  auto enclosingValues = getOpValueArray<8>(bfi->getEnclosingValues());
+  recordClonedInstruction(bfi,
+                          getBuilder().createBorrowedFrom(
+                              getOpLocation(bfi->getLoc()),
+                              getOpValue(bfi->getBorrowedValue()),
+                              enclosingValues));
 }
 
 template <typename ImplClass>
@@ -1243,8 +1456,21 @@ void SILCloner<ImplClass>::visitAssignByWrapperInst(AssignByWrapperInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
   recordClonedInstruction(
       Inst, getBuilder().createAssignByWrapper(
-                getOpLocation(Inst->getLoc()), Inst->getOriginator(),
+                getOpLocation(Inst->getLoc()),
                 getOpValue(Inst->getSrc()), getOpValue(Inst->getDest()),
+                getOpValue(Inst->getInitializer()),
+                getOpValue(Inst->getSetter()), Inst->getMode()));
+}
+
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitAssignOrInitInst(AssignOrInitInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+  recordClonedInstruction(
+      Inst, getBuilder().createAssignOrInit(
+                getOpLocation(Inst->getLoc()),
+                Inst->getProperty(),
+                getOpValue(Inst->getSelf()),
+                getOpValue(Inst->getSrc()),
                 getOpValue(Inst->getInitializer()),
                 getOpValue(Inst->getSetter()), Inst->getMode()));
 }
@@ -1278,16 +1504,48 @@ SILCloner<ImplClass>::visitDebugValueInst(DebugValueInst *Inst) {
     return;
 
   // Since we want the debug info to survive, we do not remap the location here.
-  SILDebugVariable VarInfo = *Inst->getVarInfo();
+  std::optional<SILDebugVariable> VarInfo = Inst->getVarInfo();
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+  remapDebugVariable(VarInfo);
   auto *NewInst = getBuilder().createDebugValue(
-      Inst->getLoc(), getOpValue(Inst->getOperand()), VarInfo,
-      Inst->poisonRefs(), Inst->getWasMoved(), Inst->hasTrace());
-  remapDebugVarInfo(DebugVarCarryingInst(NewInst));
+      Inst->getLoc(), getOpValue(Inst->getOperand()), *VarInfo,
+      Inst->poisonRefs(), Inst->usesMoveableValueDebugInfo(), Inst->hasTrace());
   recordClonedInstruction(Inst, NewInst);
 }
+template<typename ImplClass>
+void
+SILCloner<ImplClass>::visitDebugStepInst(DebugStepInst *Inst) {
+  recordClonedInstruction(Inst, getBuilder().createDebugStep(Inst->getLoc()));
+}
 
-#define NEVER_LOADABLE_CHECKED_REF_STORAGE(Name, name, ...)                    \
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitUnownedCopyValueInst(
+    UnownedCopyValueInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+  recordClonedInstruction(
+      Inst, getBuilder().createUnownedCopyValue(
+                getOpLocation(Inst->getLoc()), getOpValue(Inst->getOperand())));
+}
+
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitWeakCopyValueInst(WeakCopyValueInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+  recordClonedInstruction(
+      Inst, getBuilder().createWeakCopyValue(getOpLocation(Inst->getLoc()),
+                                             getOpValue(Inst->getOperand())));
+}
+
+#define COPYABLE_STORAGE_HELPER(Name, name)                                    \
+  template <typename ImplClass>                                                \
+  void SILCloner<ImplClass>::visitStrongCopy##Name##ValueInst(                 \
+      StrongCopy##Name##ValueInst *Inst) {                                     \
+    getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));      \
+    recordClonedInstruction(Inst, getBuilder().createStrongCopy##Name##Value(  \
+                                      getOpLocation(Inst->getLoc()),           \
+                                      getOpValue(Inst->getOperand())));        \
+  }
+
+#define LOADABLE_STORAGE_HELPER(Name, name)                                    \
   template <typename ImplClass>                                                \
   void SILCloner<ImplClass>::visitLoad##Name##Inst(Load##Name##Inst *Inst) {   \
     getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));      \
@@ -1321,17 +1579,8 @@ SILCloner<ImplClass>::visitDebugValueInst(DebugValueInst *Inst) {
         Inst, getBuilder().create##Name##ToRef(getOpLocation(Inst->getLoc()),  \
                                                getOpValue(Inst->getOperand()), \
                                                getOpType(Inst->getType())));   \
-  }                                                                            \
-  template <typename ImplClass>                                                \
-  void SILCloner<ImplClass>::visitStrongCopy##Name##ValueInst(                 \
-      StrongCopy##Name##ValueInst *Inst) {                                     \
-    getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));      \
-    recordClonedInstruction(Inst, getBuilder().createStrongCopy##Name##Value(  \
-                                      getOpLocation(Inst->getLoc()),           \
-                                      getOpValue(Inst->getOperand())));        \
   }
-#define ALWAYS_LOADABLE_CHECKED_REF_STORAGE(Name, name, ...)                   \
-  LOADABLE_REF_STORAGE_HELPER(Name, name)                                      \
+#define RETAINABLE_STORAGE_HELPER(Name, name)                                  \
   template <typename ImplClass>                                                \
   void SILCloner<ImplClass>::visitStrongRetain##Name##Inst(                    \
       StrongRetain##Name##Inst *Inst) {                                        \
@@ -1358,13 +1607,26 @@ SILCloner<ImplClass>::visitDebugValueInst(DebugValueInst *Inst) {
                                       getOpValue(Inst->getOperand()),          \
                                       Inst->getAtomicity()));                  \
   }
-#define SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, name, ...) \
-  NEVER_LOADABLE_CHECKED_REF_STORAGE(Name, name, "...") \
-  ALWAYS_LOADABLE_CHECKED_REF_STORAGE(Name, name, "...")
-#define UNCHECKED_REF_STORAGE(Name, name, ...) \
+#define NEVER_LOADABLE_CHECKED_REF_STORAGE(Name, name, ...)                    \
+  COPYABLE_STORAGE_HELPER(Name, name)                                          \
+  LOADABLE_STORAGE_HELPER(Name, name)
+#define ALWAYS_LOADABLE_CHECKED_REF_STORAGE(Name, name, ...)                   \
+  COPYABLE_STORAGE_HELPER(Name, name)                                          \
+  LOADABLE_REF_STORAGE_HELPER(Name, name)                                      \
+  RETAINABLE_STORAGE_HELPER(Name, name)
+#define SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, name, ...)                \
+  COPYABLE_STORAGE_HELPER(Name, name)                                          \
+  LOADABLE_REF_STORAGE_HELPER(Name, name)                                      \
+  LOADABLE_STORAGE_HELPER(Name, name)                                          \
+  RETAINABLE_STORAGE_HELPER(Name, name)
+#define UNCHECKED_REF_STORAGE(Name, name, ...)                                 \
+  COPYABLE_STORAGE_HELPER(Name, name)                                          \
   LOADABLE_REF_STORAGE_HELPER(Name, name)
 #include "swift/AST/ReferenceStorage.def"
+#undef LOADABLE_STORAGE_HELPER
 #undef LOADABLE_REF_STORAGE_HELPER
+#undef COPYABLE_STORAGE_HELPER
+#undef RETAINABLE_STORAGE_HELPER
 
 template<typename ImplClass>
 void
@@ -1381,11 +1643,20 @@ template <typename ImplClass>
 void SILCloner<ImplClass>::visitExplicitCopyAddrInst(
     ExplicitCopyAddrInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
-  recordClonedInstruction(
-      Inst, getBuilder().createExplicitCopyAddr(
-                getOpLocation(Inst->getLoc()), getOpValue(Inst->getSrc()),
-                getOpValue(Inst->getDest()), Inst->isTakeOfSrc(),
-                Inst->isInitializationOfDest()));
+  if (!getBuilder().hasOwnership()) {
+    recordClonedInstruction(
+        Inst, getBuilder().createCopyAddr(
+                  getOpLocation(Inst->getLoc()), getOpValue(Inst->getSrc()),
+                  getOpValue(Inst->getDest()), Inst->isTakeOfSrc(),
+                  Inst->isInitializationOfDest()));
+  } else {
+    // preserve the explicit_*
+    recordClonedInstruction(
+        Inst, getBuilder().createExplicitCopyAddr(
+                  getOpLocation(Inst->getLoc()), getOpValue(Inst->getSrc()),
+                  getOpValue(Inst->getDest()), Inst->isTakeOfSrc(),
+                  Inst->isInitializationOfDest()));
+  }
 }
 
 template <typename ImplClass>
@@ -1564,7 +1835,7 @@ visitRefToBridgeObjectInst(RefToBridgeObjectInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
   recordClonedInstruction(
       Inst, getBuilder().createRefToBridgeObject(
-                getOpLocation(Inst->getLoc()), getOpValue(Inst->getConverted()),
+                getOpLocation(Inst->getLoc()), getOpValue(Inst->getOperand(0)),
                 getOpValue(Inst->getBitsOperand()),
                 getBuilder().hasOwnership()
                     ? Inst->getForwardingOwnershipKind()
@@ -1578,7 +1849,7 @@ visitBridgeObjectToRefInst(BridgeObjectToRefInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
   recordClonedInstruction(
       Inst, getBuilder().createBridgeObjectToRef(
-                getOpLocation(Inst->getLoc()), getOpValue(Inst->getConverted()),
+                getOpLocation(Inst->getLoc()), getOpValue(Inst->getOperand()),
                 getOpType(Inst->getType()),
                 getBuilder().hasOwnership()
                     ? Inst->getForwardingOwnershipKind()
@@ -1592,7 +1863,7 @@ visitBridgeObjectToWordInst(BridgeObjectToWordInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
   recordClonedInstruction(Inst, getBuilder().createBridgeObjectToWord(
                                     getOpLocation(Inst->getLoc()),
-                                    getOpValue(Inst->getConverted()),
+                                    getOpValue(Inst->getOperand()),
                                     getOpType(Inst->getType())));
 }
 
@@ -1732,6 +2003,13 @@ template <typename ImplClass>
 void SILCloner<ImplClass>::visitCopyValueInst(CopyValueInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
   if (!getBuilder().hasOwnership()) {
+    // Noescape closures become trivial after OSSA.
+    if (auto fnTy = Inst->getType().getAs<SILFunctionType>()) {
+      if (fnTy->isTrivialNoEscape()) {
+        return recordFoldedValue(Inst, getOpValue(Inst->getOperand()));
+      }
+    }
+  
     SILValue newValue = getBuilder().emitCopyValueOperation(
         getOpLocation(Inst->getLoc()), getOpValue(Inst->getOperand()));
     return recordFoldedValue(Inst, newValue);
@@ -1760,19 +2038,44 @@ void SILCloner<ImplClass>::visitExplicitCopyValueInst(
 template <typename ImplClass>
 void SILCloner<ImplClass>::visitMoveValueInst(MoveValueInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
-  auto *MVI = getBuilder().createMoveValue(getOpLocation(Inst->getLoc()),
-                                           getOpValue(Inst->getOperand()),
-                                           Inst->isLexical());
+  if (!getBuilder().hasOwnership()) {
+    return recordFoldedValue(Inst, getOpValue(Inst->getOperand()));
+  }
+  auto *MVI = getBuilder().createMoveValue(
+      getOpLocation(Inst->getLoc()), getOpValue(Inst->getOperand()),
+      Inst->isLexical(), Inst->hasPointerEscape(), Inst->isFromVarDecl());
   MVI->setAllowsDiagnostics(Inst->getAllowDiagnostics());
   recordClonedInstruction(Inst, MVI);
 }
 
 template <typename ImplClass>
-void SILCloner<ImplClass>::visitMarkMustCheckInst(MarkMustCheckInst *Inst) {
+void SILCloner<ImplClass>::visitDropDeinitInst(DropDeinitInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
-  auto *MVI = getBuilder().createMarkMustCheckInst(
+  if (!getBuilder().hasOwnership()) {
+    return recordFoldedValue(Inst, getOpValue(Inst->getOperand()));
+  }
+  auto *MVI = getBuilder().createDropDeinit(getOpLocation(Inst->getLoc()),
+                                            getOpValue(Inst->getOperand()));
+  recordClonedInstruction(Inst, MVI);
+}
+
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitMarkUnresolvedNonCopyableValueInst(
+    MarkUnresolvedNonCopyableValueInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+  auto *MVI = getBuilder().createMarkUnresolvedNonCopyableValueInst(
       getOpLocation(Inst->getLoc()), getOpValue(Inst->getOperand()),
       Inst->getCheckKind());
+  recordClonedInstruction(Inst, MVI);
+}
+
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitMarkUnresolvedReferenceBindingInst(
+    MarkUnresolvedReferenceBindingInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+  auto *MVI = getBuilder().createMarkUnresolvedReferenceBindingInst(
+      getOpLocation(Inst->getLoc()), getOpValue(Inst->getOperand()),
+      Inst->getKind());
   recordClonedInstruction(Inst, MVI);
 }
 
@@ -1790,6 +2093,33 @@ void SILCloner<ImplClass>::visitMoveOnlyWrapperToCopyableValueInst(
         getOpLocation(inst->getLoc()), getOpValue(inst->getOperand()));
   }
   recordClonedInstruction(inst, cvt);
+}
+
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitMoveOnlyWrapperToCopyableBoxInst(
+    MoveOnlyWrapperToCopyableBoxInst *inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(inst->getDebugScope()));
+  recordClonedInstruction(
+      inst, getBuilder().createMoveOnlyWrapperToCopyableBox(
+                getOpLocation(inst->getLoc()), getOpValue(inst->getOperand())));
+}
+
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitMoveOnlyWrapperToCopyableAddrInst(
+    MoveOnlyWrapperToCopyableAddrInst *inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(inst->getDebugScope()));
+  recordClonedInstruction(
+      inst, getBuilder().createMoveOnlyWrapperToCopyableAddr(
+                getOpLocation(inst->getLoc()), getOpValue(inst->getOperand())));
+}
+
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitCopyableToMoveOnlyWrapperAddrInst(
+    CopyableToMoveOnlyWrapperAddrInst *inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(inst->getDebugScope()));
+  recordClonedInstruction(
+      inst, getBuilder().createCopyableToMoveOnlyWrapperAddr(
+                getOpLocation(inst->getLoc()), getOpValue(inst->getOperand())));
 }
 
 template <typename ImplClass>
@@ -1847,6 +2177,21 @@ template <typename ImplClass>
 void SILCloner<ImplClass>::visitDestroyValueInst(DestroyValueInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
   if (!getBuilder().hasOwnership()) {
+    // Noescape closures become trivial after OSSA.
+    if (auto fnTy = Inst->getOperand()->getType().getAs<SILFunctionType>()) {
+      if (fnTy->isTrivialNoEscape()) {
+        // Destroying the partial_apply [stack] becomes the stack deallocation
+        // of the context.
+        if (auto origPA = Inst->getNonescapingClosureAllocation()) {
+          recordClonedInstruction(Inst,
+            getBuilder().createDeallocStack(getOpLocation(Inst->getLoc()),
+                                            getOpValue(origPA)));
+        }
+        
+        return;
+      }
+    }
+  
     return recordClonedInstruction(
         Inst, getBuilder().createReleaseValue(
                   getOpLocation(Inst->getLoc()), getOpValue(Inst->getOperand()),
@@ -1888,12 +2233,21 @@ void SILCloner<ImplClass>::visitUnmanagedAutoreleaseValueInst(
 
 template<typename ImplClass>
 void
-SILCloner<ImplClass>::visitSetDeallocatingInst(SetDeallocatingInst *Inst) {
+SILCloner<ImplClass>::visitBeginDeallocRefInst(BeginDeallocRefInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
   recordClonedInstruction(
-      Inst, getBuilder().createSetDeallocating(getOpLocation(Inst->getLoc()),
-                                               getOpValue(Inst->getOperand()),
-                                               Inst->getAtomicity()));
+      Inst, getBuilder().createBeginDeallocRef(getOpLocation(Inst->getLoc()),
+                                               getOpValue(Inst->getReference()),
+                                               getOpValue(Inst->getAllocation())));
+}
+
+template<typename ImplClass>
+void
+SILCloner<ImplClass>::visitEndInitLetRefInst(EndInitLetRefInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+  recordClonedInstruction(
+      Inst, getBuilder().createEndInitLetRef(getOpLocation(Inst->getLoc()),
+                                          getOpValue(Inst->getOperand())));
 }
 
 template<typename ImplClass>
@@ -1904,10 +2258,17 @@ SILCloner<ImplClass>::visitObjectInst(ObjectInst *Inst) {
   recordClonedInstruction(
       Inst,
       getBuilder().createObject(getOpLocation(Inst->getLoc()), Inst->getType(),
-                                Elements, Inst->getBaseElements().size(),
-                                getBuilder().hasOwnership()
-                                    ? Inst->getForwardingOwnershipKind()
-                                    : ValueOwnershipKind(OwnershipKind::None)));
+                                Elements, Inst->getBaseElements().size()));
+}
+
+template<typename ImplClass>
+void
+SILCloner<ImplClass>::visitVectorInst(VectorInst *Inst) {
+  auto Elements = getOpValueArray<8>(Inst->getElements());
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+  recordClonedInstruction(
+      Inst,
+      getBuilder().createVector(getOpLocation(Inst->getLoc()), Elements));
 }
 
 template<typename ImplClass>
@@ -1936,6 +2297,35 @@ SILCloner<ImplClass>::visitTupleInst(TupleInst *Inst) {
                                getBuilder().hasOwnership()
                                    ? Inst->getForwardingOwnershipKind()
                                    : ValueOwnershipKind(OwnershipKind::None)));
+}
+
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitTupleAddrConstructorInst(
+    TupleAddrConstructorInst *Inst) {
+  SmallVector<SILValue, 8> Elements;
+  for (auto e : Inst->getElements()) {
+    SILValue mappedValue = getOpValue(e);
+
+    // Check if mappedValue only consists of empty tuple elements. If it does,
+    // then we do not add it to our result. This is because we know that the
+    // corresponding elements in getOpValue(Inst->getDest()) will also change
+    // into an empty exploded tuple. Since we only have leaf non-empty non-tuple
+    // elements as operands, these are not represented.
+    bool FoundNonTuple = false;
+    mappedValue->getType().getASTType().visit(
+        [&](CanType ty) { FoundNonTuple |= !ty->is<TupleType>(); });
+    if (FoundNonTuple)
+      Elements.push_back(mappedValue);
+  }
+
+  if (Elements.empty())
+    return;
+
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+  recordClonedInstruction(Inst, getBuilder().createTupleAddrConstructor(
+                                    getOpLocation(Inst->getLoc()),
+                                    getOpValue(Inst->getDest()), Elements,
+                                    Inst->isInitializationOfDest()));
 }
 
 template<typename ImplClass>
@@ -2392,6 +2782,182 @@ void SILCloner<ImplClass>::visitDeinitExistentialValueInst(
                 getOpLocation(Inst->getLoc()), getOpValue(Inst->getOperand())));
 }
 
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitPackLengthInst(PackLengthInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+
+  auto loc = getOpLocation(Inst->getLoc());
+  auto newPackType = cast<PackType>(getOpASTType(Inst->getPackType()));
+
+  recordClonedInstruction(
+      Inst, getBuilder().createPackLength(loc, newPackType));
+}
+
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitDynamicPackIndexInst(
+    DynamicPackIndexInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+
+  auto newIndexValue = getOpValue(Inst->getOperand());
+  auto loc = getOpLocation(Inst->getLoc());
+  auto newPackType = cast<PackType>(getOpASTType(Inst->getIndexedPackType()));
+
+  recordClonedInstruction(
+      Inst, getBuilder().createDynamicPackIndex(loc, newIndexValue,
+                                                newPackType));
+}
+
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitPackPackIndexInst(PackPackIndexInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+
+  auto newIndexValue = getOpValue(Inst->getOperand());
+  auto loc = getOpLocation(Inst->getLoc());
+  auto newPackType = cast<PackType>(getOpASTType(Inst->getIndexedPackType()));
+
+  auto newComponentStartIndex =
+    getOpStructuralPackIndex(Inst->getIndexedPackType(),
+                             Inst->getComponentStartIndex());
+
+  recordClonedInstruction(
+      Inst, getBuilder().createPackPackIndex(loc, newComponentStartIndex,
+                                             newIndexValue, newPackType));
+}
+
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitScalarPackIndexInst(
+    ScalarPackIndexInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+
+  auto loc = getOpLocation(Inst->getLoc());
+  auto newPackType = cast<PackType>(getOpASTType(Inst->getIndexedPackType()));
+
+  auto newComponentIndex =
+    getOpStructuralPackIndex(Inst->getIndexedPackType(),
+                             Inst->getComponentIndex());
+
+  recordClonedInstruction(
+      Inst, getBuilder().createScalarPackIndex(loc, newComponentIndex,
+                                               newPackType));
+}
+
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitOpenPackElementInst(
+    OpenPackElementInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+
+  auto newIndexValue = getOpValue(Inst->getIndexOperand());
+  auto loc = getOpLocation(Inst->getLoc());
+
+  // We need to make a new opened-element environment.  This is *not*
+  // a refinement of the contextual environment of the new insertion
+  // site; we just substitute the contextual substitutions in the
+  // opened environment and build a new one.
+  auto origEnv = Inst->getOpenedGenericEnvironment();
+
+  // Substitute the contextual substitutions.
+  auto newContextSubs =
+    getOpSubstitutionMap(origEnv->getPackElementContextSubstitutions());
+
+  // The opened shape class is a parameter of the original signature,
+  // which is unchanged.
+  auto openedShapeClass = origEnv->getOpenedElementShapeClass();
+
+  // Build the new environment.
+  auto newEnv =
+    GenericEnvironment::forOpenedElement(origEnv->getGenericSignature(),
+                                         UUID::fromTime(),
+                                         openedShapeClass,
+                                         newContextSubs);
+
+  // Associate the old opened archetypes with the new ones.
+  SmallVector<ArchetypeType*, 4> oldOpenedArchetypes;
+  origEnv->forEachPackElementArchetype([&](ElementArchetypeType *oldType) {
+    oldOpenedArchetypes.push_back(oldType);
+  });
+  {
+    size_t nextOldIndex = 0;
+    newEnv->forEachPackElementArchetype([&](ElementArchetypeType *newType) {
+      ArchetypeType *oldType = oldOpenedArchetypes[nextOldIndex++];
+      registerLocalArchetypeRemapping(oldType, newType);
+    });
+    assert(nextOldIndex == oldOpenedArchetypes.size() &&
+           "different opened archetype count");
+  }
+
+  recordClonedInstruction(
+      Inst, getBuilder().createOpenPackElement(loc, newIndexValue, newEnv));
+}
+
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitPackElementGetInst(PackElementGetInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+  auto loc = getOpLocation(Inst->getLoc());
+  auto newIndex = getOpValue(Inst->getIndex());
+  auto newPack = getOpValue(Inst->getPack());
+  auto newElementType = getOpType(Inst->getElementType());
+  recordClonedInstruction(
+      Inst, getBuilder().createPackElementGet(loc, newIndex, newPack,
+                                              newElementType));
+}
+
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitPackElementSetInst(PackElementSetInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+  auto loc = getOpLocation(Inst->getLoc());
+  auto newElementValue = getOpValue(Inst->getValue());
+  auto newIndex = getOpValue(Inst->getIndex());
+  auto newPack = getOpValue(Inst->getPack());
+  recordClonedInstruction(
+      Inst, getBuilder().createPackElementSet(loc, newElementValue,
+                                              newIndex, newPack));
+}
+
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitTuplePackElementAddrInst(
+                                             TuplePackElementAddrInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+  auto loc = getOpLocation(Inst->getLoc());
+  auto newIndex = getOpValue(Inst->getIndex());
+  auto newTuple = getOpValue(Inst->getTuple());
+  auto newElementType = getOpType(Inst->getElementType());
+
+  // If the tuple-ness of the operand disappears due to substitution,
+  // replace this instruction with an unchecked_addr_cast.
+  // FIXME: use type_refine_addr instead
+  if (doesOpTupleDisappear(Inst->getTupleType())) {
+    recordClonedInstruction(
+        Inst, getBuilder().createUncheckedAddrCast(loc, newTuple,
+                                                   newElementType));
+    return;
+  }
+
+  recordClonedInstruction(
+      Inst, getBuilder().createTuplePackElementAddr(loc, newIndex, newTuple,
+                                                    newElementType));
+}
+
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitTuplePackExtractInst(
+    TuplePackExtractInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+  auto loc = getOpLocation(Inst->getLoc());
+  auto newIndex = getOpValue(Inst->getIndex());
+  auto newTuple = getOpValue(Inst->getTuple());
+  auto newElementType = getOpType(Inst->getElementType());
+
+  // If the tuple-ness of the operand disappears due to substitution,
+  // replace this instruction with an unchecked_value_cast.
+  if (doesOpTupleDisappear(Inst->getTupleType())) {
+    recordClonedInstruction(Inst, getBuilder().createUncheckedValueCast(
+                                      loc, newTuple, newElementType));
+    return;
+  }
+
+  recordClonedInstruction(Inst, getBuilder().createTuplePackExtract(
+                                    loc, newIndex, newTuple, newElementType));
+}
+
 template<typename ImplClass>
 void
 SILCloner<ImplClass>::visitCopyBlockInst(CopyBlockInst *Inst) {
@@ -2454,6 +3020,18 @@ void SILCloner<ImplClass>::visitEndLifetimeInst(EndLifetimeInst *Inst) {
 }
 
 template <typename ImplClass>
+void SILCloner<ImplClass>::visitExtendLifetimeInst(ExtendLifetimeInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+
+  if (!getBuilder().hasOwnership())
+    return;
+
+  recordClonedInstruction(
+      Inst, getBuilder().createExtendLifetime(getOpLocation(Inst->getLoc()),
+                                              getOpValue(Inst->getOperand())));
+}
+
+template <typename ImplClass>
 void SILCloner<ImplClass>::visitUncheckedOwnershipConversionInst(
     UncheckedOwnershipConversionInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
@@ -2480,8 +3058,9 @@ void SILCloner<ImplClass>::visitMarkDependenceInst(MarkDependenceInst *Inst) {
                 getOpLocation(Inst->getLoc()), getOpValue(Inst->getValue()),
                 getOpValue(Inst->getBase()),
                 getBuilder().hasOwnership()
-                    ? Inst->getForwardingOwnershipKind()
-                    : ValueOwnershipKind(OwnershipKind::None)));
+                ? Inst->getForwardingOwnershipKind()
+                : ValueOwnershipKind(OwnershipKind::None),
+                Inst->dependenceKind()));
 }
 
 template<typename ImplClass>
@@ -2532,6 +3111,24 @@ SILCloner<ImplClass>::visitDeallocStackInst(DeallocStackInst *Inst) {
   recordClonedInstruction(
       Inst, getBuilder().createDeallocStack(getOpLocation(Inst->getLoc()),
                                             getOpValue(Inst->getOperand())));
+}
+
+template<typename ImplClass>
+void
+SILCloner<ImplClass>::visitDeallocPackInst(DeallocPackInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+  recordClonedInstruction(
+      Inst, getBuilder().createDeallocPack(getOpLocation(Inst->getLoc()),
+                                           getOpValue(Inst->getOperand())));
+}
+
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitDeallocPackMetadataInst(
+    DeallocPackMetadataInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+  recordClonedInstruction(
+      Inst, getBuilder().createDeallocPackMetadata(
+                getOpLocation(Inst->getLoc()), Inst->getOperand()));
 }
 
 template<typename ImplClass>
@@ -2632,10 +3229,9 @@ void SILCloner<ImplClass>::visitIncrementProfilerCounterInst(
 }
 
 template <typename ImplClass>
-void SILCloner<ImplClass>::visitTestSpecificationInst(
-    TestSpecificationInst *Inst) {
+void SILCloner<ImplClass>::visitSpecifyTestInst(SpecifyTestInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
-  recordClonedInstruction(Inst, getBuilder().createTestSpecificationInst(
+  recordClonedInstruction(Inst, getBuilder().createSpecifyTestInst(
                                     getOpLocation(Inst->getLoc()),
                                     Inst->getArgumentsSpecification()));
 }
@@ -2699,6 +3295,14 @@ SILCloner<ImplClass>::visitThrowInst(ThrowInst *Inst) {
 
 template<typename ImplClass>
 void
+SILCloner<ImplClass>::visitThrowAddrInst(ThrowAddrInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+  recordClonedInstruction(
+      Inst, getBuilder().createThrowAddr(getOpLocation(Inst->getLoc())));
+}
+
+template<typename ImplClass>
+void
 SILCloner<ImplClass>::visitUnwindInst(UnwindInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
   recordClonedInstruction(
@@ -2754,6 +3358,7 @@ SILCloner<ImplClass>::visitCheckedCastBranchInst(CheckedCastBranchInst *Inst) {
       Inst, getBuilder().createCheckedCastBranch(
                 getOpLocation(Inst->getLoc()), Inst->isExact(),
                 getOpValue(Inst->getOperand()),
+                getOpASTType(Inst->getSourceFormalType()),
                 getOpType(Inst->getTargetLoweredType()),
                 getOpASTType(Inst->getTargetFormalType()), OpSuccBB, OpFailBB,
                 Inst->getForwardingOwnershipKind(), TrueCount, FalseCount));
@@ -2809,7 +3414,7 @@ SILCloner<ImplClass>::visitSwitchEnumInst(SwitchEnumInst *Inst) {
   recordClonedInstruction(
       Inst, getBuilder().createSwitchEnum(
                 getOpLocation(Inst->getLoc()), getOpValue(Inst->getOperand()),
-                DefaultBB, CaseBBs, None, ProfileCounter(),
+                DefaultBB, CaseBBs, std::nullopt, ProfileCounter(),
                 getBuilder().hasOwnership()
                     ? Inst->getForwardingOwnershipKind()
                     : ValueOwnershipKind(OwnershipKind::None)));
@@ -2851,10 +3456,7 @@ SILCloner<ImplClass>::visitSelectEnumInst(SelectEnumInst *Inst) {
       Inst, getBuilder().createSelectEnum(
                 getOpLocation(Inst->getLoc()),
                 getOpValue(Inst->getEnumOperand()), getOpType(Inst->getType()),
-                DefaultResult, CaseResults, None, ProfileCounter(),
-                getBuilder().hasOwnership()
-                    ? Inst->getForwardingOwnershipKind()
-                    : ValueOwnershipKind(OwnershipKind::None)));
+                DefaultResult, CaseResults, std::nullopt, ProfileCounter()));
 }
 
 template<typename ImplClass>
@@ -2874,24 +3476,6 @@ SILCloner<ImplClass>::visitSelectEnumAddrInst(SelectEnumAddrInst *Inst) {
                                     getOpValue(Inst->getEnumOperand()),
                                     getOpType(Inst->getType()), DefaultResult,
                                     CaseResults));
-}
-
-template<typename ImplClass>
-void
-SILCloner<ImplClass>::visitSelectValueInst(SelectValueInst *Inst) {
-  SILValue DefaultResult;
-  if (Inst->hasDefault())
-    DefaultResult = getOpValue(Inst->getDefaultResult());
-  SmallVector<std::pair<SILValue, SILValue>, 8> CaseResults;
-  for (unsigned i = 0, e = Inst->getNumCases(); i != e; ++i)
-    CaseResults.push_back(std::make_pair(getOpValue(Inst->getCase(i).first),
-                                         getOpValue(Inst->getCase(i).second)));
-
-  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
-  recordClonedInstruction(
-      Inst, getBuilder().createSelectValue(
-                getOpLocation(Inst->getLoc()), getOpValue(Inst->getOperand()),
-                getOpType(Inst->getType()), DefaultResult, CaseResults));
 }
 
 template <typename ImplClass>
@@ -2975,7 +3559,7 @@ template <typename ImplClass>
 void SILCloner<ImplClass>::visitDifferentiableFunctionInst(
     DifferentiableFunctionInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
-  Optional<std::pair<SILValue, SILValue>> derivativeFns = None;
+  std::optional<std::pair<SILValue, SILValue>> derivativeFns = std::nullopt;
   if (Inst->hasDerivativeFunctions())
     derivativeFns = std::make_pair(getOpValue(Inst->getJVPFunction()),
                                    getOpValue(Inst->getVJPFunction()));
@@ -3009,7 +3593,7 @@ template <typename ImplClass>
 void SILCloner<ImplClass>::visitDifferentiableFunctionExtractInst(
     DifferentiableFunctionExtractInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
-  Optional<SILType> explicitExtracteeType = None;
+  std::optional<SILType> explicitExtracteeType = std::nullopt;
   if (Inst->hasExplicitExtracteeType())
     explicitExtracteeType = Inst->getType();
   recordClonedInstruction(
@@ -3101,6 +3685,16 @@ void SILCloner<ImplClass>
                           getBuilder().createExtractExecutor(
                             getOpLocation(Inst->getLoc()),
                             getOpValue(Inst->getExpectedExecutor())));
+}
+
+template <typename ImplClass>
+void SILCloner<ImplClass>
+::visitFunctionExtractIsolationInst(FunctionExtractIsolationInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+  recordClonedInstruction(Inst,
+                          getBuilder().createFunctionExtractIsolation(
+                            getOpLocation(Inst->getLoc()),
+                            getOpValue(Inst->getFunction())));
 }
 
 template <typename ImplClass>

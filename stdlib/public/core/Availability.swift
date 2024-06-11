@@ -19,12 +19,13 @@ import SwiftShims
 /// generated code for API availability checking.
 @_semantics("availability.osversion")
 @_effects(readnone)
+@_unavailableInEmbedded
 public func _stdlib_isOSVersionAtLeast(
   _ major: Builtin.Word,
   _ minor: Builtin.Word,
   _ patch: Builtin.Word
 ) -> Builtin.Int1 {
-#if (os(macOS) || os(iOS) || os(tvOS) || os(watchOS)) && SWIFT_RUNTIME_OS_VERSIONING
+#if (os(macOS) || os(iOS) || os(tvOS) || os(watchOS) || os(visionOS)) && SWIFT_RUNTIME_OS_VERSIONING
   if Int(major) == 9999 {
     return true._value
   }
@@ -48,6 +49,7 @@ public func _stdlib_isOSVersionAtLeast(
 // generated code for API availability checking.
 @_semantics("availability.osversion")
 @_effects(readnone)
+@_unavailableInEmbedded
 public func _stdlib_isOSVersionAtLeastOrVariantVersionAtLeast(
   _ major: Builtin.Word,
   _ minor: Builtin.Word,
@@ -71,6 +73,7 @@ public typealias _SwiftStdlibVersion = SwiftShims._SwiftStdlibVersion
 ///
 /// This function must not be called from inlinable code.
 @inline(__always)
+@_unavailableInEmbedded
 internal func _isExecutableLinkedOnOrAfter(
   _ stdlibVersion: _SwiftStdlibVersion
 ) -> Bool {
@@ -88,17 +91,25 @@ extension _SwiftStdlibVersion {
   @_alwaysEmitIntoClient
   public static var v5_7_0: Self { Self(_value: 0x050700) }
 
-  // Note: As of now, there is no bincompat level defined for v5.8. If you need
-  // to use this in a call to `_isExecutableLinkedOnOrAfter`, then you'll need
-  // to define this version in the runtime.
+  // Note: As of now, there is no bincompat level defined for the versions
+  // below. If you need to use one of these in a call to
+  // `_isExecutableLinkedOnOrAfter`, then you'll need to define the
+  // corresponding version in the runtime.
   @_alwaysEmitIntoClient
   public static var v5_8_0: Self { Self(_value: 0x050800) }
+  @_alwaysEmitIntoClient
+  public static var v5_9_0: Self { Self(_value: 0x050900) }
+  @_alwaysEmitIntoClient
+  public static var v5_10_0: Self { Self(_value: 0x050A00) }
+  @_alwaysEmitIntoClient
+  public static var v6_0_0: Self { Self(_value: 0x060000) }
 
   @available(SwiftStdlib 5.7, *)
-  public static var current: Self { .v5_8_0 }
+  public static var current: Self { .v6_0_0 }
 }
 
 @available(SwiftStdlib 5.7, *)
+@_unavailableInEmbedded
 extension _SwiftStdlibVersion: CustomStringConvertible {
   @available(SwiftStdlib 5.7, *)
   public var description: String {

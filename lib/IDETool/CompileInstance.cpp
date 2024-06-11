@@ -16,6 +16,7 @@
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/Module.h"
+#include "swift/AST/PluginLoader.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/Basic/Defer.h"
@@ -124,11 +125,13 @@ getModifiedFunctionDeclList(const SourceFile &SF, SourceManager &tmpSM,
   SearchPathOptions searchPathOpts = ctx.SearchPathOpts;
   ClangImporterOptions clangOpts = ctx.ClangImporterOpts;
   SILOptions silOpts = ctx.SILOpts;
+  CASOptions casOpts = ctx.CASOpts;
   symbolgraphgen::SymbolGraphOptions symbolOpts = ctx.SymbolGraphOpts;
 
   DiagnosticEngine tmpDiags(tmpSM);
-  auto &tmpCtx = *ASTContext::get(langOpts, typeckOpts, silOpts, searchPathOpts,
-                                  clangOpts, symbolOpts, tmpSM, tmpDiags);
+  auto &tmpCtx =
+      *ASTContext::get(langOpts, typeckOpts, silOpts, searchPathOpts, clangOpts,
+                       symbolOpts, casOpts, tmpSM, tmpDiags);
   registerParseRequestFunctions(tmpCtx.evaluator);
   registerTypeCheckerRequestFunctions(tmpCtx.evaluator);
 
@@ -193,10 +196,11 @@ void retypeCheckFunctionBody(AbstractFunctionDecl *func,
       sliceBufferID,
       GeneratedSourceInfo{
         GeneratedSourceInfo::ReplacedFunctionBody,
-        *func->getParentSourceFile()->getBufferID(),
-        func->getOriginalBodySourceRange(),
-        newRange,
-        func
+        Lexer::getCharSourceRangeFromSourceRange(
+          origSM, func->getOriginalBodySourceRange()),
+        Lexer::getCharSourceRangeFromSourceRange(origSM, newRange),
+        func,
+        nullptr
       }
   );
   func->setBodyToBeReparsed(newRange);
@@ -216,9 +220,9 @@ bool CompileInstance::performCachedSemaIfPossible(DiagnosticConsumer *DiagC) {
   auto FS = SM.getFileSystem();
 
   if (shouldCheckDependencies()) {
-    if (areAnyDependentFilesInvalidated(*CI, *FS, /*excludeBufferID=*/None,
-                                        DependencyCheckedTimestamp,
-                                        InMemoryDependencyHash)) {
+    if (areAnyDependentFilesInvalidated(
+            *CI, *FS, /*excludeBufferID=*/std::nullopt,
+            DependencyCheckedTimestamp, InMemoryDependencyHash)) {
       return true;
     }
     DependencyCheckedTimestamp = std::chrono::system_clock::now();
@@ -260,10 +264,14 @@ bool CompileInstance::setupCI(
                DiagnosticDocumentationPath.c_str()});
   args.append(origArgs.begin(), origArgs.end());
 
+  SmallString<256> driverPath(SwiftExecutablePath);
+  llvm::sys::path::remove_filename(driverPath);
+  llvm::sys::path::append(driverPath, "swiftc");
+
   CompilerInvocation invocation;
   bool invocationCreationFailed =
       driver::getSingleFrontendInvocationFromDriverArguments(
-          args, Diags,
+          driverPath, args, Diags,
           [&](ArrayRef<const char *> FrontendArgs) {
             return invocation.parseArgs(FrontendArgs, Diags);
           },
@@ -298,6 +306,7 @@ bool CompileInstance::setupCI(
     assert(Diags.hadAnyError());
     return false;
   }
+  CI->getASTContext().getPluginLoader().setRegistry(Plugins.get());
 
   return true;
 }
@@ -338,7 +347,7 @@ bool CompileInstance::performSema(
   CachedArgHash = ArgsHash;
   CachedReuseCount = 0;
   InMemoryDependencyHash.clear();
-  cacheDependencyHashIfNeeded(*CI, /*excludeBufferID=*/None,
+  cacheDependencyHashIfNeeded(*CI, /*excludeBufferID=*/std::nullopt,
                               InMemoryDependencyHash);
 
   // Perform!

@@ -2,6 +2,7 @@
 // RUN: %target-swift-frontend -swift-version 5 -enable-library-evolution %S/Inputs/exhaustive_switch_testable_helper.swift -emit-module -o %t
 // RUN: %target-typecheck-verify-swift -swift-version 5 -enable-library-evolution -I %t
 // RUN: %target-typecheck-verify-swift -swift-version 4 -enable-library-evolution -enable-nonfrozen-enum-exhaustivity-diagnostics -I %t
+// RUN: %target-typecheck-verify-swift -swift-version 4 -enable-library-evolution -enable-upcoming-feature NonfrozenEnumExhaustivity -I %t
 
 import exhaustive_switch_testable_helper
 
@@ -778,7 +779,7 @@ do {
 
   func foo(_ str: String) -> Int {
     switch str { // expected-error {{switch must be exhaustive}}
-    // expected-note@-1 {{do you want to add a default clause?}}
+    // expected-note@-1 {{add a default clause}}
     case let (x as Int) as Any:
       return x
     }
@@ -810,7 +811,7 @@ public func testNonExhaustive(_ value: NonExhaustive, _ payload: NonExhaustivePa
   case .a: break
   }
 
-  switch value { // expected-warning {{switch covers known cases, but 'NonExhaustive' may have additional unknown values}} {{none}} expected-note {{handle unknown values using "@unknown default"}} {{3-3=@unknown default:\n<#fatalError#>()\n}}
+  switch value { // expected-warning {{switch covers known cases, but 'NonExhaustive' may have additional unknown values}} {{none}} expected-note {{handle unknown values using "@unknown default"}} {{+3:3-3=@unknown default:\n<#fatalError#>()\n}}
   case .a: break
   case .b: break
   }
@@ -838,7 +839,7 @@ public func testNonExhaustive(_ value: NonExhaustive, _ payload: NonExhaustivePa
 
   switch value {
   case _: break
-  @unknown case _: break // expected-warning {{case is already handled by previous patterns; consider removing it}}
+  @unknown case _: break
   }
 
   // Test being part of other spaces.
@@ -902,7 +903,7 @@ public func testNonExhaustive(_ value: NonExhaustive, _ payload: NonExhaustivePa
   case .a: break
   }
 
-  switch payload { // expected-warning {{switch covers known cases, but 'NonExhaustivePayload' may have additional unknown values}} {{none}} expected-note {{handle unknown values using "@unknown default"}} {{3-3=@unknown default:\n<#fatalError#>()\n}}
+  switch payload { // expected-warning {{switch covers known cases, but 'NonExhaustivePayload' may have additional unknown values}} {{none}} expected-note {{handle unknown values using "@unknown default"}} {{+3:3-3=@unknown default:\n<#fatalError#>()\n}}
   case .a: break
   case .b: break
   }
@@ -939,25 +940,25 @@ public func testNonExhaustive(_ value: NonExhaustive, _ payload: NonExhaustivePa
   switch interval {
   case .seconds, .milliseconds, .microseconds, .nanoseconds: break
   case .never: break
-  @unknown case _: break // expected-warning {{case is already handled by previous patterns; consider removing it}}
+  @unknown case _: break
   }
 
   switch flag {
   case true: break
   case false: break
-  @unknown case _: break // expected-warning {{case is already handled by previous patterns; consider removing it}}
+  @unknown case _: break
   }
 
   switch flag as Optional {
   case _?: break
   case nil: break
-  @unknown case _: break // expected-warning {{case is already handled by previous patterns; consider removing it}}
+  @unknown case _: break
   }
 
   switch (flag, value) {
   case (true, _): break
   case (false, _): break
-  @unknown case _: break // expected-warning {{case is already handled by previous patterns; consider removing it}}
+  @unknown case _: break
   }
 }
 
@@ -994,7 +995,7 @@ public func testNonExhaustiveWithinModule(_ value: NonExhaustive, _ payload: Non
 
   switch value {
   case _: break
-  @unknown case _: break // expected-warning {{case is already handled by previous patterns; consider removing it}}
+  @unknown case _: break
   }
 
   // Test being part of other spaces.

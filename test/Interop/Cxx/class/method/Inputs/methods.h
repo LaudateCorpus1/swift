@@ -4,6 +4,11 @@
 struct __attribute__((swift_attr("import_unsafe"))) NonTrivialInWrapper {
   int value;
 
+  NonTrivialInWrapper(int value) : value(value) {}
+
+  // explicit copy constructor is needed, as on Windows a destructor
+  // still makes this a type that's passed in registers.
+  NonTrivialInWrapper(const NonTrivialInWrapper &other) : value(other.value) {}
   ~NonTrivialInWrapper() { }
 };
 
@@ -25,6 +30,15 @@ struct HasMethods {
 
   NonTrivialInWrapper nonConstPassThroughAsWrapper(int a) { return {a}; }
   NonTrivialInWrapper constPassThroughAsWrapper(int a) const { return {a}; }
+};
+
+struct ReferenceParams {
+  int a;
+  int b;
+  ReferenceParams(const int &a, const int &b) : a(a), b(b) { }
+  static void staticMethod(const int &a, const int &b) {
+    ReferenceParams t{a, b};
+  }
 };
 
 #endif // TEST_INTEROP_CXX_CLASS_METHOD_METHODS_H

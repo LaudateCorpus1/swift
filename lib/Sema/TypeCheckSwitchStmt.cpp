@@ -444,11 +444,11 @@ namespace {
       // \p minusCount is an optional pointer counting the number of
       // remaining calls to minus before the computation times out.
       // Returns None if the computation "timed out".
-      Optional<Space> minus(const Space &other, const DeclContext *DC,
-                            unsigned *minusCount) const {
+      std::optional<Space> minus(const Space &other, const DeclContext *DC,
+                                 unsigned *minusCount) const {
         if (minusCount && (*minusCount)-- == 0)
-          return None;
-        
+          return std::nullopt;
+
         if (this->isEmpty()) {
           return Space();
         }
@@ -521,7 +521,7 @@ namespace {
             if (auto diff = tot.minus(s, DC, minusCount))
               tot = *diff;
             else
-              return None;
+              return std::nullopt;
           }
           return tot;
         }
@@ -535,7 +535,7 @@ namespace {
           for (auto s : this->getSpaces()) {
             auto diff = s.minus(other, DC, minusCount);
             if (!diff)
-              return None;
+              return std::nullopt;
             if (diff->getKind() == SpaceKind::Disjunct) {
               smallSpaces.append(diff->getSpaces().begin(),
                                  diff->getSpaces().end());
@@ -570,7 +570,7 @@ namespace {
           for (auto subSpace : this->getSpaces()) {
             auto nextSpace = subSpace.minus(other, DC, minusCount);
             if (!nextSpace)
-              return None;
+              return std::nullopt;
             if (nextSpace.value().isEmpty())
               return Space();
             newSubSpaces.push_back(nextSpace.value());
@@ -616,7 +616,7 @@ namespace {
 
             auto reducedSpaceOrNone = s1.minus(s2, DC, minusCount);
             if (!reducedSpaceOrNone)
-              return None;
+              return std::nullopt;
             auto reducedSpace = *reducedSpaceOrNone;
             
             // If one of the constructor parameters is empty it means
@@ -828,8 +828,8 @@ namespace {
           auto children = E->getAllElements();
           llvm::transform(
               children, std::back_inserter(arr), [&](EnumElementDecl *eed) {
-                // Don't force people to match unavailable cases; they can't
-                // even write them.
+                // Don't force people to match unavailable cases since they
+                // should not be instantiated at run time.
                 if (AvailableAttr::isUnavailable(eed)) {
                   return Space();
                 }
@@ -1058,16 +1058,18 @@ namespace {
                              unknownCase);
         return;
       }
-      
+
       auto uncovered = diff.value();
-      if (unknownCase && uncovered.isEmpty()) {
-        DE.diagnose(unknownCase->getLoc(), diag::redundant_particular_case)
-          .highlight(unknownCase->getSourceRange());
-      }
 
       // Account for unknown cases. If the developer wrote `unknown`, they're
       // all handled; otherwise, we ignore the ones that were added for enums
       // that are implicitly frozen.
+      //
+      // Note that we do not diagnose an unknown case as redundant, even if the
+      // uncovered space is empty because we trust that if the developer went to
+      // the trouble of writing @unknown that it was for a good reason, like
+      // addressing diagnostics in another build configuration where there are
+      // potentially unknown cases.
       uncovered = *uncovered.minus(Space::forUnknown(unknownCase == nullptr),
                                    DC, /*&minusCount*/ nullptr);
 
@@ -1124,15 +1126,15 @@ namespace {
       bool InEditor = Context.LangOpts.DiagnosticsEditorMode;
 
       // Decide whether we want an error or a warning.
-      Optional<decltype(diag::non_exhaustive_switch)> mainDiagType =
+      std::optional<decltype(diag::non_exhaustive_switch)> mainDiagType =
           diag::non_exhaustive_switch;
+      bool downgrade = false;
       if (unknownCase) {
         switch (defaultReason) {
         case RequiresDefault::EmptySwitchBody:
           llvm_unreachable("there's an @unknown case; the body can't be empty");
         case RequiresDefault::No:
-          if (!uncovered.isEmpty())
-            mainDiagType = diag::non_exhaustive_switch_warn;
+          downgrade = !uncovered.isEmpty();
           break;
         case RequiresDefault::UncoveredSwitch:
         case RequiresDefault::SpaceTooLarge: {
@@ -1155,7 +1157,7 @@ namespace {
       case DowngradeToWarning::ForUnknownCase: {
         if (Context.LangOpts.DebuggerSupport ||
             Context.LangOpts.Playground ||
-            !Context.LangOpts.EnableNonFrozenEnumExhaustivityDiagnostics) {
+            !Context.LangOpts.hasFeature(Feature::NonfrozenEnumExhaustivity)) {
           // Don't require covering unknown cases in the debugger or in
           // playgrounds.
           return;
@@ -1168,8 +1170,9 @@ namespace {
               theEnum->getParentModule()->isSystemModule();
         }
         DE.diagnose(startLoc, diag::non_exhaustive_switch_unknown_only,
-                    subjectType, shouldIncludeFutureVersionComment);
-        mainDiagType = None;
+                    subjectType, shouldIncludeFutureVersionComment)
+          .warnUntilSwiftVersion(6);
+        mainDiagType = std::nullopt;
       }
         break;
       }
@@ -1185,7 +1188,8 @@ namespace {
         return;
       case RequiresDefault::UncoveredSwitch: {
         OS << tok::kw_default << ":\n" << placeholder << "\n";
-        DE.diagnose(startLoc, mainDiagType.value());
+        DE.diagnose(startLoc, mainDiagType.value())
+          .warnUntilSwiftVersionIf(downgrade, 6);
         DE.diagnose(startLoc, diag::missing_several_cases, /*default*/true)
           .fixItInsert(insertLoc, buffer.str());
       }
@@ -1203,8 +1207,10 @@ namespace {
       if (uncovered.isEmpty()) return;
 
       // Check if we still have to emit the main diagnostic.
-      if (mainDiagType.has_value())
-        DE.diagnose(startLoc, mainDiagType.value());
+      if (mainDiagType.has_value()) {
+        DE.diagnose(startLoc, mainDiagType.value())
+          .warnUntilSwiftVersionIf(downgrade, 6);
+      }
 
       // Add notes to explain what's missing.
       auto processUncoveredSpaces =
@@ -1253,7 +1259,7 @@ namespace {
               // will later decompose the space into cases.
               continue;
             }
-            if (!Context.LangOpts.EnableNonFrozenEnumExhaustivityDiagnostics)
+            if (!Context.LangOpts.hasFeature(Feature::NonfrozenEnumExhaustivity))
               continue;
 
             // This can occur if the switch is empty and the subject type is an
@@ -1480,8 +1486,7 @@ namespace {
       }
       case PatternKind::OptionalSome: {
         auto *OSP = cast<OptionalSomePattern>(item);
-        auto &Ctx = OSP->getElementDecl()->getASTContext();
-        const Identifier name = Ctx.getOptionalSomeDecl()->getBaseIdentifier();
+        const Identifier name = OSP->getElementDecl()->getBaseIdentifier();
 
         auto subSpace = projectPattern(OSP->getSubPattern());
         // To match patterns like (_, _, ...)?, we must rewrite the underlying
@@ -1500,8 +1505,8 @@ namespace {
           // If there's no sub-pattern then there's no further recursive
           // structure here.  Yield the constructor space.
           // FIXME: Compound names.
-          return Space::forConstructor(item->getType(),
-                                       VP->getName().getBaseIdentifier(), None);
+          return Space::forConstructor(
+              item->getType(), VP->getName().getBaseIdentifier(), std::nullopt);
         }
 
         SmallVector<Space, 4> conArgSpace;

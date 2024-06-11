@@ -4,8 +4,9 @@
 
 // RUN: %check-interop-cxx-header-in-clang(%t/functions.h)
 
-// CHECK: inline void testKeywordArgument(swift::Int register_) noexcept
-// CHECK-NEXT: return _impl::$s9Functions19testKeywordArgument8registerySi_tF(register_);
+// CHECK: SWIFT_INLINE_THUNK void testKeywordArgument(swift::Int register_) noexcept
+// CHECK-NEXT: _impl::$s9Functions19testKeywordArgument8registerySi_tF(register_);
+// CHECK-NEXT: }
 
 public func testKeywordArgument(register: Int) {
 }

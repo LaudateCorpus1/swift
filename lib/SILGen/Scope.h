@@ -154,7 +154,7 @@ class LLVM_LIBRARY_VISIBILITY DebugScope {
   SILGenFunction &SGF;
 
 public:
-  explicit DebugScope(SILGenFunction &SGF, CleanupLocation loc) : SGF(SGF) {
+  explicit DebugScope(SILGenFunction &SGF, SILLocation loc) : SGF(SGF) {
     SGF.enterDebugScope(loc);
   }
 

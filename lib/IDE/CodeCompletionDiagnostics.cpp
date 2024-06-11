@@ -86,11 +86,7 @@ bool CodeCompletionDiagnostics::getDiagnosticForDeprecated(
   if (!Attr)
     return true;
 
-  DeclName Name;
-  unsigned RawAccessorKind;
-  std::tie(RawAccessorKind, Name) = getAccessorKindAndNameForDiagnostics(D);
-  // FIXME: 'RawAccessorKind' is always 2 (NOT_ACCESSOR_INDEX).
-  // Code completion doesn't offer accessors. It only emits 'VarDecl's.
+  // FIXME: Code completion doesn't offer accessors. It only emits 'VarDecl's.
   // So getter/setter specific availability doesn't work in code completion.
 
   StringRef Platform = Attr->prettyPlatformString();
@@ -98,21 +94,26 @@ bool CodeCompletionDiagnostics::getDiagnosticForDeprecated(
   if (Attr->Deprecated)
     DeprecatedVersion = Attr->Deprecated.value();
 
+  llvm::VersionTuple RemappedDeprecatedVersion;
+  if (AvailabilityInference::updateDeprecatedPlatformForFallback(
+      Attr, Ctx, Platform, RemappedDeprecatedVersion))
+    DeprecatedVersion = RemappedDeprecatedVersion;
+
   if (!isSoftDeprecated) {
     if (Attr->Message.empty() && Attr->Rename.empty()) {
       getDiagnostics(severity, Out, diag::availability_deprecated,
-                     RawAccessorKind, Name, Attr->hasPlatform(), Platform,
+                     D, Attr->hasPlatform(), Platform,
                      Attr->Deprecated.has_value(), DeprecatedVersion,
                      /*message*/ StringRef());
     } else if (!Attr->Message.empty()) {
       EncodedDiagnosticMessage EncodedMessage(Attr->Message);
       getDiagnostics(severity, Out, diag::availability_deprecated,
-                     RawAccessorKind, Name, Attr->hasPlatform(), Platform,
+                     D, Attr->hasPlatform(), Platform,
                      Attr->Deprecated.has_value(), DeprecatedVersion,
                      EncodedMessage.Message);
     } else {
       getDiagnostics(severity, Out, diag::availability_deprecated_rename,
-                     RawAccessorKind, Name, Attr->hasPlatform(), Platform,
+                     D, Attr->hasPlatform(), Platform,
                      Attr->Deprecated.has_value(), DeprecatedVersion, false,
                      /*ReplaceKind*/ 0, Attr->Rename);
     }
@@ -125,18 +126,18 @@ bool CodeCompletionDiagnostics::getDiagnosticForDeprecated(
 
     if (Attr->Message.empty() && Attr->Rename.empty()) {
       getDiagnostics(severity, Out, diag::ide_availability_softdeprecated,
-                     RawAccessorKind, Name, Attr->hasPlatform(), Platform,
+                     D, Attr->hasPlatform(), Platform,
                      !isDistantFuture, DeprecatedVersion,
                      /*message*/ StringRef());
     } else if (!Attr->Message.empty()) {
       EncodedDiagnosticMessage EncodedMessage(Attr->Message);
       getDiagnostics(severity, Out, diag::ide_availability_softdeprecated,
-                     RawAccessorKind, Name, Attr->hasPlatform(), Platform,
+                     D, Attr->hasPlatform(), Platform,
                      !isDistantFuture, DeprecatedVersion,
                      EncodedMessage.Message);
     } else {
       getDiagnostics(severity, Out, diag::ide_availability_softdeprecated_rename,
-                     RawAccessorKind, Name, Attr->hasPlatform(), Platform,
+                     D, Attr->hasPlatform(), Platform,
                      !isDistantFuture, DeprecatedVersion, Attr->Rename);
     }
   }
@@ -165,14 +166,6 @@ bool swift::ide::getContextualCompletionDiagnostics(
     const ASTContext &Ctx) {
   CodeCompletionDiagnostics Diag(Ctx);
   switch (Reason) {
-  case ContextualNotRecommendedReason::InvalidAsyncContext:
-    // FIXME: Could we use 'diag::async_in_nonasync_function'?
-    return Diag.getDiagnostics(
-        Severity, Out, diag::ide_async_in_nonasync_context, NameForDiagnostics);
-  case ContextualNotRecommendedReason::CrossActorReference:
-    return Diag.getDiagnostics(Severity, Out,
-                               diag::ide_cross_actor_reference_swift5,
-                               NameForDiagnostics);
   case ContextualNotRecommendedReason::RedundantImport:
     return Diag.getDiagnostics(Severity, Out, diag::ide_redundant_import,
                                NameForDiagnostics);

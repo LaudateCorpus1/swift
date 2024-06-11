@@ -1,9 +1,10 @@
 // RUN: %target-typecheck-verify-swift -enable-objc-interop
+
 protocol EmptyProtocol { }
 
 protocol DefinitionsInProtocols {
   init() {} // expected-error {{protocol initializers must not have bodies}}
-  deinit {} // expected-error {{deinitializers may only be declared within a class or actor}}
+  deinit {} // expected-error {{deinitializers may only be declared within a class, actor, or noncopyable type}}
 }
 
 // Protocol decl.
@@ -82,10 +83,10 @@ struct NotFormattedPrintable : FormattedPrintable { // expected-error{{type 'Not
 
 // Protocol compositions in inheritance clauses
 protocol Left {
-  func l() // expected-note {{protocol requires function 'l()' with type '() -> ()'; do you want to add a stub?}}
+  func l() // expected-note {{protocol requires function 'l()' with type '() -> ()'; add a stub for conformance}}
 }
 protocol Right {
-  func r() // expected-note {{protocol requires function 'r()' with type '() -> ()'; do you want to add a stub?}}
+  func r() // expected-note {{protocol requires function 'r()' with type '() -> ()'; add a stub for conformance}}
 }
 typealias Both = Left & Right
 
@@ -101,11 +102,10 @@ struct DoesNotConform : Up {
 
 // Circular protocols
 
-protocol CircleMiddle : CircleStart { func circle_middle() } // expected-error {{protocol 'CircleMiddle' refines itself}}
-// expected-note@-1 {{protocol 'CircleMiddle' declared here}}
-protocol CircleStart : CircleEnd { func circle_start() } // expected-error {{protocol 'CircleStart' refines itself}}
-// expected-note@-1 {{protocol 'CircleStart' declared here}}
-protocol CircleEnd : CircleMiddle { func circle_end()} // expected-note 2 {{protocol 'CircleEnd' declared here}}
+protocol CircleMiddle : CircleStart { func circle_middle() }
+// expected-note@-1 3 {{protocol 'CircleMiddle' declared here}}
+protocol CircleStart : CircleEnd { func circle_start() } // expected-error 3 {{protocol 'CircleStart' refines itself}}
+protocol CircleEnd : CircleMiddle { func circle_end()} // expected-note 3 {{protocol 'CircleEnd' declared here}}
 
 protocol CircleEntry : CircleTrivial { }
 protocol CircleTrivial : CircleTrivial { } // expected-error {{protocol 'CircleTrivial' refines itself}}
@@ -418,7 +418,7 @@ protocol ShouldntCrash {
 
 // rdar://problem/18168866
 protocol FirstProtocol {
-    // expected-warning@+1 {{'weak' cannot be applied to a property declaration in a protocol; this is an error in Swift 5}}
+    // expected-warning@+1 {{'weak' cannot be applied to a property declaration in a protocol; this is an error in the Swift 5 language mode}}
     weak var delegate : SecondProtocol? { get } // expected-error{{'weak' must not be applied to non-class-bound 'any SecondProtocol'; consider adding a protocol conformance that has a class bound}}
 }
 
@@ -498,7 +498,7 @@ class C1_53813 {
 
   func conform() {
     c0.foo1 = self // expected-error {{cannot assign value of type 'C1_53813' to type '(any P1_53813)?'}}
-    // expected-note@-1 {{add missing conformance to 'P1_53813' to class 'C1_53813'}}{{15-15=: P1_53813}}
+    // expected-note@-1 {{add missing conformance to 'P1_53813' to class 'C1_53813'}}{{-4:15-15=: P1_53813}}
   }
 }
 
@@ -509,7 +509,7 @@ class C2_53813 {
 
   func conform() {
     c0.foo2 = self // expected-error {{cannot assign value of type 'C2_53813' to type '(any P1_53813 & P2_53813)?'}}
-    // expected-note@-1 {{add missing conformance to 'P1_53813 & P2_53813' to class 'C2_53813'}}{{15-15=: P1_53813 & P2_53813}}
+    // expected-note@-1 {{add missing conformance to 'P1_53813 & P2_53813' to class 'C2_53813'}}{{-4:15-15=: P1_53813 & P2_53813}}
   }
 }
 
@@ -520,7 +520,7 @@ class C3_53813: P3_53813 {
 
   func conform() {
     c0.foo1 = self // expected-error {{cannot assign value of type 'C3_53813' to type '(any P1_53813)?'}}
-    // expected-note@-1 {{add missing conformance to 'P1_53813' to class 'C3_53813'}}{{25-25=, P1_53813}}
+    // expected-note@-1 {{add missing conformance to 'P1_53813' to class 'C3_53813'}}{{-4:25-25=, P1_53813}}
   }
 }
 
@@ -531,7 +531,7 @@ class C4_53813: P1_53813 {
 
   func conform() {
     c0.foo2 = self // expected-error {{cannot assign value of type 'C4_53813' to type '(any P1_53813 & P2_53813)?'}}
-    // expected-note@-1 {{add missing conformance to 'P1_53813 & P2_53813' to class 'C4_53813'}}{{25-25=, P2_53813}}
+    // expected-note@-1 {{add missing conformance to 'P1_53813 & P2_53813' to class 'C4_53813'}}{{-4:25-25=, P2_53813}}
   }
 }
 

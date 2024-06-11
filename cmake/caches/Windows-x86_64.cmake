@@ -6,7 +6,6 @@ set(LLVM_ENABLE_PROJECTS
     CACHE STRING "")
 
 set(LLVM_EXTERNAL_PROJECTS
-      cmark
       swift
     CACHE STRING "")
 
@@ -29,16 +28,21 @@ set(LLVM_ENABLE_PER_TARGET_RUNTIME_DIR YES CACHE BOOL "")
 set(LLVM_ENABLE_PYTHON YES CACHE BOOL "")
 set(LLVM_RUNTIME_TARGETS
       x86_64-unknown-windows-msvc
+      aarch64-unknown-windows-msvc
     CACHE STRING "")
 foreach(target ${LLVM_RUNTIME_TARGETS})
   set(RUNTIMES_${target}_LLVM_ENABLE_RUNTIMES
         compiler-rt
       CACHE STRING "")
   set(RUNTIMES_${target}_CMAKE_MT mt CACHE STRING "")
-  set(RUNTIMES_${target}_CMAKE_SYSTEM_NAME Windows CACHE STRING "")
+  if(${target} MATCHES windows-msvc)
+    set(RUNTIMES_${target}_CMAKE_SYSTEM_NAME Windows CACHE STRING "")
+  endif()
   set(RUNTIMES_${target}_CMAKE_BUILD_TYPE Release CACHE STRING "")
+  set(RUNTIMES_${target}_COMPILER_RT_BUILD_BUILTINS YES CACHE BOOL "")
   set(RUNTIMES_${target}_COMPILER_RT_BUILD_CRT NO CACHE BOOL "")
   set(RUNTIMES_${target}_COMPILER_RT_BUILD_LIBFUZZER NO CACHE BOOL "")
+  set(RUNTIMES_${target}_COMPILER_RT_BUILD_ORC NO CACHE BOOL "")
   set(RUNTIMES_${target}_COMPILER_RT_BUILD_PROFILE YES CACHE BOOL "")
   set(RUNTIMES_${target}_COMPILER_RT_BUILD_SANITIZERS NO CACHE BOOL "")
   set(RUNTIMES_${target}_COMPILER_RT_BUILD_XRAY NO CACHE BOOL "")
@@ -68,10 +72,13 @@ set(LLDB_ALLOW_STATIC_BINDINGS YES CACHE BOOL "")
 set(LLDB_USE_STATIC_BINDINGS YES CACHE BOOL "")
 set(LLDB_ENABLE_PYTHON YES CACHE BOOL "")
 set(LLDB_EMBED_PYTHON_HOME NO CACHE BOOL "")
+set(LLDB_ENABLE_LIBXML2 NO CACHE BOOL "")
 
 # This requires perl which may not be available on Windows
 set(SWIFT_INCLUDE_DOCS NO CACHE BOOL "")
 set(SWIFT_BUILD_ENABLE_PARSER_LIB YES CACHE BOOL "")
+set(SWIFT_BUILD_STDLIB_EXTRA_TOOLCHAIN_CONTENT NO CACHE BOOL "")
+set(SWIFT_BUILD_STDLIB_CXX_MODULE NO CACHE BOOL "")
 # static linking is not supported on Windows yet
 set(SWIFT_BUILD_STATIC_STDLIB NO CACHE BOOL "")
 set(SWIFT_BUILD_STATIC_SDK_OVERLAY NO CACHE BOOL "")
@@ -121,8 +128,10 @@ set(LLVM_TOOLCHAIN_TOOLS
 set(CLANG_TOOLS
       clang
       clangd
+      clang-deps-launcher
       clang-format
       clang-resource-headers
+      clang-scan-deps
       clang-tidy
     CACHE STRING "")
 
@@ -136,7 +145,7 @@ set(LLDB_TOOLS
       lldb-argdumper
       lldb-python-scripts
       lldb-server
-      lldb-vscode
+      lldb-dap
       repl_swift
     CACHE STRING "")
 
@@ -147,8 +156,10 @@ set(SWIFT_INSTALL_COMPONENTS
       editor-integration
       tools
       sourcekit-inproc
+      static-mirror-lib
       swift-remote-mirror
       swift-remote-mirror-headers
+      swift-syntax-lib
     CACHE STRING "")
 
 set(LLVM_DISTRIBUTION_COMPONENTS
